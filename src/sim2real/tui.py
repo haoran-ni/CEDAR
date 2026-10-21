@@ -5,7 +5,8 @@ and talks to the Chief Scientist through ``ChatSession``. Closing it interrupts 
 and reopening it shows the same investigation.
 
 Top to bottom: the panel, always shown: the logo, set across its top border, with the
-tagline and the models in use beside it; the status lines; which sub-agents are working;
+tagline and the models in use beside it; the mode, on its own line and highlighted in full
+automation; the status lines; which sub-agents are working;
 and a table with one row per hypothesis, keeping lifecycle, agent role and activity,
 scheduler state, evidence quality and assessment in separate columns. Then the scrolling
 conversation and the input line, above which a menu of matching commands opens when a
@@ -35,6 +36,7 @@ from sim2real.chat import COMMANDS, HELP, ChatSession, Command, Notice, command_
 from sim2real.dashboard import (
     SwarmRow,
     dispatcher_status,
+    mode_line,
     model_line,
     status_line,
     subagent_status,
@@ -201,6 +203,8 @@ class _Snapshot:
     alarm: bool
     subagents: str
     models: str
+    mode: str = ""
+    automated: bool = False
     rows: list[SwarmRow] = field(default_factory=list)
     notices: list[Notice] = field(default_factory=list)
     alerts: list[str] = field(default_factory=list)
@@ -218,6 +222,8 @@ class Sim2RealApp(App):
     #about { width: 1fr; height: auto; }
     #tagline { text-style: bold; }
     #models { color: $text-muted; }
+    #mode { height: auto; text-style: bold; }
+    #mode.automated { color: $warning; }
     #status { height: auto; }
     #status.alarm { color: $warning; text-style: bold; }
     #subagents { height: auto; color: $success; }
@@ -274,6 +280,7 @@ class Sim2RealApp(App):
                     with Vertical(id="about"):
                         yield Static(TAGLINE, id="tagline")
                         yield Static(id="models")
+                yield Static(id="mode")
                 yield Static(id="status")
                 yield Static("No working sub-agents", id="subagents")
                 yield DataTable(id="swarm", cursor_type="row", zebra_stripes=True)
@@ -485,9 +492,10 @@ class Sim2RealApp(App):
         investigation_id = self.session.investigation_id
         settings = self.session.clients.settings
         if investigation_id is None:
+            mode, automated = mode_line(None)
             return _Snapshot("No investigation yet: describe the discrepancy to the Chief Scientist.", dispatcher,
                              alarm, subagent_status(None, activities, now, running, automatic),
-                             model_line(settings, None))
+                             model_line(settings, None), mode=mode, automated=automated)
         version = self.workspace.store.current_version(investigation_id)
         changed = version != self._version
         if changed:
@@ -495,9 +503,10 @@ class Sim2RealApp(App):
             self._state = replay(self._events)
             self._version = version
         state = self._state
+        mode, automated = mode_line(state)
         return _Snapshot(status_line(state, now), f"{work_summary(state)} · {dispatcher}", alarm,
                          subagent_status(state, activities, now, running, automatic), model_line(settings, state),
-                         swarm_rows(state, self._events, activities, now),
+                         mode, automated, swarm_rows(state, self._events, activities, now),
                          self.session.notices() if changed else [], self._new_results(state) if changed else [],
                          state.round)
 
@@ -527,6 +536,9 @@ class Sim2RealApp(App):
             return
         status.update(Text(f"{snapshot.status}\n{snapshot.summary}"))
         status.set_class(snapshot.alarm, "alarm")
+        mode = self.query_one("#mode", Static)
+        mode.update(Text(snapshot.mode))
+        mode.set_class(snapshot.automated, "automated")
         self.query_one("#subagents", Static).update(Text(snapshot.subagents))
         self.query_one("#models", Static).update(Text(snapshot.models))
         self._round = snapshot.round

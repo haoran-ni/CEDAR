@@ -4,8 +4,6 @@ before every review, within limits the researcher set; human-in-the-loop is unch
 ScriptedModel and FakeScheduler TEST DOUBLES on a SYNTHETIC site; no model or job runs.
 """
 
-from datetime import datetime, timezone
-
 import pytest
 from factories import CHIEF, USER, add_hypothesis, agent_for, draft, start_investigation
 from pydantic import ValidationError
@@ -35,7 +33,7 @@ from sim2real.contracts import (
     SchedulerState,
 )
 from sim2real.contracts.base import Actor
-from sim2real.dashboard import status_line
+from sim2real.dashboard import mode_line
 from sim2real.dispatch import SYSTEM
 from sim2real.errors import RuleViolation
 from sim2real.models import TextPart
@@ -44,7 +42,6 @@ from sim2real.notebook import render_notebook
 from sim2real.summaries import approval_requests, investigation_summary
 
 APPROVER = Actor(kind=ActorKind.APPROVER, id="approver")
-NOW = datetime(2026, 10, 20, 12, tzinfo=timezone.utc)
 
 
 @pytest.fixture
@@ -93,7 +90,7 @@ def test_in_full_automation_the_approver_and_the_judge_carry_the_investigation(t
     dispatcher.tick()
     state = ledger.load(INV)
     assert state.automation_core_hours_left == pytest.approx(1000 - hours)
-    assert f"FULL AUTOMATION ({1000 - hours:g}/1000 core-h" in status_line(state, NOW)
+    assert mode_line(state) == ("Mode: full-automation", True)
 
     output = aims_output(energy=-5000.123456789)
     scheduler.on_submit = lambda job, workdir: (workdir / "aims.out").write_text(output)
@@ -137,7 +134,7 @@ def test_the_researcher_switches_modes_and_sees_which_one_is_on(system, monkeypa
     assert state.mode is InvestigationMode.FULL_AUTOMATION and state.automation.intervention_id == "msg-3"
     left = "500 of 500 core-hours and 2,000,000 of 2,000,000 tokens left"
     assert f"  mode: full automation: {left}" in investigation_summary(state)
-    assert f"{INV} · FULL AUTOMATION (500/500 core-h, 2,000,000/2,000,000 tokens left) · " in status_line(state, NOW)
+    assert mode_line(state) == ("Mode: full-automation", True)
     assert chat.handle("/mode").startswith(f"{INV} is in full automation: {left}.")
     assert chat.handle("/mode human-in-the-loop") == (f"{INV} is in human-in-the-loop (msg-4): agent proposals and "
                                                       "submissions wait for you again.")

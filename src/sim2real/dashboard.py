@@ -16,7 +16,7 @@ from datetime import datetime
 from sim2real.contracts.events import RecordedEvent
 from sim2real.contracts.examination import ExaminationVerdict
 from sim2real.contracts.plan import PermissionAction
-from sim2real.contracts.status import CalculationState, HypothesisStatus
+from sim2real.contracts.status import CalculationState, HypothesisStatus, InvestigationMode
 from sim2real.dispatch import Activity
 from sim2real.models.types import ModelSettings
 from sim2real.state.projection import (
@@ -258,16 +258,20 @@ def work_summary(state: InvestigationState) -> str:
     return f"{n} hypothes{'is' if n == 1 else 'es'} · jobs: {jobs} · evidence: {evidence}"
 
 
+def mode_line(state: InvestigationState | None) -> tuple[str, bool]:
+    """The panel's own line for the mode, and whether it is full automation, which the panel highlights; a new
+    investigation starts in human-in-the-loop. ``/mode`` gives the details."""
+    mode = InvestigationMode.HUMAN_IN_THE_LOOP if state is None else state.mode
+    return f"Mode: {mode.value}", mode is InvestigationMode.FULL_AUTOMATION
+
+
 def status_line(state: InvestigationState, now: datetime) -> str:
     budget = state.spec.constraints.model_token_budget
     tokens = f"{state.model_tokens_used:,}" + (f" of {budget:,}" if budget else "")
     waiting = len(approval_requests(state))
     agents = sum(a.active for a in state.agents.values())
     automation = state.automation
-    mode = ("human-in-the-loop" if automation is None else
-            f"FULL AUTOMATION ({max(state.automation_core_hours_left, 0):g}/{automation.max_core_hours:g} core-h, "
-            f"{max(state.automation_tokens_left, 0):,}/{automation.max_tokens:,} tokens left)")
-    parts = [state.investigation_id, mode, state.status.value, "setup" if state.round == 0 else f"round {state.round}",
+    parts = [state.investigation_id, state.status.value, "setup" if state.round == 0 else f"round {state.round}",
              f"plan v{state.plan_version}", f"{agents} agent{'' if agents == 1 else 's'}", f"{tokens} tokens"]
     proposal = state.pending_proposal
     if proposal is not None:

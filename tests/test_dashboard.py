@@ -199,8 +199,8 @@ def test_dispatcher_status_and_status_line(ledger):
     calc = ledger.request_calculation(inv, AGENT, hyp, task(), "test").calculation_id
     examine(ledger, inv, calc)
     move(ledger, inv, calc, ENGINE, CalculationState.VALIDATED_INPUT)
-    assert status_line(ledger.load(inv), now) == ("inv-1 · human-in-the-loop · INVESTIGATING · setup · plan v1 · 1 "
-                                                  "agent · 0 of 1,000 tokens · 1 waiting for you (/pending)")
+    assert status_line(ledger.load(inv), now) == "inv-1 · INVESTIGATING · setup · plan v1 · 1 agent · " \
+                                                 "0 of 1,000 tokens · 1 waiting for you (/pending)"
     other = add_hypothesis(ledger, inv, "hyp-other", agent=False)
     ledger.record(inv, [draft(CHIEF, AgentsProposed(proposal_id="p-9", rationale="test", agents=(
         AgentSpec(hypothesis_id=other, role="coverage specialist", brief="vary coverage"),)))])

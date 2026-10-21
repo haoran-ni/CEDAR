@@ -132,7 +132,7 @@ def test_conversation_live_panel_and_approval(system):
         await refresh(pilot)
         (row,) = panel(app)
         assert row[0] == HYP and row[1] == "ACTIVE" and row[2] == f"proposed {ROLE}; starts in 10 min"
-        assert status(app).startswith(f"{INV} · human-in-the-loop · INVESTIGATING · round 1 · plan v1 · 0 agents")
+        assert status(app).startswith(f"{INV} · INVESTIGATING · round 1 · plan v1 · 0 agents")
         assert "1 agent proposed: start in 10 min unless you reply (/agents)" in status(app)
         assert "[waiting for you] /approve agents" in conversation(app)
 
@@ -398,6 +398,30 @@ def test_a_slash_at_the_start_of_a_line_lists_the_matching_commands(system):
         assert shown() == []
         await pilot.press("tab")
         assert app.focused is not composer
+
+    drive(app, script)
+
+
+def test_the_panel_shows_the_mode_on_its_own_line(system):
+    system["clients"].add("chief_scientist", open_and_delegate(system["site"]), reply(TextPart(text="Opened.")))
+    app = Sim2RealApp(system["chat"], refresh_seconds=3600, clock=lambda: NOW)
+
+    def mode():
+        widget = app.query_one("#mode", Static)
+        return str(widget.content), widget.has_class("automated")
+
+    async def script(pilot):
+        await settle(pilot)
+        assert mode() == ("Mode: human-in-the-loop", False)  # before any investigation: new ones start so
+        await send(pilot, "PBE puts CO in the fcc hollow on Cu(111); experiments see atop.")
+        await refresh(pilot)
+        assert mode() == ("Mode: human-in-the-loop", False)
+        await send(pilot, "/mode full-automation 100 1000000")
+        await refresh(pilot)
+        assert mode() == ("Mode: full-automation", True)
+        await send(pilot, "/mode human-in-the-loop")
+        await refresh(pilot)
+        assert mode() == ("Mode: human-in-the-loop", False)
 
     drive(app, script)
 

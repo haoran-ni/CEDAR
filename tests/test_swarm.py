@@ -5,6 +5,7 @@ Chief Scientist's reviews of what they report.
 ScriptedModel and FakeScheduler TEST DOUBLES on a SYNTHETIC site; no model or job runs.
 """
 
+import os
 import threading
 from collections import Counter
 
@@ -589,3 +590,113 @@ def test_agents_work_without_a_compute_profile(system):
     refused = router.models["agent-hyp-b"].calls[1].messages[-1].parts[0]
     assert refused.is_error and "no approved compute profile" in refused.content
     assert not any("compute profile" in n for n in notes)  # nothing to submit, so nothing to complain about
+
+
+# -- the dispatcher starts when there is work -------------------------------------------------------
+
+def test_what_counts_as_work_for_a_dispatcher(system):
+    from sim2real.dispatch import needs_dispatcher
+
+    ledger = system["workspace"].ledger
+    chat = investigation(system, "hyp-a")
+    assert not needs_dispatcher(ledger.load(INV))  # hypotheses alone: nothing to carry out
+    propose(ledger, "p-1", "hyp-a")
+    assert needs_dispatcher(ledger.load(INV))  # its review window must be watched
+    ledger.record(INV, [draft(USER, UserInterventionRecorded(intervention_id="msg-9", text="Wait."))])
+    assert not needs_dispatcher(ledger.load(INV))  # held for the Chief Scientist and the researcher
+    propose(ledger, "p-2", "hyp-a")
+    chat.handle("/approve agents")
+    assert needs_dispatcher(ledger.load(INV))  # the agent's first task
+    ledger.record(INV, [draft(CHIEF, PlanRevised(version=2, reason="hold", plan=ResearchPlan(
+        objective="test", hypothesis_priorities={"hyp-a": "on_hold"})))])
+    assert not needs_dispatcher(ledger.load(INV))  # on hold: nothing may run
+    ledger.record(INV, [draft(CHIEF, InvestigationStatusChanged(status=InvestigationStatus.CANCELLED,
+                                                                reason="test"))])
+    assert not needs_dispatcher(ledger.load(INV))
+
+
+def test_the_chat_starts_a_dispatcher_only_when_there_is_work_and_none_runs(system, monkeypatch):
+    import subprocess
+    import sys
+
+    import sim2real.chat
+
+    ledger, workspace = system["workspace"].ledger, system["workspace"]
+    started = []
+    chat = investigation(system, "hyp-a")
+    chat.auto_dispatch, chat.start_dispatcher = True, lambda ws: started.append(ws) or 4242
+    assert chat.ensure_dispatcher() is None and started == []  # nothing to do yet
+    propose(ledger, "p-1", "hyp-a")
+    note = chat.ensure_dispatcher()
+    assert note.startswith("[dispatcher] Started in the background (process 4242)") and len(started) == 1
+    assert "stops by itself after 30 minutes with nothing to do" in note
+    assert chat.ensure_dispatcher() is None and len(started) == 1  # not restarted within a minute
+
+    monkeypatch.setattr(sim2real.chat, "RESTART_SECONDS", 0)
+    holder = subprocess.Popen(  # another process holds the lock, as a running dispatcher does
+        [sys.executable, "-c", "import fcntl, sys; f = open(sys.argv[1], 'a'); fcntl.lockf(f, fcntl.LOCK_EX); "
+         "print('locked', flush=True); sys.stdin.read()", str(workspace.root / "dispatcher.lock")],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    try:
+        assert holder.stdout.readline().strip() == "locked"
+        assert chat.ensure_dispatcher() is None and len(started) == 1
+    finally:
+        holder.communicate("", timeout=10)
+    assert chat.ensure_dispatcher() is not None and len(started) == 2  # it stopped while work remained
+    chat.auto_dispatch = False
+    assert chat.ensure_dispatcher() is None and len(started) == 2
+
+
+def test_an_idle_dispatcher_stops_by_itself_but_not_while_there_is_work(system):
+    workspace, dispatcher = system["workspace"], system["dispatcher"]
+    notes = []
+    idle = threading.Thread(target=dispatcher.run_forever, args=(0.01,),  # an empty data directory
+                            kwargs={"log": notes.append, "idle_seconds": 0.05}, daemon=True)
+    idle.start()
+    idle.join(10)
+    assert not idle.is_alive(), "an idle dispatcher should stop by itself"
+    assert any("nothing to do for" in n for n in notes) and not (workspace.root / "dispatcher.pid").exists()
+
+    investigation(system, "hyp-a")
+    propose(workspace.ledger, "p-1", "hyp-a")  # a review window to watch
+    stop = threading.Event()
+    loop = threading.Thread(target=dispatcher.run_forever, args=(0.01,),
+                            kwargs={"log": notes.append, "stop": stop, "idle_seconds": 0.05})
+    loop.start()
+    try:
+        loop.join(0.5)
+        assert loop.is_alive() and (workspace.root / "dispatcher.pid").read_text() == str(os.getpid())
+    finally:
+        stop.set()
+        loop.join(10)
+    assert not loop.is_alive()
+
+
+def test_a_background_dispatcher_runs_detached_and_stops_on_request(tmp_path):
+    """A real process, with the tests' isolated configuration and no API key."""
+    import signal
+
+    from sim2real.dispatch import dispatcher_running, start_background_dispatcher, stop_dispatcher
+    from sim2real.models import write_starter
+    from sim2real.paths import config_dir
+    from sim2real.workspace import Workspace
+
+    write_starter(config_dir() / "models.toml")
+    workspace = Workspace.open(tmp_path / "background")
+    pid = start_background_dispatcher(workspace, idle_minutes=5)
+    try:
+        for _ in range(300):
+            if dispatcher_running(workspace) and (workspace.root / "dispatcher.pid").exists():
+                break
+            threading.Event().wait(0.1)
+        assert dispatcher_running(workspace)
+        assert (workspace.root / "dispatcher.pid").read_text() == str(pid)
+        assert stop_dispatcher(workspace, timeout=30) == f"Stopped the dispatcher (process {pid})."
+        assert not dispatcher_running(workspace) and not (workspace.root / "dispatcher.pid").exists()
+        assert "stops after 5 min with nothing to do" in (workspace.root / "dispatcher.log").read_text()
+        assert stop_dispatcher(workspace) == "No dispatcher is running on this data directory."
+    finally:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass

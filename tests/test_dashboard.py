@@ -264,3 +264,15 @@ def test_the_panel_says_when_queued_work_waits_for_a_dispatcher(ledger):
     working = Activity(investigation_id=inv, task_id="t-1", role="hypothesis_agent", hypothesis_id=hyp,
                        agent_id=AGENT.id, started_at=LATER)
     assert subagent_status(state, [working], LATER) == f"Working sub-agents: test specialist on {hyp} (0 s)"
+
+
+def test_with_automatic_dispatch_a_missing_dispatcher_needs_no_attention(ledger):
+    assert dispatcher_status(None, [], LATER, automatic=True) == (
+        "no dispatcher running; one starts by itself when there is work", False)
+    assert dispatcher_status(30, [], LATER, automatic=True) == ("dispatcher seen 30 s ago", False)
+    inv = start_investigation(ledger)
+    hyp = add_hypothesis(ledger, inv)
+    ledger.record(inv, [draft(USER, AgentTaskQueued(task_id="t-1", role="hypothesis_agent", hypothesis_id=hyp,
+                                                    agent_id=AGENT.id, instruction="test it"))])
+    assert subagent_status(ledger.load(inv), [], LATER, dispatcher_running=False, automatic=True) == (
+        "No working sub-agents · 1 task queued, waiting for the dispatcher to start")

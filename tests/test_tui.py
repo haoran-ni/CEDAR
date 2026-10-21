@@ -418,3 +418,22 @@ def test_the_conversation_has_no_shortcut_keys(system):
         assert isinstance(app.screen, NotebookScreen)
 
     drive(app, script)
+
+
+def test_the_window_starts_a_dispatcher_when_work_waits_and_none_runs(system):
+    clients = system["clients"]
+    clients.add("chief_scientist", open_and_delegate(system["site"]), reply(TextPart(text="Proposed.")))
+    system["chat"].handle("Investigate CO on Cu(111).")  # the proposal now waits out its review window
+    started = []
+    session = system["chat"]
+    session.auto_dispatch, session.start_dispatcher = True, lambda workspace: started.append(workspace) or 4242
+    app = Sim2RealApp(session, refresh_seconds=3600, clock=lambda: NOW)
+
+    async def script(pilot):
+        await settle(pilot)
+        assert len(started) == 1 and "[dispatcher] Started in the background (process 4242)" in conversation(app)
+        assert "one starts by itself when there is work" in status(app) and "start `sim2real dispatch`" not in status(app)
+        await refresh(pilot)
+        assert len(started) == 1  # not restarted within a minute
+
+    drive(app, script)

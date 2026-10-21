@@ -129,9 +129,9 @@ stands), which opens a new window. Give an existing agent further work with dele
 retire an agent whose hypothesis needs no more work.
 
 Queued agent work, submissions and job polling are carried out by the dispatcher, a \
-process the researcher runs with `sim2real dispatch` (for example in tmux); investigation_state \
-says whether one is running. If none is, queued work does not start: tell the researcher to \
-start it. You cannot start it yourself.
+background process. investigation_state says whether one is running, and whether the chat \
+starts one by itself when there is work. Only if neither holds does queued work wait for the \
+researcher to run `sim2real dispatch`; then tell them. You cannot start it yourself.
 
 Agents investigate independently and never see each other's work. You collect their \
 results and compare them across hypotheses: look for confounders, contradictions and \

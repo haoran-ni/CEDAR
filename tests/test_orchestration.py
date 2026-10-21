@@ -375,12 +375,19 @@ def test_cli_start_and_dispatch(system, monkeypatch, capsys, tmp_path):
     monkeypatch.setattr(cli, "_profiles", lambda: system["profiles"])
     monkeypatch.setattr(cli, "_model_clients", lambda: clients)
     clients.add("chief_scientist", open_and_delegate(system["site"]), reply(TextPart(text="Opened and delegated.")))
+    started = []  # TEST DOUBLE for starting the background dispatcher
+    monkeypatch.setattr("sim2real.chat.start_background_dispatcher", lambda workspace: started.append(workspace) or 4242)
     lines = iter(["Investigate CO on Cu(111).", "/approve agents", "/status", "/quit"])
     monkeypatch.setattr("builtins.input", lambda prompt: next(lines))
     assert cli.main(["start"]) == 0
     out = capsys.readouterr().out
-    assert "no dispatcher has run recently" in out and "Opened and delegated." in out
+    assert "Opened and delegated." in out and "no dispatcher has run recently" not in out
     assert f"Investigation {INV}" in out and f"Resume with: sim2real start {INV}" in out
+    # The proposed agents needed a dispatcher to start them when their review window ends, so the chat started
+    # one right after the Chief proposed them; once, although the approval gave it more work.
+    assert [w.root for w in started] == [system["workspace"].root]
+    assert out.count("[dispatcher] Started in the background (process 4242)") == 1
+    assert out.index("Opened and delegated.") < out.index("[dispatcher] Started") < out.index(f"Started agent-{HYP}")
 
     cli.main(["investigations"])
     assert f"{INV}: INVESTIGATING; 1 hypotheses" in capsys.readouterr().out
@@ -469,7 +476,7 @@ def test_start_opens_the_full_screen_interface_only_where_it_can_work(system, mo
     monkeypatch.setattr(cli, "_profiles", lambda: system["profiles"])
     monkeypatch.setattr(cli, "_model_clients", lambda: system["clients"])
     opened = []
-    monkeypatch.setattr(tui, "run_tui", lambda session: opened.append(session))
+    monkeypatch.setattr(tui, "run_tui", lambda session, started=None: opened.append(session))
     assert cli.main(["start"]) == 0 and len(opened) == 1 and opened[0].investigation_id is None
 
 
@@ -481,5 +488,9 @@ def test_the_chief_knows_whether_a_dispatcher_is_running(system):
     seen = clients.models["chief_scientist"].calls[-1].messages[-1].parts[0].content
     assert seen.endswith("the researcher starts it with `sim2real dispatch`): no dispatcher has run: start "
                          "`sim2real dispatch`")
+    chat.auto_dispatch = True  # as `sim2real start` does: the Chief need not send the researcher to start one
+    assert chat._dispatcher_status().startswith("none is running now; this chat starts one in the background by "
+                                                "itself right after your turn")
     system["dispatcher"].tick()
+    chat.auto_dispatch = False
     assert chat._dispatcher_status() == "dispatcher seen 0 s ago"

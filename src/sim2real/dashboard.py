@@ -159,9 +159,12 @@ def swarm_rows(state: InvestigationState, events: Sequence[RecordedEvent], activ
     return rows
 
 
-def dispatcher_status(heartbeat_age: float | None, activities: Sequence[Activity],
-                      now: datetime) -> tuple[str, bool]:
-    """A short description of the dispatcher, and whether it needs the researcher's attention."""
+def dispatcher_status(heartbeat_age: float | None, activities: Sequence[Activity], now: datetime,
+                      automatic: bool = False) -> tuple[str, bool]:
+    """A short description of the dispatcher, and whether it needs the researcher's attention; with
+    ``automatic`` the chat starts one when there is work, so a missing one needs no attention."""
+    if automatic and (heartbeat_age is None or heartbeat_age > STALE_DISPATCHER_SECONDS):
+        return "no dispatcher running; one starts by itself when there is work", False
     if heartbeat_age is None:
         return "no dispatcher has run: start `sim2real dispatch`", True
     if heartbeat_age > STALE_DISPATCHER_SECONDS:
@@ -181,7 +184,7 @@ def dispatcher_status(heartbeat_age: float | None, activities: Sequence[Activity
 
 
 def subagent_status(state: InvestigationState | None, activities: Sequence[Activity], now: datetime,
-                    dispatcher_running: bool = True) -> str:
+                    dispatcher_running: bool = True, automatic: bool = False) -> str:
     """Which sub-agents (hypothesis agents and the Evidence Judge) are working on the investigation right now,
     and how much of their work is queued; queued work waits for a dispatcher if none is running."""
     mine = [a for a in activities if state is not None and a.investigation_id == state.investigation_id]
@@ -199,7 +202,8 @@ def subagent_status(state: InvestigationState | None, activities: Sequence[Activ
     if queued:
         text += f" · {len(queued)} task{'s' if len(queued) > 1 else ''} queued"
         if not dispatcher_running:
-            text += ", waiting for a dispatcher: start `sim2real dispatch`"
+            text += (", waiting for the dispatcher to start" if automatic else
+                     ", waiting for a dispatcher: start `sim2real dispatch`")
     if any(a.role == "chief_scientist" for a in mine):
         text += " · the Chief Scientist is reviewing their reports"
     return text

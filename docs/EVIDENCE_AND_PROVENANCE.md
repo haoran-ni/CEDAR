@@ -27,7 +27,7 @@ Under the data directory (`$SIM2REAL_DATA_DIR`, else `$XDG_DATA_HOME/sim2real`, 
 | `analyses/` | Working directories of analysis scripts while they run; each is removed when its script ends |
 | `transcripts/` | Each agent session's conversation, one JSON line per message (mode 600). Operational memory for resuming agents, not the research record |
 | `notebooks/<investigation>/` | The research notebook |
-| `dispatcher.lock`, `dispatcher.heartbeat` | The dispatcher's lock and last-pass time |
+| `dispatcher.lock`, `dispatcher.heartbeat`, `dispatcher.pid`, `dispatcher.log` | The dispatcher's lock, last-pass time and process id, and the output of one the chat started |
 | `activity/` | One file per agent run in progress, for the live panel; removed when the run ends |
 
 Run directories, where jobs actually execute, are under the compute profile's `runs_root`.

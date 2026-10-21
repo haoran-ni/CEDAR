@@ -253,16 +253,20 @@ def _start(args) -> int:
     if args.investigation and args.investigation not in workspace.store.investigation_ids():
         print(f"No investigation {args.investigation}. See `sim2real investigations`.", file=sys.stderr)
         return 1
-    session = ChatSession(workspace, _profiles(), _model_clients(), investigation_id=args.investigation)
+    session = ChatSession(workspace, _profiles(), _model_clients(), investigation_id=args.investigation,
+                          auto_dispatch=not args.no_dispatch)
+    started = session.ensure_dispatcher()
     if _full_screen(args):
         from sim2real.tui import run_tui
 
-        run_tui(session)
+        run_tui(session, started)
         if session.investigation_id:
             print(f"Resume with: sim2real start {session.investigation_id}")
         return 0
+    if started:
+        print(started)
     age = heartbeat_age(workspace)
-    if age is None or age > 600:
+    if args.no_dispatch and (age is None or age > 600):
         print("Note: no dispatcher has run recently, so queued agent work and jobs will not progress. Start one in "
               "another terminal (or tmux/screen): sim2real dispatch")
     if args.investigation:
@@ -320,6 +324,11 @@ def _make_dispatcher(max_agents: int = 4):
 
 
 def _dispatch(args) -> int:
+    if args.stop:
+        from sim2real.dispatch import stop_dispatcher
+
+        print(stop_dispatcher(_workspace()))
+        return 0
     if args.agents < 1:
         print("--agents must be at least 1", file=sys.stderr)
         return 2
@@ -328,10 +337,12 @@ def _dispatch(args) -> int:
         for note in dispatcher.tick():
             print(note)
         return 0
-    print(f"Dispatcher running every {args.interval:g} s on {data_dir()}, up to {args.agents} agents at once; stop "
-          "with Ctrl-C.")
+    idle = f"; stops after {args.until_idle:g} min with nothing to do" if args.until_idle is not None else ""
+    print(f"Dispatcher running every {args.interval:g} s on {data_dir()}, up to {args.agents} agents at once{idle}; "
+          "stop with Ctrl-C or `sim2real dispatch --stop`.", flush=True)
     try:
-        dispatcher.run_forever(args.interval)
+        dispatcher.run_forever(args.interval, log=lambda note: print(note, flush=True),
+                               idle_seconds=args.until_idle * 60 if args.until_idle is not None else None)
     except KeyboardInterrupt:
         print("Stopped.")
     return 0
@@ -381,6 +392,8 @@ def main(argv: list[str] | None = None) -> int:
 
     start = commands.add_parser("start", help="talk with the Chief Scientist (new or existing investigation)")
     start.add_argument("investigation", nargs="?", help="an existing investigation to continue")
+    start.add_argument("--no-dispatch", action="store_true",
+                       help="never start a dispatcher in the background; run `sim2real dispatch` yourself")
     start.add_argument("--plain", action="store_true",
                        help="line-by-line chat instead of the full-screen interface (used anyway when the terminal "
                             "cannot show it)")
@@ -394,6 +407,10 @@ def main(argv: list[str] | None = None) -> int:
     dispatch.add_argument("--interval", type=float, default=60.0, help="seconds between passes (default 60)")
     dispatch.add_argument("--agents", type=int, default=4, metavar="N",
                           help="agents that may run at the same time (default 4)")
+    dispatch.add_argument("--until-idle", type=float, metavar="MINUTES",
+                          help="stop after this long with nothing to do (as when the chat starts it)")
+    dispatch.add_argument("--stop", action="store_true",
+                          help="stop the dispatcher running on this data directory, after its agent runs finish")
     dispatch.set_defaults(handler=_dispatch)
 
     args = parser.parse_args(argv)

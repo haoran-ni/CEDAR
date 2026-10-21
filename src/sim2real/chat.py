@@ -10,6 +10,10 @@ The Chief Scientist also reviews the agents' reports in the background, in a con
 of its own; what it concluded is shown here, and passed to it at the start of its next
 turn in this conversation.
 
+With ``auto_dispatch`` the session starts a dispatcher in the background whenever the
+investigation has work for one and none is running, so approved agents start without the
+researcher starting anything.
+
 Commands may run while the Chief Scientist is still working on an earlier message (the
 terminal interface does this); every record they make is built from the state at the
 moment it is written.
@@ -17,6 +21,7 @@ moment it is written.
 
 import getpass
 import shlex
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -33,7 +38,15 @@ from sim2real.hpc.profile import ProfileStore
 from sim2real.hpc.slurm import SchedulerBackend
 from sim2real.models.types import ToolCall
 from sim2real.dashboard import dispatcher_status
-from sim2real.dispatch import current_activity, heartbeat_age
+from sim2real.dispatch import (
+    IDLE_MINUTES,
+    LOG,
+    current_activity,
+    dispatcher_running,
+    heartbeat_age,
+    needs_dispatcher,
+    start_background_dispatcher,
+)
 from sim2real.notebook import round_file, update_notebook
 from sim2real.state.projection import AgentRunRecord, InvestigationState
 from sim2real.summaries import approval_requests, investigation_summary, pending_approvals
@@ -75,6 +88,9 @@ def command_lines(commands: tuple[Command, ...]) -> str:
     return "\n".join(f"  {c.usage:<28} {c.description}" for c in commands)
 
 
+RESTART_SECONDS = 60
+"""The least time between two dispatchers this chat starts."""
+
 HELP = f"""Commands:
 {command_lines(COMMANDS)}
 A <calc> may be given by the first characters of its id, if they are unique. Anything else goes to
@@ -111,6 +127,11 @@ class ChatSession:
     _shown_approvals: set[str] = field(default_factory=set)
     _shown_starts: set[str] = field(default_factory=set)
     chief_session: str = ""
+    auto_dispatch: bool = False
+    """Start a dispatcher in the background when there is work for one and none is running."""
+    start_dispatcher: Callable[[Workspace], int] | None = None
+    """How to start one; by default ``start_background_dispatcher``."""
+    _last_start: float | None = None
 
     def __post_init__(self) -> None:
         if self.investigation_id is not None:
@@ -135,9 +156,25 @@ class ChatSession:
         line = line.strip()
         if not line:
             return ""
-        if line.startswith("/"):
-            return self._command(line)
-        return self._ask_chief(line, observer)
+        reply = self._command(line) if line.startswith("/") else self._ask_chief(line, observer)
+        started = self.ensure_dispatcher()
+        return f"{reply}\n\n{started}" if started else reply
+
+    def ensure_dispatcher(self) -> str | None:
+        """With ``auto_dispatch``, start a background dispatcher if the investigation has work for one and none
+        is running; say so, or return None."""
+        if not self.auto_dispatch or self.investigation_id is None:
+            return None
+        if not needs_dispatcher(self.workspace.ledger.load(self.investigation_id)) \
+                or dispatcher_running(self.workspace):
+            return None
+        if self._last_start is not None and time.monotonic() - self._last_start < RESTART_SECONDS:
+            return None  # one that keeps failing is not restarted over and over; its log says why
+        self._last_start = time.monotonic()
+        pid = (self.start_dispatcher or start_background_dispatcher)(self.workspace)
+        return (f"[dispatcher] Started in the background (process {pid}) to carry out the queued work. It keeps "
+                f"going after you leave and stops by itself after {IDLE_MINUTES} minutes with nothing to do; its log "
+                f"is {self.workspace.root / LOG}. `sim2real dispatch --stop` stops it.")
 
     def _command(self, line: str) -> str:
         try:
@@ -266,7 +303,11 @@ class ChatSession:
 
     def _dispatcher_status(self) -> str:
         now = self.clock()
-        text, _ = dispatcher_status(heartbeat_age(self.workspace, now), current_activity(self.workspace), now)
+        if self.auto_dispatch and not dispatcher_running(self.workspace):
+            return ("none is running now; this chat starts one in the background by itself right after your turn "
+                    "whenever there is queued work, so the researcher need not start anything")
+        text, _ = dispatcher_status(heartbeat_age(self.workspace, now), current_activity(self.workspace), now,
+                                    automatic=self.auto_dispatch)
         return text
 
     def _reviews_since_last_turn(self) -> str:

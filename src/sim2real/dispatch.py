@@ -24,7 +24,10 @@ The dispatcher then regenerates the research notebook of every investigation who
 grew, closed ones included.
 
 Only one dispatcher works on a data directory at a time: it holds a lock file for as long
-as it runs. It leaves a heartbeat at every pass and after every agent step, so the chat can
+as it runs. The researcher may run it themselves (``sim2real dispatch``), or the chat
+starts one in the background whenever an investigation has work for it and none is
+running (``start_background_dispatcher``); such a dispatcher stops by itself once it has
+had nothing to do for a while. It leaves a heartbeat at every pass and after every agent step, so the chat can
 warn when no dispatcher is running, and describes each agent run in progress in a file
 under ``activity/``, so the live panel can show them.
 """
@@ -32,7 +35,11 @@ under ``activity/``, so the live panel can show them.
 import fcntl
 import json
 import os
+import signal
+import subprocess
+import sys
 import threading
+import time
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -67,6 +74,35 @@ _ENDED = frozenset({CalculationState.SCHEDULER_TERMINAL, CalculationState.PARSIN
 _ORDER = {Priority.HIGH: 0, Priority.NORMAL: 1, Priority.LOW: 2, Priority.ON_HOLD: 3}
 HEARTBEAT = "dispatcher.heartbeat"
 ACTIVITY = "activity"
+LOCK = "dispatcher.lock"
+PID = "dispatcher.pid"
+LOG = "dispatcher.log"
+IDLE_MINUTES = 30
+"""A dispatcher the chat started stops after this long with nothing to do."""
+_LIVE = frozenset({CalculationState.SUBMISSION_PENDING, CalculationState.SUBMITTED, CalculationState.QUEUED,
+                   CalculationState.RUNNING, CalculationState.SCHEDULER_TERMINAL, CalculationState.PARSING})
+
+
+def needs_dispatcher(state: InvestigationState) -> bool:
+    """Whether the investigation has work only a dispatcher carries out: a proposal waiting out its review
+    window, agent work that can run, a review that is due, or a calculation authorized, at the scheduler or
+    waiting for its run check."""
+    if state.status in INVESTIGATION_MACHINE.terminal:
+        return False
+    proposal = state.pending_proposal
+    if proposal is not None and not proposal.feedback_ids:
+        return True
+    if any(Dispatcher._runnable(state, t) for t in state.pending_tasks) or review_due(state):
+        return True
+    for calc in state.calculations.values():
+        if calc.state in _LIVE:
+            return True
+        if (calc.state is CalculationState.VALIDATED_INPUT
+                and not all(state.plan.priority(h) is Priority.ON_HOLD for h in calc.hypothesis_ids)
+                and (not state.spec.constraints.submit_requires_approval
+                     or authorization_for(state, PermissionAction.SUBMIT, calc.calculation_id) is not None)):
+            return True
+    return False
 
 
 @dataclass(frozen=True)
@@ -136,21 +172,34 @@ class Dispatcher:
             return notes
 
     def run_forever(self, interval: float, log: Callable[[str], None] = print,
-                    stop: threading.Event | None = None) -> None:
+                    stop: threading.Event | None = None, idle_seconds: float | None = None) -> None:
         """Pass every ``interval`` seconds while agents work in the background; holds the lock throughout.
 
-        Setting ``stop`` ends it after the agent runs in progress. On Ctrl-C it also waits for them, so none
-        is cut off; a second Ctrl-C stops at once.
+        It ends, after the agent runs in progress, when ``stop`` is set, on SIGTERM (``sim2real dispatch
+        --stop``), or once it has had nothing to do for ``idle_seconds``. On Ctrl-C it also waits for the runs,
+        so none is cut off; a second Ctrl-C stops at once.
         """
         stop = stop or threading.Event()
         with self._exclusive() as mine:
             if not mine:
                 log("another dispatcher is working on this data directory; stopping")
                 return
+            pid_path = self.workspace.root / PID
+            _write_atomically(pid_path, str(os.getpid()))
+            terminate = None
+            if threading.current_thread() is threading.main_thread():
+                terminate = signal.signal(signal.SIGTERM, lambda *_: stop.set())
+            idle_since = None
             try:
                 while not stop.is_set():
                     for note in self._pass():
                         log(f"{self.clock():%Y-%m-%d %H:%M:%S} {note}")
+                    idle_since = None if self._has_work() else (idle_since or time.monotonic())
+                    if idle_seconds is not None and idle_since is not None \
+                            and time.monotonic() - idle_since >= idle_seconds:
+                        log(f"{self.clock():%Y-%m-%d %H:%M:%S} nothing to do for {idle_seconds / 60:g} min; "
+                            "stopping (the chat starts a dispatcher again when there is work)")
+                        break
                     stop.wait(interval)
                 for note in self.wait():
                     log(note)
@@ -161,6 +210,15 @@ class Dispatcher:
                     for note in self.wait():
                         log(note)
                 raise
+            finally:
+                if terminate is not None:
+                    signal.signal(signal.SIGTERM, terminate)
+                pid_path.unlink(missing_ok=True)
+
+    def _has_work(self) -> bool:
+        if self._runs:
+            return True
+        return any(needs_dispatcher(self.workspace.ledger.load(i)) for i in self.workspace.store.investigation_ids())
 
     def wait(self) -> list[str]:
         """Wait for every agent run in progress to end; their notes."""
@@ -174,7 +232,7 @@ class Dispatcher:
         if self._held is not None:
             yield True
             return
-        lock = open(self.workspace.root / "dispatcher.lock", "a")
+        lock = open(self.workspace.root / LOCK, "a")
         try:
             fcntl.lockf(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
@@ -497,6 +555,48 @@ class Dispatcher:
                 continue
             self._notebook_versions[investigation_id] = version
         return notes
+
+
+def dispatcher_running(workspace: Workspace) -> bool:
+    """Whether a dispatcher holds this data directory's lock right now."""
+    with open(workspace.root / LOCK, "a") as lock:
+        try:
+            fcntl.lockf(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return True
+        fcntl.lockf(lock, fcntl.LOCK_UN)
+        return False
+
+
+def start_background_dispatcher(workspace: Workspace, idle_minutes: float = IDLE_MINUTES) -> int:
+    """Start ``sim2real dispatch`` for this data directory as a separate, detached process, so it keeps working
+    after the chat closes; it stops after ``idle_minutes`` with nothing to do. Its output goes to the log file
+    in the data directory. Returns its process id."""
+    environment = {**os.environ, "SIM2REAL_DATA_DIR": str(workspace.root)}
+    with open(workspace.root / LOG, "a") as log:
+        process = subprocess.Popen(
+            [sys.executable, "-m", "sim2real", "dispatch", "--until-idle", f"{idle_minutes:g}"],
+            stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT, cwd=workspace.root, env=environment,
+            start_new_session=True, close_fds=True)
+    return process.pid
+
+
+def stop_dispatcher(workspace: Workspace, timeout: float = 600) -> str:
+    """Ask the dispatcher of this data directory to stop (SIGTERM) and wait until it has, for at most
+    ``timeout`` seconds; it first finishes the agent runs in progress."""
+    if not dispatcher_running(workspace):
+        return "No dispatcher is running on this data directory."
+    try:
+        pid = int((workspace.root / PID).read_text().strip())
+    except (FileNotFoundError, ValueError):
+        return "A dispatcher holds the lock but left no process id; stop it where it runs (Ctrl-C)."
+    os.kill(pid, signal.SIGTERM)
+    deadline = time.monotonic() + timeout
+    while dispatcher_running(workspace):
+        if time.monotonic() > deadline:
+            return f"Asked the dispatcher (process {pid}) to stop; it is still finishing agent runs."
+        time.sleep(0.2)
+    return f"Stopped the dispatcher (process {pid})."
 
 
 def heartbeat_age(workspace: Workspace, now: datetime | None = None) -> float | None:

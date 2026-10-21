@@ -57,11 +57,10 @@ sim2real models check                   # one tiny request to confirm the key wo
 sim2real setup --name mycluster         # an agent works out how FHI-aims runs here and asks you questions
 sim2real profile show mycluster
 sim2real profile approve mycluster      # nothing runs on the cluster until you approve a profile
-sim2real dispatch                       # keep running (e.g. in tmux): submits what you authorize, runs agents (--agents N at once)
 sim2real start                          # live panel and chat with the Chief Scientist (--plain for line by line); /help lists commands
 sim2real report                         # write the research notebook (the dispatcher also keeps it current)
 ```
 
-Proposed agents start after a 10-minute review window unless you reply; `/agents` shows them and `/approve agents` starts them at once. Calculations are submitted only after you type `/approve submit <calculation>` in the chat. Each investigation's notebook is in the data directory, by default `~/.local/share/sim2real/notebooks/<investigation>/index.md`.
+The chat starts a dispatcher in the background whenever there is work for it: it starts the agents, submits what you authorize and follows the jobs, keeps going after you close the chat, and stops by itself after 30 idle minutes (`sim2real dispatch --stop` stops it now; `sim2real start --no-dispatch` leaves it to you, e.g. `sim2real dispatch --agents N` in tmux). Proposed agents start after a 10-minute review window unless you reply; `/agents` shows them and `/approve agents` starts them at once. Calculations are submitted only after you type `/approve submit <calculation>` in the chat. Each investigation's notebook is in the data directory, by default `~/.local/share/sim2real/notebooks/<investigation>/index.md`.
 
 For detailed implementation guidance, start with [`AGENTS.md`](AGENTS.md). Design documents and the record of decisions are in [`docs/`](docs/).

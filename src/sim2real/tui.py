@@ -240,9 +240,10 @@ class Sim2RealApp(App):
     COLUMNS = ("Hypothesis", "Lifecycle", "Agent", "Jobs (scheduler)", "Evidence (validator)", "Assessment (judge)")
 
     def __init__(self, session: ChatSession, *, refresh_seconds: float = 2.0,
-                 clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc)) -> None:
+                 clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc), started: str | None = None) -> None:
         super().__init__()
         self.session = session
+        self._started = started
         self.workspace = session.workspace
         self.refresh_seconds = refresh_seconds
         self.clock = clock
@@ -290,6 +291,8 @@ class Sim2RealApp(App):
         else:
             self.say("New conversation with the Chief Scientist. Describe the simulation-experiment discrepancy you "
                      "want to investigate. Type /help for commands.", "notice")
+        if self._started:
+            self.say(self._started, "notice")
         self.query_one(Input).focus()
         self._fit_panel()
         self.refresh_state()
@@ -472,13 +475,19 @@ class Sim2RealApp(App):
 
     def _snapshot(self) -> _Snapshot:
         now = self.clock()
+        started = self.session.ensure_dispatcher()  # restarts one that stopped while work remains
+        if started:
+            self.call_from_thread(self.say, started, "notice")
         activities = current_activity(self.workspace)
-        dispatcher, alarm = dispatcher_status(heartbeat_age(self.workspace, now), activities, now)
+        automatic = self.session.auto_dispatch
+        dispatcher, alarm = dispatcher_status(heartbeat_age(self.workspace, now), activities, now, automatic)
+        running = not alarm and not (automatic and dispatcher.startswith("no dispatcher"))
         investigation_id = self.session.investigation_id
         settings = self.session.clients.settings
         if investigation_id is None:
             return _Snapshot("No investigation yet: describe the discrepancy to the Chief Scientist.", dispatcher,
-                             alarm, subagent_status(None, activities, now, not alarm), model_line(settings, None))
+                             alarm, subagent_status(None, activities, now, running, automatic),
+                             model_line(settings, None))
         version = self.workspace.store.current_version(investigation_id)
         changed = version != self._version
         if changed:
@@ -487,7 +496,7 @@ class Sim2RealApp(App):
             self._version = version
         state = self._state
         return _Snapshot(status_line(state, now), f"{work_summary(state)} · {dispatcher}", alarm,
-                         subagent_status(state, activities, now, not alarm), model_line(settings, state),
+                         subagent_status(state, activities, now, running, automatic), model_line(settings, state),
                          swarm_rows(state, self._events, activities, now),
                          self.session.notices() if changed else [], self._new_results(state) if changed else [],
                          state.round)
@@ -577,5 +586,6 @@ class Sim2RealApp(App):
         self.call_from_thread(self.push_screen, NotebookScreen(update.directory, page, self.workspace.artifacts.root))
 
 
-def run_tui(session: ChatSession) -> None:
-    Sim2RealApp(session).run()
+def run_tui(session: ChatSession, started: str | None = None) -> None:
+    """Run the interface; ``started`` says that a dispatcher was started for it in the background."""
+    Sim2RealApp(session, started=started).run()

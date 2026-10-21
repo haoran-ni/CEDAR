@@ -79,6 +79,8 @@ class ActorKind(StrEnum):
     APPROVER = "approver"
     """Decides on the researcher's behalf, in full automation only, whether proposed agents start and
     calculations are submitted."""
+    WORKBENCH = "workbench"
+    """Runs agents' commands in their workspaces, in a sandbox, and records them."""
     SYSTEM = "system"
 
 

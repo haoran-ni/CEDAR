@@ -54,6 +54,7 @@ from cedar.contracts.events import (
     RetrievalPolicyChanged,
     TokenBudgetChanged,
     UserInterventionRecorded,
+    WorkbenchPolicyChanged,
 )
 from cedar.contracts.investigation import RetrievalPolicy
 from cedar.contracts.plan import Authorization, PermissionAction
@@ -61,6 +62,7 @@ from cedar.contracts.status import INVESTIGATION_MACHINE, CalculationState, Inve
 from cedar.errors import RuleViolation
 from cedar.hpc.profile import ProfileStore
 from cedar.hpc.profile import ProfileNotApproved
+from cedar.hpc.node import ExecutionHost, HostWatch, local_dft
 from cedar.hpc.slurm import SchedulerBackend, SchedulerError
 from cedar.models.types import ToolCall
 from cedar.dashboard import dispatcher_status
@@ -68,6 +70,7 @@ from cedar.dispatch import (
     IDLE_MINUTES,
     LOG,
     current_activity,
+    dispatcher_host,
     dispatcher_running,
     heartbeat_age,
     needs_dispatcher,
@@ -77,10 +80,16 @@ from cedar.dispatch import (
 from cedar.notebook import round_file, update_notebook
 from cedar.paths import config_dir
 from cedar.state.projection import AgentRunRecord, InvestigationState, RetrievalRecord
-from cedar.summaries import approval_requests, investigation_summary, pending_approvals, recommendation_text
+from cedar.summaries import (
+    approval_requests,
+    calculation_summary,
+    investigation_summary,
+    pending_approvals,
+    recommendation_text,
+)
 from cedar.swarm import CHIEF, agent_label, agents_summary, close_drafts, halt_drafts, start_drafts
 from cedar.web import web_access, web_summary
-from cedar.workspace import ModelClients, Workspace, profile_for, registry_for, services_for
+from cedar.workspace import ModelClients, Workspace, investigation_registrar, profile_for, registry_for, services_for
 
 @dataclass(frozen=True)
 class Command:
@@ -116,8 +125,13 @@ COMMANDS = (
     Command("/web on", "let the Chief Scientist and the hypothesis agents search and read the web"),
     Command("/web only <domains>", "the same, limited to these domains, e.g. arxiv.org doi.org"),
     Command("/web off", "no web for any agent (the default; keeps blind tests blind)"),
+    Command("/workbench", "show whether the agents may run commands in their workspaces, and where they run"),
+    Command("/workbench on", "let them (the default): sandboxed, no network, no DFT, writing only in their workspaces"),
+    Command("/workbench off", "no commands for any agent of this investigation"),
     Command("/attach <path> <note>", "give the agents an image, PDF or text file to view; the note is optional"),
     Command("/materials", "the files you attached"),
+    Command("/register <dir> <note>", "register a finished FHI-aims run computed outside CEDAR, shared with every "
+                                      "agent, so evidence can come from it; --output <file> if it is not aims.out"),
     Command("/cancel <calc> <reason>", "cancel a calculation, stopping its job if it has one"),
     Command("/report", "update the research notebook and show where it is"),
     Command("/halt <reason>", "stop this investigation now: cancel its jobs, retire its agents, pause it (reason "
@@ -186,6 +200,8 @@ class ChatSession:
     """Start a dispatcher in the background when there is work for one and none is running."""
     start_dispatcher: Callable[[Workspace], int] | None = None
     """How to start one; by default ``start_background_dispatcher``."""
+    host: Callable[[], ExecutionHost] = field(default_factory=HostWatch)
+    """Where the chat runs: a login node, or an interactive node inside a Slurm allocation."""
     _last_start: float | None = None
 
     def __post_init__(self) -> None:
@@ -276,6 +292,10 @@ class ChatSession:
             return self._authorize(action, args[1], line)
         if name == "/cancel" and len(args) >= 2:
             return self._cancel(args[0], " ".join(args[1:]), line)
+        if name == "/register":
+            return self._register(args, line)
+        if name == "/workbench":
+            return self._workbench(args, line)
         if name == "/halt":
             return self._halt([self.investigation_id], " ".join(args), line)
         return f"Unknown or incomplete command: {line}\n{HELP}"
@@ -609,18 +629,78 @@ class ChatSession:
             return [], []
         state = self.workspace.ledger.load(investigation_id)
         try:
-            manager = services_for(self.workspace, profile_for(state, self.profiles), self.backend).manager
+            services = services_for(self.workspace, profile_for(state, self.profiles), self.backend)
         except (LookupError, ProfileNotApproved, FileNotFoundError) as exc:
             return [], [f"{', '.join(live)}: no usable compute profile ({exc})"]
         cancelled, failed = [], []
         for calculation_id in live:
             job = state.calculations[calculation_id].scheduler_job_id
             try:
-                manager.cancel(investigation_id, calculation_id, reason)
+                services.manager_for(state.calculations[calculation_id]).cancel(investigation_id, calculation_id,
+                                                                                reason)
                 cancelled.append(f"{calculation_id}" + (f" (job {job})" if job else ""))
             except (RuleViolation, SchedulerError, OSError) as exc:
                 failed.append(f"{calculation_id}: {exc}")
         return cancelled, failed
+
+    def _workbench(self, args: list[str], line: str) -> str:
+        state = self.workspace.ledger.load(self.investigation_id)
+        if not args:
+            setting = "on" if state.workbench_enabled else "off"
+            return (f"The workbench is {setting} for this investigation: agents "
+                    + ("may run sandboxed commands in their workspaces (no network, no DFT, writing nowhere else)."
+                       if state.workbench_enabled else "run no commands.")
+                    + f" CEDAR runs on the {self.host().describe()}.\nUsage: /workbench on, or /workbench off")
+        if args not in (["on"], ["off"]):
+            return "Usage: /workbench, /workbench on, or /workbench off"
+        enabled = args == ["on"]
+
+        def build(current: InvestigationState) -> list[EventDraft]:
+            message = self._message_draft(current, line, ())
+            return [message, EventDraft(actor=self.user, payload=WorkbenchPolicyChanged(
+                enabled=enabled, intervention_id=message.payload.intervention_id))]
+
+        try:
+            events = self.workspace.ledger.record_with(self.investigation_id, build).events
+        except RuleViolation as exc:
+            return f"The workbench could not be changed: {exc}"
+        message_id = events[0].payload.intervention_id
+        if enabled:
+            return f"Agents may run commands in their workspaces again from their next command ({message_id})."
+        return (f"No agent runs commands from now on ({message_id}); a command already running finishes. "
+                "/workbench on allows them again.")
+
+    def _register(self, args: list[str], line: str) -> str:
+        usage = ("Usage: /register <dir> <note> [--output <file>], e.g. /register ~/runs/co-fcc \"my PBE fcc run, "
+                 "the one that disagrees\"")
+        output = "aims.out"
+        if "--output" in args:
+            at = args.index("--output")
+            if at + 1 >= len(args):
+                return usage
+            output, args = args[at + 1], args[:at] + args[at + 2:]
+        if not args:
+            return usage
+        directory = Path(args[0]).expanduser().resolve()
+        if directory == config_dir().resolve() or directory.is_relative_to(config_dir().resolve()):
+            return "Nothing in CEDAR's configuration directory, which holds your API keys, can be registered."
+        missing = [name for name in ("control.in", "geometry.in", output) if not (directory / name).is_file()]
+        if missing:
+            return f"{directory} has no {', '.join(missing)}.\n{usage}"
+        note = " ".join(args[1:]).strip() or f"a run the researcher registered from {directory}"
+        message_id = self._record_message(line)
+        registrar = investigation_registrar(self.workspace, self.profiles, self.investigation_id,
+                                            deny=[config_dir()])
+        outcome = registrar.register(self.investigation_id, directory, requested_by=self.user, description=note,
+                                     output_file=output, intervention_id=message_id)
+        if outcome.calculation_id is None:
+            return f"Recorded your message ({message_id}), but nothing was registered: {'; '.join(outcome.problems)}"
+        state = self.workspace.ledger.load(self.investigation_id)
+        summary = calculation_summary(state, state.calculations[outcome.calculation_id])
+        if outcome.reused:
+            return f"That run is already registered ({message_id}):\n{summary}"
+        return (f"Registered ({message_id}); every agent can read and analyse it, and evidence from it is marked as "
+                f"computed outside CEDAR:\n{summary}")
 
     def _cancel(self, given: str, reason: str, line: str) -> str:
         state = self.workspace.ledger.load(self.investigation_id)
@@ -631,7 +711,8 @@ class ChatSession:
                                                                  target_ids=(calculation_id,)),))
         services = services_for(self.workspace, profile_for(state, self.profiles), self.backend)
         try:
-            services.manager.cancel(self.investigation_id, calculation_id, reason)
+            services.manager_for(state.calculations[calculation_id]).cancel(self.investigation_id, calculation_id,
+                                                                            reason)
         except RuleViolation as exc:
             return f"Recorded your cancellation ({intervention}), but it could not be applied: {exc}"
         return f"Cancelled {calculation_id} ({intervention})."
@@ -657,7 +738,10 @@ class ChatSession:
         context = ChiefContext(ledger=self.workspace.ledger, profiles=self.profiles, actor=CHIEF,
                                registry_for=lambda name: registry_for(self.profiles.load_approved(name)),
                                investigation_id=self.investigation_id, on_open=self._opened, clock=self.clock,
-                               dispatcher=self._dispatcher_status)
+                               dispatcher=self._dispatcher_status,
+                               registrar=lambda inv: investigation_registrar(self.workspace, self.profiles, inv,
+                                                                             deny=[config_dir()]),
+                               where=self._where)
         settings = self.clients.settings("chief_scientist")
         runner = AgentRunner(self.clients.client("chief_scientist"), settings, self.workspace.transcripts,
                              secrets=self.clients.secrets())
@@ -676,6 +760,15 @@ class ChatSession:
         if result.outcome != "finished":
             reply += f"\n[the Chief Scientist stopped: {result.outcome}{': ' + result.error if result.error else ''}]"
         return reply.strip()
+
+    def _where(self) -> str:
+        """Whether calculations can run locally: they start where the dispatcher runs, which the chat starts here."""
+        here = self.host()
+        elsewhere = dispatcher_host(self.workspace)
+        if dispatcher_running(self.workspace) and elsewhere is not None and elsewhere != here.hostname:
+            return (f"local calculations start on {elsewhere}, where the dispatcher runs, not on the "
+                    f"{here.describe()} where this chat runs; ask the researcher to run CEDAR on one node")
+        return local_dft(here)
 
     def _dispatcher_status(self) -> str:
         now = self.clock()

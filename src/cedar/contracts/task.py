@@ -8,7 +8,7 @@ classification lets a comparison state which of its differences are intended.
 
 from collections.abc import Iterable, Sequence
 from enum import StrEnum
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import Field, JsonValue, model_validator
 
@@ -44,6 +44,13 @@ class ResourceBudget(Contract):
     max_core_hours: float | None = Field(default=None, gt=0)
     max_walltime_hours: float | None = Field(default=None, gt=0)
     max_jobs: int | None = Field(default=None, gt=0)
+    cores: int | None = Field(default=None, gt=0)
+    """Cores to run on, if not the profile's default; for a local run, at most the allocation's on this node."""
+
+
+Execution = Literal["slurm", "local"]
+"""Where a calculation runs: as a Slurm job, or on the interactive node CEDAR runs on, inside the researcher's
+allocation. Either way its inputs are examined and its submission authorized."""
 
 
 class ScientificTaskSpec(Contract):
@@ -60,6 +67,7 @@ class ScientificTaskSpec(Contract):
     controls: dict[Identifier, JsonValue] = {}
     fidelity: FidelityTier = FidelityTier.SCREENING
     budget: ResourceBudget = ResourceBudget()
+    execution: Execution = "slurm"
     authored_files: dict[FileName, ArtifactRef] = {}
     """Input files and job scripts written by an agent; the protocol generates any it needs
     that are not given. All of them are examined before anything runs."""
@@ -79,7 +87,8 @@ class ScientificTaskSpec(Contract):
     def identity_hash(self) -> str:
         """Hash of the scientific content, used to detect duplicate calculations.
 
-        Descriptive labels, fidelity tier and budget are excluded; the structure and
+        Descriptive labels, fidelity tier, budget and where it runs are excluded, so the same
+        calculation run locally or through Slurm is one calculation; the structure and
         agent-written files count only through their content hashes.
         """
         return sha256_hex(canonical_json({

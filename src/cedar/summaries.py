@@ -5,6 +5,7 @@ always shown separately.
 """
 
 from cedar.automation import mode_summary, pending_decisions
+from cedar.contracts.base import canonical_json
 from cedar.contracts.examination import ExaminationVerdict, FindingSeverity
 from cedar.contracts.plan import PermissionAction
 from cedar.contracts.status import CalculationState
@@ -22,15 +23,24 @@ from cedar.web import web_summary
 def calculation_summary(state: InvestigationState, calc: CalculationRecord, *, findings: bool = True,
                         viewer: str | None = None) -> str:
     """One calculation; ``viewer`` is the hypothesis whose agent reads it, which then sees only its own work."""
-    head = f"{calc.calculation_id}: {calc.state.value}"
-    if calc.examination is not None:
-        head += f"; inputs {calc.examination.verdict.value}"
-    if calc.scheduler_job_id:
-        job_state = calc.scheduler_state.value if calc.scheduler_state else "submitted"
-        head += f"; job {calc.scheduler_job_id} {job_state}"
-    used_by = "" if viewer is not None else f"; for {', '.join(calc.hypothesis_ids)}"
-    lines = [head, f"  {calc.task.observable.name} via {calc.task.protocol.name} {calc.task.protocol.version}; "
-                   f"estimand: {calc.task.estimand}{used_by}"]
+    if calc.registered:
+        registration = calc.registration
+        owner = "shared with every agent" if calc.shared else f"for {registration.hypothesis_id}"
+        settings = ", ".join(f"{name} {canonical_json(value)}" for name, value in
+                             {**calc.task.controls, **calc.task.numerical_settings}.items())
+        lines = [f"{calc.calculation_id}: registered run from {registration.source} ({owner}; computed outside "
+                 f"CEDAR, FHI-aims {registration.code_version})",
+                 f"  {registration.description}", f"  settings its inputs used: {settings or 'none recorded'}"]
+    else:
+        head = f"{calc.calculation_id}: {calc.state.value}"
+        if calc.examination is not None:
+            head += f"; inputs {calc.examination.verdict.value}"
+        if calc.scheduler_job_id:
+            job_state = calc.scheduler_state.value if calc.scheduler_state else "submitted"
+            head += f"; job {calc.scheduler_job_id} {job_state}"
+        used_by = "" if viewer is not None else f"; for {', '.join(calc.hypothesis_ids)}"
+        lines = [head, f"  {calc.task.observable.name} via {calc.task.protocol.name} {calc.task.protocol.version}; "
+                       f"estimand: {calc.task.estimand}{used_by}"]
     if findings and calc.examination is not None:
         for f in calc.examination.findings:
             if f.severity is not FindingSeverity.INFO or f.code == "generated":

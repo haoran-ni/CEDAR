@@ -21,6 +21,7 @@ from cedar.contracts.base import (
     Actor,
     Contract,
     ExternalSource,
+    FileName,
     Identifier,
     NonEmptyStr,
     Observable,
@@ -58,11 +59,12 @@ from cedar.contracts.next_actions import CandidateAction
 from cedar.contracts.plan import Priority, ResearchPlan
 from cedar.contracts.status import HypothesisStatus, InvestigationStatus
 from cedar.contracts.task import ProtocolRef
+from cedar.engine.registration import RunRegistrar
 from cedar.hpc.profile import ProfileStore
 from cedar.protocols.base import ProtocolRegistry
 from cedar.state.ledger import ResearchLedger
 from cedar.state.projection import review_deadline
-from cedar.summaries import investigation_summary, pending_approvals
+from cedar.summaries import calculation_summary, investigation_summary, pending_approvals
 from cedar.swarm import agent_label, agents_summary, clock_time
 
 
@@ -80,6 +82,10 @@ class ChiefContext:
     clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc)
     dispatcher: Callable[[], str] | None = None
     """Whether a dispatcher, which carries out queued agent work and submissions, is running."""
+    registrar: Callable[[str], RunRegistrar] | None = None
+    """Registers runs computed outside CEDAR for an investigation, by its id."""
+    where: Callable[[], str] | None = None
+    """Where CEDAR runs, and so whether calculations can run locally."""
 
 
 class NoArgs(Contract):
@@ -248,6 +254,17 @@ class ProtocolArgs(Contract):
     version: str
 
 
+class RegisterArgs(Contract):
+    directory: str = Field(description="Absolute path of a finished FHI-aims run's directory, holding its "
+                                       "control.in, geometry.in and output.")
+    description: NonEmptyStr = Field(description="What the run is, e.g. the researcher's calculation that disagrees "
+                                                 "with the measurement.")
+    output_file: FileName = Field(default="aims.out", description="The output's file name in that directory.")
+    hypothesis_id: Identifier | None = Field(default=None, description="Register it for this hypothesis only; by "
+                                                                       "default it is shared with every agent.")
+    system_label: str | None = Field(default=None, description="A short label; the directory's name by default.")
+
+
 def chief_tools(ctx: ChiefContext) -> list[AgentTool]:
     def current() -> str:
         if ctx.investigation_id is None:
@@ -316,6 +333,8 @@ def chief_tools(ctx: ChiefContext) -> list[AgentTool]:
         if ctx.dispatcher is not None:
             summary += (f"\nDispatcher (the process that carries out queued agent work and submissions; the "
                         f"researcher starts it with `cedar dispatch`): {ctx.dispatcher()}")
+        if ctx.where is not None:
+            summary += f"\nLocal DFT (calculations with execution 'local'): {ctx.where()}"
         return summary
 
     def set_investigation_status(args: InvestigationStatusArgs) -> str:
@@ -471,6 +490,21 @@ def chief_tools(ctx: ChiefContext) -> list[AgentTool]:
             raise ToolFailure(f"no protocol {args.name} {args.version}; available: {available or 'none'}")
         return protocol.describe()
 
+    def register_existing_run(args: RegisterArgs) -> str:
+        if ctx.registrar is None:
+            raise ToolFailure("runs cannot be registered from here")
+        outcome = ctx.registrar(current()).register(
+            current(), args.directory, requested_by=ctx.actor, description=args.description,
+            hypothesis_id=args.hypothesis_id, output_file=args.output_file, system_label=args.system_label)
+        if outcome.calculation_id is None:
+            raise ToolFailure("not registered: " + "; ".join(outcome.problems))
+        state = ctx.ledger.load(current())
+        calc = state.calculations[outcome.calculation_id]
+        notes = [f"  [{n.severity.value}] {n.code}: {n.message}" for n in calc.registration.notes]
+        who = "every agent" if calc.shared else f"the agent of {args.hypothesis_id}"
+        return "\n".join([calculation_summary(state, calc), "(already registered)" if outcome.reused else
+                          f"(registered; {who} can read and analyse it)", *notes])
+
     return [
         AgentTool("list_compute_profiles", "List compute profiles and whether each is approved for use.", NoArgs,
                   list_compute_profiles),
@@ -523,4 +557,9 @@ def chief_tools(ctx: ChiefContext) -> list[AgentTool]:
                   "review, closing) and the exact command they type to grant each.", NoArgs, approvals),
         AgentTool("describe_protocol", "Explain what a protocol under this investigation's compute profile "
                   "accepts.", ProtocolArgs, describe_protocol),
+        AgentTool("register_existing_run", "Register a finished FHI-aims run computed outside CEDAR, such as the "
+                  "researcher's calculation that disagrees with the measurement, so that agents can read and "
+                  "analyse it and evidence can come from it. Nothing runs: its files are stored by hash, its health "
+                  "is checked from its output, and the settings its inputs used are recorded. By default every "
+                  "agent may use it.", RegisterArgs, register_existing_run),
     ]

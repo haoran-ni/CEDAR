@@ -2,9 +2,11 @@
 
 Before the script starts, this sets CPU, memory and file-size limits and installs an audit
 hook that refuses to read anything but the working directory and the read-only roots it is
-given (the Python installation), to change anything outside the working directory, to start
-processes or to open sockets. Audit hooks cannot be removed once installed, but they are not
-a security boundary against code written to evade them; they stop mistakes and naive misuse.
+given (the Python installation), or anything in a denied root, to change anything outside the
+working directory, to start processes or to open sockets. Audit hooks cannot be removed once
+installed, but they are not a security boundary against code written to evade them; they stop
+mistakes and naive misuse. The workbench uses the same guard for Python scripts where the
+machine has no bubblewrap.
 
 Standard library only: this file runs in the child process before anything else.
 """
@@ -17,7 +19,15 @@ import sys
 
 ROOT = os.path.realpath(os.environ["CEDAR_ANALYSIS_ROOT"])
 READ_ROOTS = tuple(os.path.realpath(p) for p in os.environ.get("CEDAR_READ_ROOTS", "").split(os.pathsep) if p)
+DENY_ROOTS = tuple(os.path.realpath(p) for p in os.environ.get("CEDAR_DENY_ROOTS", "").split(os.pathsep) if p)
+ALLOW_ROOTS = tuple(os.path.realpath(p) for p in os.environ.get("CEDAR_ALLOW_ROOTS", "").split(os.pathsep) if p)
+"""Readable although inside a denied root."""
 LIMITS = json.loads(os.environ.get("CEDAR_LIMITS", "{}"))
+SCRIPT = os.environ.get("CEDAR_SCRIPT", "analysis.py")
+"""The script to run, relative to the root directory."""
+ARGV = json.loads(os.environ.get("CEDAR_ARGV", "[]"))
+CWD = os.environ.get("CEDAR_CWD", ".")
+"""Where the script runs, relative to the root directory."""
 
 REFUSED_EVENTS = frozenset({
     "subprocess.Popen", "os.system", "os.exec", "os.posix_spawn", "os.spawn", "os.fork", "os.forkpty",
@@ -32,7 +42,7 @@ _WRITE_FLAGS = os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_APPEND | os.O_TRUNC
 
 
 def _inside(path: str, base: str) -> bool:
-    return path == base or path.startswith(base + os.sep)
+    return path == base or path.startswith(base if base.endswith(os.sep) else base + os.sep)
 
 
 def _real(path) -> str:
@@ -40,7 +50,9 @@ def _real(path) -> str:
 
 
 def _readable(path: str) -> bool:
-    return _inside(path, ROOT) or any(_inside(path, root) for root in READ_ROOTS)
+    if _inside(path, ROOT) or any(_inside(path, root) for root in ALLOW_ROOTS):
+        return True
+    return not any(_inside(path, root) for root in DENY_ROOTS) and any(_inside(path, root) for root in READ_ROOTS)
 
 
 def _hook(event: str, args: tuple) -> None:
@@ -80,9 +92,11 @@ def main() -> None:
     _limit(resource.RLIMIT_AS, LIMITS.get("memory_bytes"))
     _limit(resource.RLIMIT_FSIZE, LIMITS.get("file_bytes"))
     _limit(resource.RLIMIT_CORE, 0)
-    os.chdir(ROOT)
+    script = os.path.join(ROOT, SCRIPT)
+    os.chdir(os.path.join(ROOT, CWD))
+    sys.argv = [script, *ARGV]
     sys.addaudithook(_hook)
-    runpy.run_path(os.path.join(ROOT, "analysis.py"), run_name="__main__")
+    runpy.run_path(script, run_name="__main__")
 
 
 if __name__ == "__main__":

@@ -56,7 +56,10 @@ from cedar.contracts.events import (
     RoundStarted,
     TokenBudgetChanged,
     RunChecked,
+    RunRegistered,
     UserInterventionRecorded,
+    WorkbenchPolicyChanged,
+    WorkbenchRunRecorded,
 )
 from cedar.contracts.evidence import EvidenceObject
 from cedar.contracts.examination import FindingSeverity
@@ -77,6 +80,7 @@ from cedar.state.projection import (
     HypothesisRecord,
     InvestigationState,
     apply,
+    evidence_owner,
     hypothesis_evidence,
     review_deadline,
 )
@@ -256,6 +260,13 @@ def _calc_status(calc: CalculationRecord) -> str:
 
 
 def _inputs(calc: CalculationRecord, indent: str) -> list[str]:
+    if calc.registered:
+        registration = calc.registration
+        lines = [f"{indent}- Inputs registered from `{registration.source}` with its output: computed outside CEDAR "
+                 f"(FHI-aims {registration.code_version}), not examined before it ran"]
+        lines += [f"{indent}  - {n.severity.value} {n.code}: {_flat(n.message)}" for n in registration.notes
+                  if n.severity in (FindingSeverity.ERROR, FindingSeverity.REVIEW, FindingSeverity.WARNING)]
+        return lines
     exam = calc.examination
     if exam is None:
         return [f"{indent}- Inputs: not examined yet"]
@@ -275,12 +286,44 @@ def _inputs(calc: CalculationRecord, indent: str) -> list[str]:
     return lines
 
 
+def _where(calc: CalculationRecord) -> str:
+    """Where a calculation ran or runs."""
+    if calc.registered:
+        return "computed outside CEDAR"
+    return "runs locally on an interactive node" if calc.task.execution == "local" else "runs through Slurm"
+
+
+def _workbench_lines(record, here: _Here) -> list[str]:
+    run = record.run
+    code = f", exit code {run.exit_code}" if run.exit_code is not None else ""
+    changed = f"; wrote {', '.join(sorted(run.changed)[:8])}" + (" …" if len(run.changed) > 8 else "") \
+        if run.changed else ""
+    output = f"; {here.artifact(run.output, 'output')}" if run.output else ""
+    return [f"- {record.run_id} by {record.agent_id} for {here.hyp(record.hypothesis_id)}: "
+            f"{_code(_short(run.command, 200))} "
+            f"{run.outcome.value}{code}, {run.duration_seconds:g} s on {run.host}{changed}{output}",
+            f"  - Purpose: {_said(run.purpose)}"]
+
+
+def _users(calc: CalculationRecord, here: _Here) -> str:
+    return "every agent" if calc.shared else ", ".join(here.hyp(h) for h in calc.hypothesis_ids)
+
+
+def _origin(calc: CalculationRecord, events: Sequence[RecordedEvent]) -> tuple[str, Actor]:
+    """Why the calculation exists and who asked: its request, or its registration."""
+    if calc.registered:
+        return calc.registration.description, calc.registration.requested_by
+    request = events[calc.requested_at - 1]
+    return request.payload.rationale, request.actor
+
+
 def _calculation_lines(calc: CalculationRecord, rationale: str, requester: Actor, here: _Here,
                        status_label: str) -> list[str]:
     t = calc.task
+    what = "registered run" if calc.registered else _flat(t.estimand)
     return [
-        f"- **{calc.calculation_id}** for {', '.join(here.hyp(h) for h in calc.hypothesis_ids)}: "
-        f"{_flat(t.estimand)} ({_flat(t.system_label)})",
+        f"- **{calc.calculation_id}** for {_users(calc, here)}: {what} ({_flat(t.system_label)}); "
+        f"{_where(calc)}",
         f"  - Why, by {_actor(requester)}: {_said(rationale)}",
         f"  - Protocol {t.protocol.name} {t.protocol.version}; observable {t.observable.name}; "
         f"fidelity {t.fidelity.value}",
@@ -296,8 +339,10 @@ def _evidence_lines(evidence_id: str, ev: EvidenceObject, state: InvestigationSt
         hypotheses = [state.analyses[ev.analysis_id].hypothesis_id]
         origin = f"from analysis {ev.analysis_id} of {', '.join(ev.calculation_ids)}"
     elif ev.calculation_id is not None:
-        hypotheses = state.calculations[ev.calculation_id].hypothesis_ids
-        origin = f"from {ev.calculation_id}"
+        owner = evidence_owner(state, ev)
+        hypotheses = [owner] if owner is not None else state.calculations[ev.calculation_id].hypothesis_ids
+        origin = f"from {ev.calculation_id}" + (" (registered run)" if state.calculations[ev.calculation_id].registered
+                                                else "")
     else:
         hypotheses, origin = [], f"({ev.kind.value.replace('_', ' ')})"
     linked = f" for {', '.join(here.hyp(h) for h in hypotheses)}" if hypotheses else ""
@@ -382,6 +427,10 @@ _REPORTS_NOTE = ("In the agents' own words. A report is not evidence: its values
 def _web_use(p: AgentRunRecorded) -> str:
     return f"{p.web_searches} web search{'es' if p.web_searches != 1 else ''}, {p.web_fetches} page" \
         f"{'s' if p.web_fetches != 1 else ''} fetched"
+
+
+def _workbench_change(p: WorkbenchPolicyChanged) -> str:
+    return "Agents' workbench turned " + ("on" if p.enabled else "off")
 
 
 def _web_change(p: RetrievalPolicyChanged) -> str:
@@ -494,6 +543,8 @@ def _why(rnd: _Round, state: InvestigationState) -> list[str]:
             lines.append(f"- {_mode_change(p)}, by {who}: {_said(p.reason)}")
         elif isinstance(p, RetrievalPolicyChanged):
             lines.append(f"- {_web_change(p)} by {who} ({p.intervention_id})")
+        elif isinstance(p, WorkbenchPolicyChanged):
+            lines.append(f"- {_workbench_change(p)} by {who} ({p.intervention_id})")
         elif isinstance(p, TokenBudgetChanged):
             lines.append(f"- {_budget_change(p.max_tokens)} by {who} ({p.intervention_id})")
         elif isinstance(p, MaterialAttached):
@@ -545,6 +596,11 @@ def _tested(rnd: _Round, state: InvestigationState) -> list[str]:
         if isinstance(p, CalculationRequested):
             lines += _calculation_lines(state.calculations[p.calculation_id], p.rationale, event.actor, ROOT,
                                         "At the end of the round")
+        elif isinstance(p, RunRegistered):
+            lines += _calculation_lines(state.calculations[p.calculation_id], p.description, p.requested_by, ROOT,
+                                        "Registered")
+        elif isinstance(p, WorkbenchRunRecorded):
+            lines += _workbench_lines(state.workbench_runs[p.run_id], ROOT)
         elif isinstance(p, CalculationLinked):
             lines.append(f"- {ROOT.hyp(p.hypothesis_id)} reuses **{p.calculation_id}**: {_said(p.rationale)}")
         elif isinstance(p, CalculationStateChanged) and p.state is CalculationState.SUBMITTED:
@@ -564,9 +620,10 @@ def _observed(rnd: _Round, state: InvestigationState) -> list[str]:
         p = event.payload
         if isinstance(p, EvidenceRecorded):
             lines += _evidence_lines(p.evidence_id, p.evidence, state, ROOT)
-        elif isinstance(p, RunChecked):
+        elif isinstance(p, (RunChecked, RunRegistered)):
             failed = [c for c in p.checks if not c.passed]
-            lines.append(f"- **{p.calculation_id}**: run checked, " + (
+            checked = "registered run checked" if isinstance(p, RunRegistered) else "run checked"
+            lines.append(f"- **{p.calculation_id}**: {checked}, " + (
                 "healthy" if not failed else "failed " + "; ".join(
                     f"{c.name}" + (f" ({_flat(c.detail)})" if c.detail else "") for c in failed)))
             lines += [f"  - The protocol read {r.name} = {_quantity(r.value)} at {r.file} line {r.line_start}"
@@ -720,8 +777,7 @@ def _hypothesis_page(hyp: HypothesisRecord, state: InvestigationState, events: S
     calculations = []
     for cid in hyp.calculation_ids:
         calc = state.calculations[cid]
-        request = events[calc.requested_at - 1]
-        rationale, requester = request.payload.rationale, request.actor
+        rationale, requester = _origin(calc, events)
         for event in events:  # a linked calculation was requested for another hypothesis; show why it is used here
             if (isinstance(event.payload, CalculationLinked) and event.payload.calculation_id == cid
                     and event.payload.hypothesis_id == hyp.hypothesis_id):
@@ -731,6 +787,8 @@ def _hypothesis_page(hyp: HypothesisRecord, state: InvestigationState, events: S
                 for line in _evidence_lines(record.evidence_id, record.evidence, state, SUB)]
     analyses = [line for record in state.analyses.values() if record.hypothesis_id == hyp.hypothesis_id
                 for line in _analysis_lines(record.analysis_id, record.hypothesis_id, record.run, SUB)]
+    workbench = [line for record in state.workbench_runs.values() if record.hypothesis_id == hyp.hypothesis_id
+                 for line in _workbench_lines(record, SUB)]
 
     assessments = []
     for entry in hyp.assessments:
@@ -750,6 +808,7 @@ def _hypothesis_page(hyp: HypothesisRecord, state: InvestigationState, events: S
               _section("Predictions", predictions or ["None registered yet."]),
               _section("Calculations", calculations or ["None requested yet."]),
               _section("Analyses", analyses or ["None run yet."]),
+              _section("Workbench commands (context, not evidence)", workbench or ["None run yet."]),
               _section("Evidence", evidence or ["None recorded yet."]),
               _section("Assessments", assessments or ["Not assessed yet."]),
               _section("Agent reports", [_REPORTS_NOTE, "", *reports] if reports else ["None yet."])]
@@ -817,13 +876,13 @@ def _index_page(state: InvestigationState, events: Sequence[RecordedEvent], roun
                     "| Calculation | For | Estimand | Inputs | Job | Job state | Run check | Evidence |",
                     "|---|---|---|---|---|---|---|---|"]
     for c in state.calculations.values():
-        inputs = c.examination.verdict.value if c.examination else "not examined"
+        inputs = "registered" if c.registered else c.examination.verdict.value if c.examination else "not examined"
         evidence = "; ".join(f"{eid}: {state.evidence[eid].evidence.quality.value}, "
                              f"{state.evidence[eid].evidence.observable.name} = "
                              f"{_quantity(state.evidence[eid].evidence.value)}" for eid in c.evidence_ids) or "none"
         check = _run_check(c.run_check) if c.run_check is not None else "-"
         calculations.append(
-            f"| {c.calculation_id} | {', '.join(ROOT.hyp(h) for h in c.hypothesis_ids)} | {_cell(c.task.estimand)} | "
+            f"| {c.calculation_id} | {_users(c, ROOT)} | {_cell(c.task.estimand)} | "
             f"{inputs} | {c.scheduler_job_id or '-'} | {c.scheduler_state.value if c.scheduler_state else '-'} | "
             f"{_cell(check)} | {_cell(evidence)} |")
     if not state.calculations:
@@ -873,6 +932,11 @@ def _index_page(state: InvestigationState, events: Sequence[RecordedEvent], roun
                "materials is context, not evidence.", ""]
     sources += [f"- Set {web_summary(r)} by the researcher's {r.intervention_id} (event #{r.recorded_at})"
                 for r in state.retrieval_changes]
+    sources += ["", f"Agents' workbench (sandboxed commands in their workspaces): **"
+                    f"{'on' if state.workbench_enabled else 'off'}**. What a command prints or writes is context, "
+                    "not evidence.", ""]
+    sources += [f"- Turned {'on' if r.enabled else 'off'} by the researcher's {r.intervention_id} "
+                f"(event #{r.recorded_at})" for r in state.workbench_changes]
     sources += ["", "Materials the researcher attached, which every agent of the investigation can view:", ""]
     sources += [f"- **{m.material_id}** {ROOT.artifact(m.artifact, _flat(m.name))} ({m.artifact.media_type or 'file'}, "
                 f"{m.artifact.size_bytes:,} bytes; {m.intervention_id})" + (f": {_said(m.note)}" if m.note else "")
@@ -881,7 +945,7 @@ def _index_page(state: InvestigationState, events: Sequence[RecordedEvent], roun
     blocks = [f"# {spec.title}", header, generated, _NOTE,
               _section("Question", [_flat(spec.question), "", f"Target claim: {_flat(spec.target_claim)}"]),
               _section("Compared quantities", quantities),
-              _section("Web access and materials", sources),
+              _section("Web access, workbench and materials", sources),
               _section("Plan", plan),
               _section("Hypotheses", hypotheses),
               _section("Agents", agents),
@@ -928,6 +992,10 @@ def _describe(event: RecordedEvent) -> str:
             return f"{p.calculation_id} inputs examined: {p.examination.verdict.value}"
         case RunChecked():
             return f"Run of {p.calculation_id} checked: {_run_check(p)}"
+        case RunRegistered():
+            users = p.hypothesis_id or "every agent"
+            return (f"{p.calculation_id} registered for {users} from {p.source}, by {p.requested_by.id}: "
+                    f"{_run_check(p.as_run_check())}")
         case AnalysisRecorded():
             results = ", ".join(f"{r.name} = {_quantity(r.value)}" for r in p.run.results)
             return f"{p.analysis_id} for {p.hypothesis_id}: {p.run.outcome.value}" + (f"; {results}" if results else "")
@@ -958,6 +1026,11 @@ def _describe(event: RecordedEvent) -> str:
             return f"{_mode_change(p)}: {_said(p.reason)}"
         case RetrievalPolicyChanged():
             return f"{_web_change(p)} ({p.intervention_id})"
+        case WorkbenchPolicyChanged():
+            return f"{_workbench_change(p)} ({p.intervention_id})"
+        case WorkbenchRunRecorded():
+            return (f"{p.run_id} for {p.hypothesis_id}: {_code(_short(p.run.command, 120))} "
+                    f"{p.run.outcome.value} on {p.run.host}")
         case TokenBudgetChanged():
             return f"{_budget_change(p.max_tokens)} ({p.intervention_id})"
         case MaterialAttached():

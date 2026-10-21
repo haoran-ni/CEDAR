@@ -32,8 +32,8 @@ class ToolFailure(Exception):
     """Raised by a handler for a failure the agent should see and can correct."""
 
 
-EXPECTED_FAILURES = (ToolFailure, RuleViolation, PermissionError, FileNotFoundError, NotADirectoryError,
-                     IsADirectoryError, ValueError, KeyError, ConcurrencyConflict)
+EXPECTED_FAILURES = (ToolFailure, RuleViolation, PermissionError, FileNotFoundError, FileExistsError,
+                     NotADirectoryError, IsADirectoryError, ValueError, KeyError, ConcurrencyConflict)
 """Failures the agent sees as error results; ConcurrencyConflict means the record stayed busy, so trying again
 works."""
 

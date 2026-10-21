@@ -46,8 +46,11 @@ from cedar.contracts.events import (
     RetrievalPolicyChanged,
     RoundStarted,
     RunChecked,
+    RunRegistered,
     TokenBudgetChanged,
     UserInterventionRecorded,
+    WorkbenchPolicyChanged,
+    WorkbenchRunRecorded,
 )
 from cedar.contracts.evidence import EvidenceKind, EvidenceObject
 from cedar.contracts.examination import ExaminationVerdict, InputExamination
@@ -75,6 +78,7 @@ from cedar.contracts.status import (
     SchedulerState,
 )
 from cedar.contracts.task import ScientificTaskSpec
+from cedar.contracts.workbench import WorkbenchRun
 from cedar.errors import RuleViolation
 
 _A = ActorKind
@@ -88,6 +92,7 @@ EVENT_ACTORS: dict[type, frozenset[ActorKind]] = {
     ModeChanged: frozenset({_A.USER, _A.SYSTEM}),
     RetrievalPolicyChanged: frozenset({_A.USER}),
     TokenBudgetChanged: frozenset({_A.USER}),
+    WorkbenchPolicyChanged: frozenset({_A.USER}),
     MaterialAttached: frozenset({_A.USER}),
     ApproverDecision: frozenset({_A.APPROVER}),
     ObservableAlignmentRecorded: frozenset({_A.USER, _A.CHIEF_SCIENTIST}),
@@ -102,6 +107,8 @@ EVENT_ACTORS: dict[type, frozenset[ActorKind]] = {
     CalculationInputsExamined: frozenset({_A.PROTOCOL_ENGINE}),
     CalculationStateChanged: frozenset({_A.PROTOCOL_ENGINE, _A.JOB_MANAGER, _A.JOB_MONITOR, _A.VALIDATOR}),
     RunChecked: frozenset({_A.VALIDATOR}),
+    RunRegistered: frozenset({_A.VALIDATOR}),
+    WorkbenchRunRecorded: frozenset({_A.WORKBENCH}),
     AnalysisRecorded: frozenset({_A.ANALYSIS_RUNNER}),
     EvidenceRecorded: frozenset({_A.VALIDATOR, _A.HYPOTHESIS_AGENT, _A.USER}),
     AssessmentRecorded: frozenset({_A.EVIDENCE_JUDGE}),
@@ -217,6 +224,34 @@ class CalculationRecord:
     workdir: str | None = None
     run_check: RunChecked | None = None
     history: list[tuple[int, CalculationState]] = field(default_factory=list)
+    registration: RunRegistered | None = None
+    """For a run computed outside CEDAR and registered: where it came from, who registered it, what it is."""
+
+    @property
+    def registered(self) -> bool:
+        return self.registration is not None
+
+    @property
+    def shared(self) -> bool:
+        """A registered run every agent of the investigation may use."""
+        return self.registration is not None and self.registration.hypothesis_id is None
+
+    @property
+    def input_files(self) -> dict[str, ArtifactRef]:
+        """The files the run ran with: as examined, or as registered."""
+        if self.examination is not None:
+            return dict(self.examination.files)
+        return dict(self.registration.inputs) if self.registration is not None else {}
+
+    @property
+    def input_hash(self) -> str | None:
+        if self.examination is not None:
+            return self.examination.input_hash
+        return self.registration.input_hash if self.registration is not None else None
+
+    def visible_to(self, hypothesis_id: str) -> bool:
+        """Whether the hypothesis's agent may use this run: its own, or a registered run shared with every agent."""
+        return hypothesis_id in self.hypothesis_ids or self.shared
 
 
 @dataclass
@@ -225,6 +260,25 @@ class EvidenceRecord:
     evidence: EvidenceObject
     recorded_at: int
     round: int
+
+
+@dataclass
+class WorkbenchRecord:
+    run_id: str
+    hypothesis_id: str
+    agent_id: str
+    run: WorkbenchRun
+    recorded_at: int
+    round: int
+
+
+@dataclass(frozen=True)
+class WorkbenchPolicyRecord:
+    """The researcher's setting of the agents' workbench."""
+
+    enabled: bool
+    intervention_id: str
+    recorded_at: int
 
 
 @dataclass
@@ -420,6 +474,13 @@ class InvestigationState:
     retrieval_changes: list[RetrievalRecord] = field(default_factory=list)
     budget_changes: list[BudgetRecord] = field(default_factory=list)
     materials: dict[str, MaterialRecord] = field(default_factory=dict)
+    workbench_runs: dict[str, WorkbenchRecord] = field(default_factory=dict)
+    workbench_changes: list[WorkbenchPolicyRecord] = field(default_factory=list)
+
+    @property
+    def workbench_enabled(self) -> bool:
+        """Whether agents may run commands in their workspaces: yes, unless the researcher turned it off."""
+        return self.workbench_changes[-1].enabled if self.workbench_changes else True
 
     @property
     def mode(self) -> InvestigationMode:
@@ -546,12 +607,14 @@ def reusable_calculation(state: InvestigationState, task_hash: str) -> str | Non
     do not count: requesting the same task again is then a fresh attempt.
     """
     for calc in state.calculations.values():
-        if calc.task_hash == task_hash and _is_reusable(calc):
+        if calc.task_hash == task_hash and not calc.registered and _is_reusable(calc):
             return calc.calculation_id
     return None
 
 
 def _is_reusable(calc: CalculationRecord) -> bool:
+    if calc.registered:
+        return calc.registration.healthy
     if calc.state in (_C.REJECTED, _C.CANCELLED):
         return False
     return not (
@@ -559,12 +622,21 @@ def _is_reusable(calc: CalculationRecord) -> bool:
     )
 
 
-def calculation_with_inputs(state: InvestigationState, input_hash: str) -> str | None:
-    """A reusable calculation whose examined scientific inputs are identical."""
+def calculation_with_inputs(state: InvestigationState, input_hash: str, hypothesis_ids=()) -> str | None:
+    """A reusable calculation whose scientific inputs are identical. A registered run counts only for the
+    hypotheses that may use it, so no agent is kept from a run it cannot see."""
     for calc in state.calculations.values():
-        if calc.examination is not None and calc.examination.input_hash == input_hash and _is_reusable(calc):
+        if calc.input_hash != input_hash or not _is_reusable(calc):
+            continue
+        if not calc.registered or any(calc.visible_to(h) for h in hypothesis_ids):
             return calc.calculation_id
     return None
+
+
+def hypothesis_calculations(state: InvestigationState, hypothesis_id: str) -> list[CalculationRecord]:
+    """The runs the hypothesis's agent may use: its own, then the registered runs shared with every agent."""
+    own = [state.calculations[c] for c in state.hypotheses[hypothesis_id].calculation_ids]
+    return own + [c for c in state.calculations.values() if c.shared]
 
 
 def hypothesis_evidence(state: InvestigationState, hypothesis_id: str) -> list[EvidenceRecord]:
@@ -574,7 +646,7 @@ def hypothesis_evidence(state: InvestigationState, hypothesis_id: str) -> list[E
     found = []
     for record in state.evidence.values():
         ev = record.evidence
-        mine = ev.analysis_id is not None and state.analyses[ev.analysis_id].hypothesis_id == hypothesis_id
+        mine = evidence_owner(state, ev) == hypothesis_id
         if mine or ev.calculation_id in calcs or calcs.intersection(ev.calculation_ids):
             found.append(record)
     return found
@@ -731,6 +803,34 @@ def _on_token_budget(state: InvestigationState, event: RecordedEvent, p: TokenBu
     if p.intervention_id not in state.interventions:
         raise RuleViolation("the researcher's token budget cites their recorded command")
     state.budget_changes.append(BudgetRecord(p.max_tokens, p.intervention_id, event.stream_version))
+
+
+def _on_workbench_policy(state: InvestigationState, event: RecordedEvent, p: WorkbenchPolicyChanged) -> None:
+    _require_open(state)
+    if p.intervention_id not in state.interventions:
+        raise RuleViolation("the researcher's setting of the workbench cites their recorded command")
+    state.workbench_changes.append(WorkbenchPolicyRecord(p.enabled, p.intervention_id, event.stream_version))
+
+
+def _on_workbench_run(state: InvestigationState, event: RecordedEvent, p: WorkbenchRunRecorded) -> None:
+    _require_open(state)
+    _hypothesis(state, p.hypothesis_id)
+    if p.run_id in state.workbench_runs:
+        raise RuleViolation(f"workbench run {p.run_id} already recorded")
+    agent = state.agents.get(p.agent_id)
+    if agent is None or agent.hypothesis_id != p.hypothesis_id:
+        raise RuleViolation(f"{p.agent_id} is not an agent of {p.hypothesis_id}")
+    # A command already running when its agent was retired, or the workbench turned off, is still recorded.
+    state.workbench_runs[p.run_id] = WorkbenchRecord(p.run_id, p.hypothesis_id, p.agent_id, p.run,
+                                                     event.stream_version, event.round)
+
+
+def workbench_run_with(state: InvestigationState, hypothesis_id: str, sha256: str) -> str | None:
+    """The hypothesis's latest workbench run that wrote a file with this content, if one did."""
+    for record in reversed(list(state.workbench_runs.values())):
+        if record.hypothesis_id == hypothesis_id and sha256 in record.run.changed.values():
+            return record.run_id
+    return None
 
 
 def _on_material(state: InvestigationState, event: RecordedEvent, p: MaterialAttached) -> None:
@@ -935,7 +1035,7 @@ def _on_inputs_examined(state: InvestigationState, event: RecordedEvent, p: Calc
     if structure is not None and structure.sha256 not in {ref.sha256 for ref in exam.files.values()}:
         raise RuleViolation("the requested structure is not among the examined files")
     if exam.verdict is not ExaminationVerdict.REJECTED:
-        duplicate = calculation_with_inputs(state, exam.input_hash)
+        duplicate = calculation_with_inputs(state, exam.input_hash, calc.hypothesis_ids)
         if duplicate is not None:
             raise RuleViolation(f"inputs are identical to calculation {duplicate}")
     calc.examination = exam
@@ -999,6 +1099,26 @@ def _on_run_checked(state: InvestigationState, event: RecordedEvent, p: RunCheck
     calc.run_check = p
 
 
+def _on_run_registered(state: InvestigationState, event: RecordedEvent, p: RunRegistered) -> None:
+    _require_open(state)
+    if p.calculation_id in state.calculations:
+        raise RuleViolation(f"calculation {p.calculation_id} already exists")
+    requester = p.requested_by
+    if requester.kind is ActorKind.USER and p.intervention_id not in state.interventions:
+        raise RuleViolation("a run the researcher registers cites their recorded command")
+    hypothesis_ids = []
+    if p.hypothesis_id is not None:
+        hyp = _hypothesis(state, p.hypothesis_id)
+        if hyp.status in _CLOSED_HYPOTHESIS:
+            raise RuleViolation(f"hypothesis {p.hypothesis_id} is {hyp.status}")
+        _require_own(state, requester, p.hypothesis_id)
+        hyp.calculation_ids.append(p.calculation_id)
+        hypothesis_ids = [p.hypothesis_id]
+    state.calculations[p.calculation_id] = CalculationRecord(
+        p.calculation_id, p.task, p.task_hash, hypothesis_ids, event.stream_version, state=_C.QUALITY_ASSESSED,
+        run_check=p.as_run_check(), history=[(event.stream_version, _C.QUALITY_ASSESSED)], registration=p)
+
+
 def _on_analysis(state: InvestigationState, event: RecordedEvent, p: AnalysisRecorded) -> None:
     _require_open(state)
     hyp = _hypothesis(state, p.hypothesis_id)
@@ -1008,12 +1128,12 @@ def _on_analysis(state: InvestigationState, event: RecordedEvent, p: AnalysisRec
         raise RuleViolation(f"analysis {p.analysis_id} already recorded")
     for staged in p.run.inputs:
         calc = _calculation(state, staged.calculation_id)
-        if p.hypothesis_id not in calc.hypothesis_ids:
+        if not calc.visible_to(p.hypothesis_id):
             raise RuleViolation(f"calculation {calc.calculation_id} is not linked to {p.hypothesis_id}; an analysis "
-                                "uses only its own hypothesis's runs")
+                                "uses only its own hypothesis's runs and shared registered runs")
         if calc.run_check is None:
             raise RuleViolation(f"the run of {calc.calculation_id} has not been checked; nothing to analyse yet")
-        known = {**calc.examination.files, **calc.run_check.outputs}
+        known = {**calc.input_files, **calc.run_check.outputs}
         changed = [name for name, ref in staged.files.items() if name in known and known[name].sha256 != ref.sha256]
         if changed:
             raise RuleViolation(f"staged files of {calc.calculation_id} differ from the checked run: {changed}")
@@ -1025,7 +1145,7 @@ def _require_healthy_for_validation(ev: EvidenceObject, calcs: list[CalculationR
     if ev.quality is not EvidenceQuality.VALIDATED:
         return
     for calc in calcs:
-        if calc.scheduler_state is not SchedulerState.COMPLETED:
+        if not calc.registered and calc.scheduler_state is not SchedulerState.COMPLETED:
             raise RuleViolation(f"cannot validate output of a job that ended {calc.scheduler_state}")
         if not calc.run_check.healthy:
             raise RuleViolation(f"cannot validate results of {calc.calculation_id}: its run failed checks")
@@ -1042,8 +1162,9 @@ def _require_reader_owns(state: InvestigationState, ev: EvidenceObject, linked: 
     if ev.analysis_id is not None:
         if state.analyses[ev.analysis_id].hypothesis_id != agent.hypothesis_id:
             raise RuleViolation(f"analysis {ev.analysis_id} was not run for {agent.hypothesis_id}")
-    elif any(agent.hypothesis_id not in calc.hypothesis_ids for calc in linked):
-        raise RuleViolation(f"{reader.id} reads only calculations linked to {agent.hypothesis_id}")
+    elif not all(calc.visible_to(agent.hypothesis_id) for calc in linked):
+        raise RuleViolation(f"{reader.id} reads only calculations linked to {agent.hypothesis_id} and shared "
+                            "registered runs")
 
 
 def _on_evidence(state: InvestigationState, event: RecordedEvent, p: EvidenceRecorded) -> None:
@@ -1057,6 +1178,10 @@ def _on_evidence(state: InvestigationState, event: RecordedEvent, p: EvidenceRec
         calc = _calculation(state, ev.calculation_id)
         if calc.run_check is None or calc.state is not _C.QUALITY_ASSESSED:
             raise RuleViolation(f"evidence for {calc.calculation_id} waits for its run check")
+        if calc.registered != (ev.kind is EvidenceKind.ARCHIVED_COMPUTATION):
+            raise RuleViolation(f"a reading of {calc.calculation_id} is "
+                                + ("archived computation evidence: it is a registered run" if calc.registered else
+                                   "direct computation evidence: CEDAR ran it"))
         linked = [calc]
     if ev.kind is EvidenceKind.ANALYSIS:
         analysis = state.analyses.get(ev.analysis_id)
@@ -1248,6 +1373,7 @@ _HANDLERS = {
     ModeChanged: _on_mode_changed,
     RetrievalPolicyChanged: _on_retrieval_policy,
     TokenBudgetChanged: _on_token_budget,
+    WorkbenchPolicyChanged: _on_workbench_policy,
     MaterialAttached: _on_material,
     ApproverDecision: _on_approver_decision,
     NextActionsRecommended: _on_next_actions,
@@ -1263,6 +1389,8 @@ _HANDLERS = {
     CalculationInputsExamined: _on_inputs_examined,
     CalculationStateChanged: _on_calculation_state,
     RunChecked: _on_run_checked,
+    RunRegistered: _on_run_registered,
+    WorkbenchRunRecorded: _on_workbench_run,
     AnalysisRecorded: _on_analysis,
     EvidenceRecorded: _on_evidence,
     AssessmentRecorded: _on_assessment,
@@ -1278,6 +1406,7 @@ __all__ = [
     "AgentRecord", "AnalysisRecord", "AssessmentEntry", "CalculationRecord", "ClosingRecord", "EvidenceRecord", "HypothesisRecord", "InterventionRecord",
     "InvestigationState", "ApprovalRecord", "BudgetRecord", "MaterialRecord", "ModeRecord", "PlanRecord", "RetrievalRecord", "PredictionRecord", "ProposalRecord",
     "ProposalStatus", "RecommendationRecord", "agent_id_for", "apply",
-    "authorization_for", "calculation_with_inputs", "evidence_owner", "hypothesis_evidence", "replay",
-    "reusable_calculation", "review_deadline",
+    "authorization_for", "calculation_with_inputs", "evidence_owner", "hypothesis_calculations", "hypothesis_evidence",
+    "replay",
+    "reusable_calculation", "review_deadline", "WorkbenchPolicyRecord", "WorkbenchRecord", "workbench_run_with",
 ]

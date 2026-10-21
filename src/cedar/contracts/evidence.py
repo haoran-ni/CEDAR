@@ -23,7 +23,8 @@ class EvidenceKind(StrEnum):
     DIRECT_COMPUTATION = "direct_computation"
     """Parsed from a calculation run within this investigation."""
     ARCHIVED_COMPUTATION = "archived_computation"
-    """Prerecorded output, disclosed as such and never presented as newly computed."""
+    """Read from a run computed outside CEDAR and registered with its files; disclosed as such, never presented as
+    newly computed."""
     PUBLISHED_EXPERIMENT = "published_experiment"
     INFERENCE = "inference"
     """Derived from other information under stated assumptions."""
@@ -77,7 +78,7 @@ class EvidenceObject(Contract):
     observable: Observable
     value: Quantity | None = None
     calculation_id: Identifier | None = None
-    """The run a direct reading was taken from."""
+    """The run a reading was taken from: one CEDAR ran (direct computation) or one registered (archived)."""
     calculation_ids: tuple[Identifier, ...] = ()
     """The runs whose files an analysis used."""
     analysis_id: Identifier | None = None
@@ -100,8 +101,9 @@ class EvidenceObject(Contract):
 
     @model_validator(mode="after")
     def _consistent(self) -> "EvidenceObject":
-        if (self.kind is EvidenceKind.DIRECT_COMPUTATION) != (self.calculation_id is not None):
-            raise ValueError("calculation_id is required for, and only allowed on, direct_computation evidence")
+        if (self.kind in COMPUTED_KINDS) != (self.calculation_id is not None):
+            raise ValueError("calculation_id is required for, and only allowed on, direct and archived computation "
+                             "evidence")
         analysis = self.kind is EvidenceKind.ANALYSIS
         if (analysis != (self.analysis_id is not None) or analysis != (self.analysis_result is not None)
                 or analysis != bool(self.calculation_ids)):

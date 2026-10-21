@@ -45,7 +45,10 @@ from cedar.contracts.events import (
     RoundStarted,
     TokenBudgetChanged,
     RunChecked,
+    RunRegistered,
     UserInterventionRecorded,
+    WorkbenchPolicyChanged,
+    WorkbenchRunRecorded,
 )
 from cedar.contracts.evidence import (
     CITATIONS_VERIFIED,
@@ -98,6 +101,7 @@ from cedar.contracts.task import (
     ScientificTaskSpec,
     compare_tasks,
 )
+from cedar.contracts.workbench import WorkbenchOutcome, WorkbenchRun
 
 __all__ = [
     "ActionKind",
@@ -187,6 +191,7 @@ __all__ = [
     "RoundStarted",
     "RunChecked",
     "RunReading",
+    "RunRegistered",
     "SchedulerState",
     "scientific_input_hash",
     "ScientificTaskSpec",
@@ -194,5 +199,9 @@ __all__ = [
     "Uncertainty",
     "UncertaintyKind",
     "UserInterventionRecorded",
+    "WorkbenchOutcome",
+    "WorkbenchPolicyChanged",
+    "WorkbenchRun",
+    "WorkbenchRunRecorded",
     "verdict_for",
 ]

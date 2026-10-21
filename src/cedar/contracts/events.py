@@ -4,14 +4,16 @@ The event log is the source of truth: research state is whatever replaying these
 produces. Payloads only add information; nothing edits or deletes an earlier record.
 """
 
+from pathlib import PurePosixPath
 from typing import Annotated, Literal
 
-from pydantic import AwareDatetime, Field, JsonValue, StringConstraints, model_validator
+from pydantic import AfterValidator, AwareDatetime, Field, JsonValue, StringConstraints, model_validator
 
 from cedar.contracts.agents import AgentSpec
 from cedar.contracts.analysis import AnalysisRun
 from cedar.contracts.base import (
     Actor,
+    ActorKind,
     ArtifactRef,
     Contract,
     FileName,
@@ -23,7 +25,7 @@ from cedar.contracts.base import (
     sha256_hex,
 )
 from cedar.contracts.evidence import EvidenceObject, QualityCheck, RunReading
-from cedar.contracts.examination import InputExamination
+from cedar.contracts.examination import Finding, InputExamination, scientific_input_hash
 from cedar.contracts.hypothesis import HypothesisSpec, Prediction
 from cedar.contracts.investigation import (
     Domain,
@@ -45,6 +47,7 @@ from cedar.contracts.status import (
     SchedulerState,
 )
 from cedar.contracts.task import ScientificTaskSpec
+from cedar.contracts.workbench import WorkbenchRun
 
 
 class InvestigationCreated(Contract):
@@ -153,6 +156,16 @@ class TokenBudgetChanged(Contract):
     type: Literal["token_budget_changed"] = "token_budget_changed"
     max_tokens: int | None = Field(default=None, gt=0)
     """None: no limit."""
+    intervention_id: Identifier
+    """The researcher's command."""
+
+
+class WorkbenchPolicyChanged(Contract):
+    """The researcher turns the agents' workbench (sandboxed commands in their workspaces) on or off. It is on
+    unless the researcher turned it off."""
+
+    type: Literal["workbench_policy_changed"] = "workbench_policy_changed"
+    enabled: bool
     intervention_id: Identifier
     """The researcher's command."""
 
@@ -324,6 +337,90 @@ class RunChecked(Contract):
         return all(c.passed for c in self.checks)
 
 
+def _check_absolute(value: str) -> str:
+    path = PurePosixPath(value)
+    if not path.is_absolute() or ".." in path.parts or path.as_posix() != value or "\x00" in value:
+        raise ValueError(f"expected a normalized absolute path: {value!r}")
+    return value
+
+
+REGISTRANTS = frozenset({ActorKind.USER, ActorKind.CHIEF_SCIENTIST, ActorKind.HYPOTHESIS_AGENT})
+
+
+class RunRegistered(Contract):
+    """A run computed outside CEDAR, registered with its files so that readings and analyses of it can become
+    evidence. Nothing runs.
+
+    The validator stores the run's inputs and outputs by content hash, checks the run's health from its output, and
+    records the settings its inputs actually used as the task. A run registered for a hypothesis belongs to that
+    hypothesis; one the researcher or the Chief Scientist registers for none is shared by every agent.
+    """
+
+    type: Literal["run_registered"] = "run_registered"
+    calculation_id: Identifier
+    hypothesis_id: Identifier | None = None
+    """None: shared by every agent of the investigation."""
+    requested_by: Actor
+    """Who asked for it to be registered: the researcher, the Chief Scientist or a hypothesis agent."""
+    description: NonEmptyStr
+    """What the run is, in the words of whoever registered it."""
+    source: Annotated[str, AfterValidator(_check_absolute)]
+    """The directory it was registered from."""
+    task: ScientificTaskSpec
+    """The settings the run's inputs used, classified as a task declares them."""
+    task_hash: Sha256Hex
+    code_version: NonEmptyStr
+    """The version the run's output reports, or "unknown"."""
+    inputs: dict[FileName, ArtifactRef] = Field(min_length=1)
+    input_hash: Sha256Hex
+    notes: tuple[Finding, ...] = ()
+    """What the validator noticed in the inputs, e.g. keywords whose effect it does not classify."""
+    outputs: dict[FileName, ArtifactRef] = Field(min_length=1)
+    checks: tuple[QualityCheck, ...] = Field(min_length=1)
+    failure_quality: EvidenceQuality
+    readings: tuple[RunReading, ...] = ()
+    limitations: tuple[NonEmptyStr, ...] = ()
+    method: dict[str, JsonValue] = {}
+    intervention_id: Identifier | None = None
+    """The researcher's command, when it was the researcher who registered it."""
+
+    @model_validator(mode="after")
+    def _consistent(self) -> "RunRegistered":
+        if self.task_hash != self.task.identity_hash():
+            raise ValueError("task_hash does not match the task specification")
+        if self.input_hash != scientific_input_hash(self.task.protocol, self.code_version, self.inputs):
+            raise ValueError("input_hash does not match the registered inputs")
+        if self.failure_quality not in (EvidenceQuality.INVALID, EvidenceQuality.INCONCLUSIVE):
+            raise ValueError("a failed run check can make results INVALID or INCONCLUSIVE, nothing better")
+        if self.requested_by.kind not in REGISTRANTS:
+            raise ValueError("runs are registered by the researcher, the Chief Scientist or a hypothesis agent")
+        if self.requested_by.kind is ActorKind.HYPOTHESIS_AGENT and self.hypothesis_id is None:
+            raise ValueError("an agent registers runs for its own hypothesis")
+        if (self.requested_by.kind is ActorKind.USER) != (self.intervention_id is not None):
+            raise ValueError("a run the researcher registers cites their command, and only theirs does")
+        return self
+
+    @property
+    def healthy(self) -> bool:
+        return all(c.passed for c in self.checks)
+
+    def as_run_check(self) -> "RunChecked":
+        """The registration's health check, in the form every checked run has."""
+        return RunChecked(calculation_id=self.calculation_id, outputs=self.outputs, checks=self.checks,
+                          failure_quality=self.failure_quality, readings=self.readings,
+                          limitations=self.limitations, method=self.method)
+
+
+class WorkbenchRunRecorded(Contract):
+    """A command an agent ran in its workspace, in the workbench's sandbox. Context, never evidence."""
+
+    type: Literal["workbench_run_recorded"] = "workbench_run_recorded"
+    run_id: Identifier
+    hypothesis_id: Identifier
+    agent_id: Identifier
+    run: WorkbenchRun
+
+
 class AnalysisRecorded(Contract):
     """An analysis script the runner executed for a hypothesis, and what came of it."""
 
@@ -463,6 +560,7 @@ EventPayload = Annotated[
     | ModeChanged
     | RetrievalPolicyChanged
     | TokenBudgetChanged
+    | WorkbenchPolicyChanged
     | MaterialAttached
     | ApproverDecision
     | ObservableAlignmentRecorded
@@ -477,6 +575,8 @@ EventPayload = Annotated[
     | CalculationInputsExamined
     | CalculationStateChanged
     | RunChecked
+    | RunRegistered
+    | WorkbenchRunRecorded
     | AnalysisRecorded
     | EvidenceRecorded
     | AssessmentRecorded

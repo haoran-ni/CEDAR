@@ -5,6 +5,10 @@ commands are accepted only if each matches a command line of the approved profil
 template (after shell variables are expanded on both sides), with the template's
 placeholders standing for numbers or the configured values. Exactly one command must be
 the template's launch of the configured binary. Anything else needs user review.
+
+A local script, for a run on the interactive node CEDAR runs on, is the same template
+without its ``#SBATCH`` lines, and one ``#CEDAR --ntasks=N --time=T`` line that states what
+it may use; its commands are examined the same way.
 """
 
 import re
@@ -59,6 +63,23 @@ def parse_walltime(text: str) -> int | None:
     else:  # MM
         total, secs = int(first), 0
     return total + (1 if secs else 0)
+
+
+LOCAL_DIRECTIVE = "#CEDAR"
+LOCAL_PARTITION = "local"
+"""The partition name a local run's resources carry."""
+
+
+def render_local_script(profile: ComputeProfile, code: CodeInstallation, *, ntasks: int, walltime_minutes: int,
+                        output_file: str) -> str:
+    """The approved job template without its Slurm directives, for a run on this interactive node."""
+    text = fill_template(profile.job_template, {
+        "job_name": "cedar", "partition": LOCAL_PARTITION, "nodes": 1, "ntasks": ntasks,
+        "walltime": format_walltime(walltime_minutes), "binary": code.binary, "output": output_file,
+    })
+    lines = [line for line in text.splitlines() if not line.strip().startswith("#SBATCH")]
+    lines.insert(1, f"{LOCAL_DIRECTIVE} --ntasks={ntasks} --time={format_walltime(walltime_minutes)}")
+    return "\n".join(lines) + "\n"
 
 
 def render_job_script(profile: ComputeProfile, code: CodeInstallation, resources: JobResources,
@@ -219,6 +240,22 @@ def examine_job_script(text: str, profile: ComputeProfile, code: CodeInstallatio
                 add(_R, "unapproved_directive", f"--{name} is not used by the approved job template", number)
             directives[name] = value
 
+    launches = _examine_commands(script, profile, code, output_file, add)
+    resources = _resources(directives, profile, add)
+    if resources is not None:
+        for number, ntasks in launches:
+            if ntasks is not None and ntasks > resources.ntasks:
+                add(_E, "oversubscribed", f"launches {ntasks} tasks but requests {resources.ntasks}", number)
+    for name in ("output", "error"):
+        value = directives.get(name)
+        if value is not None and not _PLAIN_FILE.match(value):
+            add(_R, "output_path", f"--{name}={value} writes outside the run directory")
+    return ScriptExamination(tuple(findings), resources)
+
+
+def _examine_commands(script: _Commands, profile: ComputeProfile, code: CodeInstallation, output_file: str,
+                      add) -> list[tuple[int, int | None]]:
+    """Every command must be one of the template's; returns the launches, with the task count each starts."""
     patterns = _template_patterns(profile, code, output_file)
     launches: list[tuple[int, int | None]] = []
     for number, command in script.commands:
@@ -234,16 +271,53 @@ def examine_job_script(text: str, profile: ComputeProfile, code: CodeInstallatio
         add(_E, "no_launch", f"the script never launches {code.binary} writing {output_file} as the template does")
     elif len(launches) > 1:
         add(_R, "several_launches", "the script launches the code more than once", launches[1][0])
+    return launches
 
-    resources = _resources(directives, profile, add)
+
+def local_resources(text: str) -> JobResources | None:
+    """What a local script's ``#CEDAR`` line says it may use; None if it has no readable one."""
+    for line in text.splitlines():
+        if not line.strip().startswith(LOCAL_DIRECTIVE):
+            continue
+        options = dict(_directive_options(line.strip()[len(LOCAL_DIRECTIVE):]) or [])
+        ntasks, time = options.get("ntasks"), options.get("time")
+        minutes = parse_walltime(time) if time else None
+        if ntasks is None or not ntasks.isdigit() or int(ntasks) < 1 or minutes is None or minutes < 1:
+            return None
+        return JobResources(LOCAL_PARTITION, 1, int(ntasks), minutes)
+    return None
+
+
+def examine_local_script(text: str, profile: ComputeProfile, code: CodeInstallation, *, file: str = "local.sh",
+                         output_file: str) -> ScriptExamination:
+    """A script for a run on this interactive node: the template's commands, no Slurm directives, one ``#CEDAR``
+    line stating its task count and time limit."""
+    findings: list[Finding] = []
+
+    def add(severity: FindingSeverity, code_: str, message: str, line: int | None = None) -> None:
+        findings.append(Finding(severity=severity, code=code_, message=message, file=file, line=line))
+
+    lines = text.splitlines()
+    if not lines or not lines[0].startswith("#!"):
+        add(_E, "missing_shebang", "the first line must be a shebang such as #!/bin/bash", 1)
+    if lines and profile.job_template.splitlines()[0].strip() != lines[0].strip():
+        add(_R, "different_shell", f"uses {lines[0].strip()}, not the profile's {profile.job_template.splitlines()[0]}", 1)
+    script = _split(text)
+    for number, line in script.unresolved:
+        add(_R, "unresolved_line", f"cannot resolve shell variables in: {line}", number)
+    for number, _ in script.directives:
+        add(_E, "slurm_directive", "a local run is not a Slurm job; it takes no #SBATCH lines", number)
+    if sum(1 for line in lines if line.strip().startswith(LOCAL_DIRECTIVE)) > 1:
+        add(_E, "several_directives", f"give one {LOCAL_DIRECTIVE} line")
+    resources = local_resources(text)
+    if resources is None:
+        add(_E, "no_local_resources", f"the script must state its task count and time limit in a line such as "
+                                      f"'{LOCAL_DIRECTIVE} --ntasks=8 --time=01:00:00'")
+    launches = _examine_commands(script, profile, code, output_file, add)
     if resources is not None:
         for number, ntasks in launches:
             if ntasks is not None and ntasks > resources.ntasks:
-                add(_E, "oversubscribed", f"launches {ntasks} tasks but requests {resources.ntasks}", number)
-    for name in ("output", "error"):
-        value = directives.get(name)
-        if value is not None and not _PLAIN_FILE.match(value):
-            add(_R, "output_path", f"--{name}={value} writes outside the run directory")
+                add(_E, "oversubscribed", f"launches {ntasks} tasks but states {resources.ntasks}", number)
     return ScriptExamination(tuple(findings), resources)
 
 

@@ -38,6 +38,7 @@ import fcntl
 import json
 import os
 import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -50,12 +51,11 @@ from pathlib import Path
 
 from cedar.agents import AgentRunner, RunLimits, record_agent_run
 from cedar.agents.prompts import APPROVER, CHIEF_SCIENTIST, EVIDENCE_JUDGE, HYPOTHESIS_AGENT
-from cedar.agents.toolkits import ResearchContext, file_tools, research_tools
+from cedar.agents.toolkits import file_tools, research_tools
 from cedar.agents.toolkits.approver import ApproverContext, approver_tools, decisions_text
 from cedar.agents.toolkits.chief import ChiefContext, chief_tools
 from cedar.agents.toolkits.judge import JudgeContext, judge_tools
 from cedar.agents.toolkits.materials import material_tools, recorded_materials
-from cedar.agents.toolkits.research import agent_file_access
 from cedar.contracts.base import Actor, ActorKind, new_id
 from cedar.automation import approver_due, judgements_due
 from cedar.contracts.events import (
@@ -74,11 +74,13 @@ from cedar.contracts.status import (
     InvestigationStatus,
 )
 from cedar.engine.jobs import InputsChanged
+from cedar.engine.workbench import Workbench
 from cedar.errors import RuleViolation
+from cedar.hpc.local import LocalBackend
+from cedar.hpc.node import local_dft
 from cedar.hpc.profile import ProfileNotApproved, ProfileStore
 from cedar.hpc.slurm import SchedulerBackend, SchedulerError
 from cedar.notebook import update_notebook
-from cedar.protocols.base import ProtocolRegistry
 from cedar.state.projection import AgentTaskRecord, InvestigationState, authorization_for, review_deadline
 from cedar.summaries import calculation_summary, task_owner
 from cedar.swarm import (
@@ -91,7 +93,8 @@ from cedar.swarm import (
     start_drafts,
 )
 from cedar.web import web_access
-from cedar.workspace import ModelClients, Services, Workspace, profile_for, registry_for, services_for
+from cedar.workspace import (ModelClients, Services, Workspace, investigation_registrar, profile_for, registry_for,
+                             research_context, services_for)
 
 SYSTEM = Actor(kind=ActorKind.SYSTEM, id="dispatcher")
 JUDGE = Actor(kind=ActorKind.EVIDENCE_JUDGE, id="evidence-judge")
@@ -103,6 +106,8 @@ HEARTBEAT = "dispatcher.heartbeat"
 ACTIVITY = "activity"
 LOCK = "dispatcher.lock"
 PID = "dispatcher.pid"
+HOST = "dispatcher.host"
+"""The machine the dispatcher holding the lock runs on; local calculations start there."""
 LOG = "dispatcher.log"
 IDLE_MINUTES = 30
 """A dispatcher the chat started stops after this long with nothing to do."""
@@ -174,8 +179,10 @@ class Dispatcher:
                  backend: SchedulerBackend | None = None, deny: list[Path] = (),
                  limits: RunLimits = RunLimits(max_turns=40), max_agents: int = 4,
                  analysis_slots: int = 2, chief_reviews: bool = True,
-                 clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc)) -> None:
-        """``max_agents`` agent runs at once; ``analysis_slots`` analysis scripts at once on this node."""
+                 clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+                 workbench: Workbench | None = None) -> None:
+        """``max_agents`` agent runs at once; ``analysis_slots`` analysis scripts at once on this node; the
+        ``workbench`` runs agents' commands, sharing this machine's cores between them."""
         self.workspace = workspace
         self.profiles = profiles
         self.clients = clients
@@ -186,6 +193,8 @@ class Dispatcher:
         self.chief_reviews = chief_reviews
         self.clock = clock
         self._analysis_slots = threading.BoundedSemaphore(analysis_slots)
+        self.workbench = workbench or Workbench(workspace.ledger, workspace.artifacts)
+        self._local_backends: dict[str, LocalBackend] = {}
         self._runs: dict[str, _Run] = {}
         self._held = None
         self._notebook_versions: dict[str, int] = {}
@@ -272,6 +281,7 @@ class Dispatcher:
             yield False
             return
         self._held = lock
+        _write_atomically(self.workspace.root / HOST, socket.gethostname())
         self._clear_activity()  # descriptions left by a dispatcher that stopped mid-run
         try:
             yield True
@@ -300,8 +310,9 @@ class Dispatcher:
             return []
         notes = []
         try:
-            services = services_for(self.workspace, profile_for(state, self.profiles), self.backend, deny=self.deny,
-                                    analysis_slots=self._analysis_slots)
+            profile = profile_for(state, self.profiles)
+            services = services_for(self.workspace, profile, self.backend, deny=self.deny,
+                                    analysis_slots=self._analysis_slots, local_backend=self._local_backend(profile))
         except (LookupError, ProfileNotApproved, FileNotFoundError) as exc:
             services = None  # agents can still plan and report; calculations wait for a usable profile
             if state.calculations:
@@ -319,6 +330,14 @@ class Dispatcher:
         notes += self._launch(investigation_id, services)
         return [f"{investigation_id}: {n}" for n in notes]
 
+    def _local_backend(self, profile) -> LocalBackend:
+        """One per runs directory, so it keeps track of the local runs it started; it shares this machine's cores
+        with the workbench."""
+        if profile.runs_root not in self._local_backends:
+            self._local_backends[profile.runs_root] = LocalBackend(profile.runs_root, host=self.workbench.host,
+                                                                   pool=self.workbench.pool)
+        return self._local_backends[profile.runs_root]
+
     def _submit(self, investigation_id: str, services: Services) -> list[str]:
         state = self.workspace.ledger.load(investigation_id)
         notes = []
@@ -333,21 +352,30 @@ class Dispatcher:
                     continue
             elif calc.state is not CalculationState.SUBMISSION_PENDING:
                 continue
+            if calc.task.execution == "local":
+                problem = services.local_backend.unavailable(self.workbench.host())
+                if problem:
+                    notes.append(f"{calc.calculation_id} waits: {problem}")
+                    continue
             try:
-                job = services.manager.submit(investigation_id, calc.calculation_id)
+                job = services.manager_for(calc).submit(investigation_id, calc.calculation_id)
                 notes.append(f"submitted {calc.calculation_id} as job {job}")
             except (RuleViolation, InputsChanged, SchedulerError, OSError) as exc:
                 notes.append(f"could not submit {calc.calculation_id}: {exc}")
         return notes
 
     def _poll(self, investigation_id: str, services: Services) -> list[str]:
-        try:
-            result = services.monitor.poll(investigation_id)
-        except SchedulerError as exc:
-            return [f"scheduler query failed: {exc}"]
-        return [f"{e.payload.calculation_id} is {e.payload.state.value}"
-                + (f" ({e.payload.scheduler_state.value})" if e.payload.scheduler_state else "")
-                for e in result.recorded]
+        notes = []
+        for monitor in (services.monitor, services.local_monitor):
+            try:
+                result = monitor.poll(investigation_id)
+            except SchedulerError as exc:
+                notes.append(f"{monitor.execution} query failed: {exc}")
+                continue
+            notes += [f"{e.payload.calculation_id} is {e.payload.state.value}"
+                      + (f" ({e.payload.scheduler_state.value})" if e.payload.scheduler_state else "")
+                      for e in result.recorded]
+        return notes
 
     def _check_runs(self, investigation_id: str, services: Services) -> list[str]:
         notes = []
@@ -589,21 +617,11 @@ class Dispatcher:
         state = self.workspace.ledger.load(investigation_id)
         if role == "hypothesis_agent":
             agent = state.agents[task.agent_id]
-            actor = Actor(kind=ActorKind.HYPOTHESIS_AGENT, id=agent.agent_id)
-            if services is not None:
-                files = services.agent_files(self.workspace, investigation_id, agent.hypothesis_id)
-                context = ResearchContext(ledger=self.workspace.ledger, investigation_id=investigation_id,
-                                          hypothesis_id=agent.hypothesis_id, actor=actor, registry=services.registry,
-                                          artifacts=self.workspace.artifacts, engine=services.engine,
-                                          validator=services.validator, files=files, analysis=services.analysis)
-            else:
-                files = agent_file_access(self.workspace.ledger, investigation_id, agent.hypothesis_id, None,
-                                          deny=self.deny)
-                context = ResearchContext(ledger=self.workspace.ledger, investigation_id=investigation_id,
-                                          hypothesis_id=agent.hypothesis_id, actor=actor, registry=ProtocolRegistry([]),
-                                          artifacts=self.workspace.artifacts, engine=None, validator=None,
-                                          files=files, analysis=None)
-            tools = research_tools(context) + file_tools(files)
+            context = research_context(self.workspace, investigation_id, agent, services, deny=self.deny,
+                                       analysis_slots=self._analysis_slots, workbench=self.workbench,
+                                       should_stop=lambda: self._interruption(investigation_id, task) is not None)
+            actor = context.actor
+            tools = research_tools(context) + file_tools(context.files)
             system, session = HYPOTHESIS_AGENT + agent_prompt(agent), f"{investigation_id}.{agent.agent_id}"
         elif role == "evidence_judge":
             actor = JUDGE
@@ -621,7 +639,9 @@ class Dispatcher:
             tools = chief_tools(ChiefContext(
                 ledger=self.workspace.ledger, profiles=self.profiles, actor=CHIEF, investigation_id=investigation_id,
                 registry_for=lambda name: registry_for(self.profiles.load_approved(name)), clock=self.clock,
-                dispatcher=lambda: "running; it is carrying out this review"))
+                dispatcher=lambda: "running; it is carrying out this review",
+                registrar=lambda inv: investigation_registrar(self.workspace, self.profiles, inv, deny=self.deny),
+                where=lambda: local_dft(self.workbench.host())))
             system, session = CHIEF_SCIENTIST, f"{investigation_id}.chief-review"
             instruction += "\n\n" + review_material(state, task)
         ledger = self.workspace.ledger
@@ -702,6 +722,10 @@ def stop_dispatcher(workspace: Workspace, timeout: float = 600, force: bool = Fa
     token counts of runs still going."""
     if not dispatcher_running(workspace):
         return "No dispatcher is running on this data directory."
+    host = dispatcher_host(workspace)
+    if host is not None and host != socket.gethostname():
+        return (f"The dispatcher runs on {host}, not on this machine ({socket.gethostname()}); stop it there, with "
+                "`cedar dispatch --stop` on that machine.")
     try:
         pid = int((workspace.root / PID).read_text().strip())
     except (FileNotFoundError, ValueError):
@@ -727,6 +751,14 @@ def stop_dispatcher(workspace: Workspace, timeout: float = 600, force: bool = Fa
                     f"{timeout:g} s, so their last token counts were not recorded.")
         time.sleep(0.2)
     return f"Stopped the dispatcher (process {pid})."
+
+
+def dispatcher_host(workspace: Workspace) -> str | None:
+    """The machine the running dispatcher, or the last one, worked on; None if no dispatcher has."""
+    try:
+        return (workspace.root / HOST).read_text().strip() or None
+    except OSError:
+        return None
 
 
 def heartbeat_age(workspace: Workspace, now: datetime | None = None) -> float | None:

@@ -6,17 +6,26 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-from cedar.agents.toolkits.research import agent_file_access
-from cedar.agents.toolkits.files import FileAccess
+from cedar.agents.toolkits.research import (
+    PSEUDO_FILESYSTEMS,
+    ResearchContext,
+    agent_file_access,
+    registrant_file_access,
+)
 from cedar.agents.transcripts import TranscriptStore
-from cedar.engine import JobManager, JobMonitor, ProtocolEngine, ResultValidator
+from cedar.contracts.base import Actor, ActorKind
+from cedar.engine import JobManager, JobMonitor, ProtocolEngine, ResultValidator, RunRegistrar
 from cedar.engine.analysis import AnalysisRunner
-from cedar.hpc.profile import ComputeProfile, ProfileStore
+from cedar.engine.sandbox import SandboxView, program_paths
+from cedar.engine.workbench import AgentBench, Workbench
+from cedar.hpc.local import LocalBackend
+from cedar.hpc.profile import ComputeProfile, LocalExecution, ProfileNotApproved, ProfileStore
 from cedar.hpc.slurm import SchedulerBackend, SlurmBackend
 from cedar.models import CredentialStore, ModelClient, ModelConfig, ModelSettings, create_client
-from cedar.protocols import FhiAimsRun, ProtocolRegistry
+from cedar.protocols import FhiAimsRun, FhiAimsRunSlurmOnly, ProtocolRegistry
+from cedar.protocols.fhiaims_run import current_host
 from cedar.state.ledger import ResearchLedger
-from cedar.state.projection import InvestigationState
+from cedar.state.projection import AgentRecord, CalculationRecord, InvestigationState
 from cedar.store import ArtifactStore, SQLiteEventStore
 
 
@@ -43,6 +52,12 @@ class Workspace:
         """Where the investigation's research notebook (generated Markdown) lives."""
         return self.root / "notebooks" / investigation_id
 
+    def agent_workspace(self, investigation_id: str, hypothesis_id: str) -> Path:
+        """The directory of a hypothesis's agent, the only place it writes; created on first use."""
+        path = self.root / "workspaces" / investigation_id / hypothesis_id
+        path.mkdir(mode=0o700, parents=True, exist_ok=True)
+        return path
+
 
 @dataclass
 class Services:
@@ -55,25 +70,28 @@ class Services:
     monitor: JobMonitor
     validator: ResultValidator
     analysis: AnalysisRunner
-    shared_roots: list[Path]
-    """Directories every agent may read, such as the codes' species defaults."""
     deny: list[Path]
+    local_backend: LocalBackend
+    """Runs local calculations on the interactive node CEDAR runs on."""
+    local_manager: JobManager
+    local_monitor: JobMonitor
 
-    def agent_files(self, workspace: Workspace, investigation_id: str, hypothesis_id: str) -> FileAccess:
-        """What one hypothesis's agent may read: its own calculations' run directories and the shared roots."""
-        return agent_file_access(workspace.ledger, investigation_id, hypothesis_id, self.profile.runs_root,
-                                 self.shared_roots, self.deny)
+    def manager_for(self, calc: CalculationRecord) -> JobManager:
+        return self.local_manager if calc.task.execution == "local" else self.manager
 
 
 def registry_for(profile: ComputeProfile) -> ProtocolRegistry:
-    protocols = [FhiAimsRun(profile)] if "fhi-aims" in profile.codes else []
+    protocols = [FhiAimsRun(profile), FhiAimsRunSlurmOnly(profile)] if "fhi-aims" in profile.codes else []
     return ProtocolRegistry(protocols)
 
 
 def services_for(workspace: Workspace, profile: ComputeProfile, backend: SchedulerBackend | None = None,
-                 *, deny: list[Path] = (), analysis_slots: threading.Semaphore | None = None) -> Services:
-    """``analysis_slots``, shared across investigations, limits analysis scripts running at once."""
+                 *, deny: list[Path] = (), analysis_slots: threading.Semaphore | None = None,
+                 local_backend: LocalBackend | None = None) -> Services:
+    """``analysis_slots``, shared across investigations, limits analysis scripts running at once; the dispatcher
+    passes its own ``local_backend``, which keeps track of the local runs it started."""
     backend = backend or SlurmBackend()
+    local = local_backend or LocalBackend(profile.runs_root, host=current_host)
     registry = registry_for(profile)
     return Services(
         profile=profile,
@@ -81,12 +99,71 @@ def services_for(workspace: Workspace, profile: ComputeProfile, backend: Schedul
         engine=ProtocolEngine(workspace.ledger, registry, workspace.artifacts, profile.runs_root),
         manager=JobManager(workspace.ledger, backend, profile.runs_root),
         monitor=JobMonitor(workspace.ledger, backend),
-        validator=ResultValidator(workspace.ledger, registry, workspace.artifacts, backend, profile.runs_root),
+        validator=ResultValidator(workspace.ledger, registry, workspace.artifacts, backend, profile.runs_root,
+                                  local_backend=local),
         analysis=AnalysisRunner(workspace.ledger, workspace.artifacts, profile.runs_root, workspace.root / "analyses",
                                 slots=analysis_slots),
-        shared_roots=[Path(p) for code in profile.codes.values() for p in code.data_paths.values()],
         deny=[Path(d) for d in deny],
+        local_backend=local,
+        local_manager=JobManager(workspace.ledger, local, profile.runs_root, execution="local"),
+        local_monitor=JobMonitor(workspace.ledger, local, execution="local"),
     )
+
+
+def investigation_registrar(workspace: Workspace, profiles: ProfileStore, investigation_id: str, *,
+                            deny: list[Path] = ()) -> RunRegistrar:
+    """Registers shared runs for the researcher and the Chief Scientist, under the investigation's compute profile if
+    it has a usable one."""
+    try:
+        profile = profile_for(workspace.ledger.load(investigation_id), profiles)
+    except (LookupError, ProfileNotApproved, FileNotFoundError):
+        profile = None
+    access = registrant_file_access(workspace.root, deny)
+    return RunRegistrar(workspace.ledger, workspace.artifacts, profile=profile,
+                        readable=lambda path: access.resolve(str(path)))
+
+
+def research_context(workspace: Workspace, investigation_id: str, agent: AgentRecord, services: Services | None, *,
+                     deny: list[Path] = (), analysis_slots: threading.Semaphore | None = None,
+                     workbench: Workbench | None = None,
+                     should_stop: Callable[[], bool] | None = None) -> ResearchContext:
+    """What one hypothesis agent's research tools work with. Without ``services`` (no usable compute profile) it
+    requests no calculation, but still registers existing runs, reads and analyses them, and runs commands in the
+    ``workbench``, which ``should_stop`` interrupts."""
+    directory = workspace.agent_workspace(investigation_id, agent.hypothesis_id)
+    profile = services.profile if services is not None else None
+    files = agent_file_access(workspace.ledger, investigation_id, agent.hypothesis_id,
+                              profile.runs_root if profile is not None else None, data_dir=workspace.root,
+                              workspace=directory, deny=deny)
+    if services is not None:
+        registry, engine, validator, analysis = services.registry, services.engine, services.validator, \
+            services.analysis
+    else:
+        registry, engine = ProtocolRegistry([]), None
+        validator = ResultValidator(workspace.ledger, registry, workspace.artifacts)
+        analysis = AnalysisRunner(workspace.ledger, workspace.artifacts, None, workspace.root / "analyses",
+                                  slots=analysis_slots)
+    registrar = RunRegistrar(workspace.ledger, workspace.artifacts, profile=profile,
+                             readable=lambda path: files.resolve(str(path)))
+    bench = None
+    if workbench is not None:
+        local = profile.local_execution if profile is not None else LocalExecution()
+        binaries = [Path(code.binary) for code in profile.codes.values()] if profile is not None else []
+
+        def view() -> SandboxView:
+            # The sandbox makes its own /proc and /dev; everything else the agent may not read is hidden.
+            hidden = [p for p in files.deny if str(p) not in PSEUDO_FILESYSTEMS]
+            hidden += [*binaries, *program_paths(), *map(Path, local.hidden_paths)]
+            shown = [p for p in files.allow if p != directory.resolve()]
+            return SandboxView(workspace=directory, hidden=tuple(dict.fromkeys(hidden)), shown=tuple(shown))
+
+        bench = AgentBench(workbench, investigation_id, agent.hypothesis_id, agent.agent_id, view, local,
+                           code_paths=[Path(p) / "bin" for p in local.python_environments], should_stop=should_stop)
+    return ResearchContext(ledger=workspace.ledger, investigation_id=investigation_id,
+                           hypothesis_id=agent.hypothesis_id,
+                           actor=Actor(kind=ActorKind.HYPOTHESIS_AGENT, id=agent.agent_id), registry=registry,
+                           artifacts=workspace.artifacts, engine=engine, validator=validator, files=files,
+                           analysis=analysis, workspace=directory, registrar=registrar, bench=bench)
 
 
 def profile_for(state: InvestigationState, profiles: ProfileStore) -> ComputeProfile:

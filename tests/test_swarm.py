@@ -324,7 +324,7 @@ def test_agents_see_only_their_own_work(ledger, store, artifacts, site, tmp_path
         outcome = tools_a[name].invoke(arguments)
         assert outcome.is_error and "is not one of your hypothesis's calculations" in outcome.content
     outcome = tools_a["read_file"].invoke({"path": aims_out})
-    assert outcome.is_error and "outside the readable roots" in outcome.content
+    assert outcome.is_error and "not readable by agents" in outcome.content
 
     # Its own agent reads it, computes from it and records both.
     assert not tools_b["read_file"].invoke({"path": aims_out}).is_error

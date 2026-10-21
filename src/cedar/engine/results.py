@@ -12,7 +12,9 @@ When a job ends, the validator checks the run's health and stores its output fil
 
 Either way the evidence is VALIDATED only if every run it rests on ended COMPLETED and
 passed its checks; otherwise it gets the failed run's quality. An analysis result whose
-script reported a failed check is INCONCLUSIVE at best.
+script reported a failed check is INCONCLUSIVE at best. A run registered from outside CEDAR
+has no scheduler state: its health check alone decides, and a reading of it is archived
+computation evidence.
 """
 
 import math
@@ -75,15 +77,23 @@ class ValidationOutcome:
 
 class ResultValidator:
     def __init__(self, ledger: ResearchLedger, registry: ProtocolRegistry, artifacts: ArtifactStore,
-                 backend: SchedulerBackend, runs_root: str | Path, *, actor: Actor = VALIDATOR) -> None:
+                 backend: SchedulerBackend | None = None, runs_root: str | Path | None = None, *,
+                 actor: Actor = VALIDATOR, local_backend: SchedulerBackend | None = None) -> None:
+        """Without a ``backend`` and ``runs_root`` (no compute profile) it handles registered runs only;
+        ``local_backend`` names the logs of local runs."""
         self._ledger = ledger
         self._registry = registry
         self._artifacts = artifacts
         self._backend = backend
-        self._runs_root = Path(runs_root)
+        self._local_backend = local_backend
+        self._runs_root = Path(runs_root) if runs_root is not None else None
         self._actor = actor
 
     def run_directory(self, investigation_id: str, calculation_id: str) -> Path:
+        """Where the run's files are: its run directory, or the directory a registered run came from."""
+        calc = self._ledger.load(investigation_id).calculations.get(calculation_id)
+        if calc is not None and calc.registered:
+            return Path(calc.registration.source)
         calc, _ = self._calculation(investigation_id, calculation_id)
         return self._runs_root / calc.workdir
 
@@ -92,8 +102,9 @@ class ResultValidator:
         calc, protocol = self._calculation(investigation_id, calculation_id)
         directory = self._runs_root / calc.workdir
         names = list(protocol.output_files)
-        if calc.scheduler_job_id:
-            names += self._backend.log_file_names(calc.scheduler_job_id)
+        backend = self._local_backend if calc.task.execution == "local" else self._backend
+        if calc.scheduler_job_id and backend is not None:
+            names += backend.log_file_names(calc.scheduler_job_id)
         return {name: directory / name for name in names if (directory / name).is_file()}
 
     # -- run checks ---------------------------------------------------------------------
@@ -108,6 +119,9 @@ class ResultValidator:
 
         outputs = {name: path.read_bytes() for name, path in self.output_paths(investigation_id, calculation_id).items()}
         report = protocol.check_run(calc.task, outputs, calc.scheduler_state)
+        method = dict(report.method)
+        if calc.task.execution == "local" and calc.scheduler_job_id and hasattr(self._local_backend, "where"):
+            method |= self._local_backend.where(calc.scheduler_job_id)
         checks = list(report.checks)
         try:
             verify_run_directory(self._runs_root / calc.workdir, calc)
@@ -130,7 +144,7 @@ class ResultValidator:
             EventDraft(actor=self._actor, idempotency_key=f"{calculation_id}:run_checked", payload=RunChecked(
                 calculation_id=calculation_id, outputs=stored, checks=tuple(checks),
                 failure_quality=report.failure_quality, readings=readings, limitations=report.limitations,
-                method=report.method)),
+                method=method)),
             EventDraft(actor=self._actor, idempotency_key=f"{calculation_id}:quality_assessed",
                        payload=CalculationStateChanged(calculation_id=calculation_id,
                                                        state=CalculationState.QUALITY_ASSESSED)),
@@ -141,7 +155,9 @@ class ResultValidator:
 
     def record_reading(self, investigation_id: str, calculation_id: str, reading: OutputReading,
                        observable: Observable) -> ValidationOutcome:
-        calc, _ = self._calculation(investigation_id, calculation_id)
+        calc = self._ledger.load(investigation_id).calculations.get(calculation_id)
+        if calc is None:
+            raise RuleViolation(f"unknown calculation {calculation_id}")
         check = self._checked(calc)
         outputs = {name: self._artifacts.read(ref) for name, ref in check.outputs.items()}
         problems = self._check_reading_parts(reading.citations, reading.value, outputs)
@@ -152,11 +168,12 @@ class ResultValidator:
         checks = (self._health_check(calc),
                   QualityCheck(name=CITATIONS_VERIFIED, passed=True,
                                detail=f"{len(citations)} citation(s) found verbatim in the stored output"))
+        kind = EvidenceKind.ARCHIVED_COMPUTATION if calc.registered else EvidenceKind.DIRECT_COMPUTATION
         evidence = EvidenceObject(
-            kind=EvidenceKind.DIRECT_COMPUTATION, summary=reading.summary, observable=observable, value=reading.value,
+            kind=kind, summary=reading.summary, observable=observable, value=reading.value,
             calculation_id=calculation_id, method=check.method, quality=self._quality([calc]),
             quality_checks=checks, limitations=(*check.limitations, *reading.limitations),
-            sources=(*check.outputs.values(), *calc.examination.files.values()), citations=citations,
+            sources=(*check.outputs.values(), *calc.input_files.values()), citations=citations,
             interpreted_by=reading.reader)
         return ValidationOutcome(self._record(investigation_id, evidence))
 
@@ -224,8 +241,8 @@ class ResultValidator:
 
     @classmethod
     def _quality(cls, calcs: list[CalculationRecord]) -> EvidenceQuality:
-        failures = [check.failure_quality for c in calcs
-                    if not (check := cls._checked(c)).healthy or c.scheduler_state is not SchedulerState.COMPLETED]
+        failures = [check.failure_quality for c in calcs if not (check := cls._checked(c)).healthy
+                    or (not c.registered and c.scheduler_state is not SchedulerState.COMPLETED)]
         if not failures:
             return EvidenceQuality.VALIDATED
         return EvidenceQuality.INVALID if EvidenceQuality.INVALID in failures else EvidenceQuality.INCONCLUSIVE

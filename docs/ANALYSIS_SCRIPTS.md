@@ -5,7 +5,9 @@ Hypothesis agents take results from finished calculations in two ways:
 - **Readings.** A value the code printed is recorded with `submit_reading`, citing the file and lines. The validator finds the quote in the stored output before recording it.
 - **Analysis scripts.** Anything that must be computed is handled by a Python script the agent writes, run with `run_analysis`. Examples: a gap from an eigenvalue table, a distance from a geometry, a planar average, or a difference between runs. The agent then records a result with `record_result`.
 
-No quantity is built into CEDAR. The FHI-aims protocol (`fhiaims.run`) checks that a run is healthy; what to take from it is the agent's decision.
+No quantity is built into CEDAR. The FHI-aims protocol (`fhiaims.run`) checks that a run is healthy; what to take from it is the agent's decision. The runs can be CEDAR's own or runs computed outside CEDAR and registered ([`WORKBENCH.md`](WORKBENCH.md)).
+
+Analysis scripts are not the agent's general-purpose commands: those run in its workspace, in the workbench's sandbox, and give context, not evidence ([`WORKBENCH.md`](WORKBENCH.md)).
 
 ## How a script runs
 
@@ -13,7 +15,7 @@ No quantity is built into CEDAR. The FHI-aims protocol (`fhiaims.run`) checks th
    - imports modules that start processes, open network connections, load foreign code or import dynamically (`subprocess`, `socket`, `urllib`, `multiprocessing`, `ctypes`, `importlib`, …)
    - calls `os.system`, `os.popen`, `os.exec*`, `os.spawn*`, `os.fork` or `os.kill`
    - uses `eval`, `exec`, `compile` or `__import__`
-2. **Staging.** For each calculation it names, which must be one of its own hypothesis's, the requested files are copied read-only to `inputs/<calculation_id>/` in a fresh working directory: by default the run's stored outputs and its input files, or any file of the run directory named by relative path. Each file is identified by its content hash, and a file the run check already stored must be that same file.
+2. **Staging.** For each calculation it names, which must be one of its own hypothesis's or a registered run shared with every agent, the requested files are copied read-only to `inputs/<calculation_id>/` in a fresh working directory: by default the run's stored outputs and its input files, or any file of the run directory (for a registered run, the directory it came from) named by relative path. Each file is identified by its content hash, and a file the run check already stored must be that same file.
 3. **Execution.** The script runs on the login node with the Python environment CEDAR runs in (NumPy, SciPy, ASE and matplotlib available), with:
    - a clean environment: no credentials, a private home and temporary directory, single-threaded numerical libraries
    - limits: 10 minutes of CPU, 15 minutes of wall-clock time, 4 GiB of memory, 200 MiB per file written; at most two scripts run at once, whichever agents started them
@@ -45,7 +47,7 @@ Both kinds are recorded on the evidence. The script's checks appear with the pre
 
 ## Scripts never run DFT
 
-A script cannot start a program, so it cannot launch a DFT code, an MPI job or a shell command. Calculations run only as examined jobs through the job manager, after the researcher authorizes them.
+A script cannot start a program, so it cannot launch a DFT code, an MPI job or a shell command. Calculations run only as examined jobs through the job manager, through Slurm or locally on an interactive node, after the researcher authorizes them.
 
 The guards stop mistakes and naive misuse. They are not a security boundary against code written to evade them: Python audit hooks can be bypassed from native code, and shared login nodes often do not allow operating-system sandboxes. Agents are instructed never to work around the guards.
 

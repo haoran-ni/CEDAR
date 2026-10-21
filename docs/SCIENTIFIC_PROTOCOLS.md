@@ -11,9 +11,9 @@ Protocols contain only knowledge that holds for the code everywhere, such as wha
 
 This document grows with each implemented protocol.
 
-## `fhiaims.run` 0.1
+## `fhiaims.run` 0.2 (and 0.1)
 
-One FHI-aims run of one structure, at fixed geometry or relaxing it.
+One FHI-aims run of one structure, at fixed geometry or relaxing it. Version 0.2 adds runs on the interactive node CEDAR runs on (`execution: local`); version 0.1 runs through Slurm only and stays for the calculations recorded under it. Everything below holds for both.
 
 ### Observables
 
@@ -61,7 +61,9 @@ Findings are `ERROR` (reject), `REVIEW` (needs user approval), `WARNING` or `INF
 - Relaxing a slab with no constrained atoms is a `WARNING`.
 - `k_grid` without a periodic cell is an `ERROR`.
 
-**Job script:** examined against the approved compute profile. The requested walltime and core-hours must also fit the task budget.
+**Job script:** examined against the approved compute profile. The requested walltime and core-hours must also fit the task budget. A task's `budget.cores`, if given, sets the task count of a generated script.
+
+**Local script** (0.2, `execution: local`): `local.sh` is the approved job template without its `#SBATCH` lines, with one `#CEDAR --ntasks=N --time=T` line stating what it may use; the protocol generates it with the allocation's cores here (or the task's, if fewer) and the profile's default walltime, ending at least five minutes before the allocation does. Its commands are examined like a job script's. `#SBATCH` lines in it are an `ERROR`; so is a task count beyond the allocation's cores on this node, a time limit past the allocation's end, a `job.sh` given for a local run (or `local.sh` for a Slurm one), and any local request while CEDAR runs on a login node: "DFT cannot run locally on login nodes". Under 0.1, a local request is an `ERROR`.
 
 **Duplicates:** inputs identical to a reusable calculation's are an `ERROR`; the agent should link that calculation instead.
 
@@ -81,6 +83,12 @@ When a job ends, the validator checks the run and stores `aims.out` and the sche
 
 These marker strings were checked against the FHI-aims source and real outputs of versions 240507 and 260331.1.
 
+A local run's checks are the same; its scheduler state comes from the local backend, and its run check records where it ran (`execution`, `host`, `allocation`).
+
+### Registered runs
+
+A run computed outside CEDAR can be registered from its directory ([`WORKBENCH.md`](WORKBENCH.md)). Its output gets the same checks except `scheduler_completed` (there is no scheduler state), `code_version` (the version is recorded, not required to match the profile) and `inputs_unchanged` (its inputs are stored when it is registered). Its settings are read from its inputs: physical keywords, forbidden ones and keywords the protocol does not know become controls; numerical keywords become numerical settings; convergence aids are left out; `species_defaults` names the level of the profile's species defaults that the species blocks equal, per element where they differ, or a hash of a block that equals none.
+
 ### Evidence from a run
 
 Every result taken from the run, a cited reading or an analysis result, gets its quality from the run check:
@@ -94,4 +102,5 @@ A reading must also have every quote found at its lines of the stored output (`c
 
 - Numerical convergence of the quantities taken from a run, and of differences between runs, with respect to k-points, basis, slab thickness and vacuum is not established by a single calculation. It needs a declared convergence comparison.
 - A species block modified by an agent can run only after user review. The examiner does not judge basis quality.
+- A registered run's inputs were not examined before it ran; the settings recorded for it are read from its files, and nothing checks that they produced its output.
 - Keyword meanings cover the keywords listed above. Anything else needs review rather than being guessed.

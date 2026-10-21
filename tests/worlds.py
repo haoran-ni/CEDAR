@@ -12,7 +12,7 @@ from cedar.contracts import PermissionAction, ProtocolRef, SchedulerState, Scien
 from cedar.engine import JobManager, JobMonitor, ProtocolEngine, ResultValidator
 from cedar.engine.analysis import AnalysisRunner
 from cedar.hpc.fake import FakeScheduler
-from cedar.protocols import TOTAL_ENERGY, FhiAimsRun, ProtocolRegistry
+from cedar.protocols import TOTAL_ENERGY, FhiAimsRun, FhiAimsRunSlurmOnly, ProtocolRegistry
 
 
 class World:
@@ -21,7 +21,7 @@ class World:
     def __init__(self, ledger, store, artifacts, site, **constraints):
         self.ledger, self.store, self.artifacts, self.site = ledger, store, artifacts, site
         self.scheduler = FakeScheduler()
-        self.registry = ProtocolRegistry([FhiAimsRun(site)])
+        self.registry = ProtocolRegistry([FhiAimsRun(site), FhiAimsRunSlurmOnly(site)])
         self.runs = Path(site.runs_root)
         self.engine = ProtocolEngine(ledger, self.registry, artifacts, self.runs)
         self.manager = JobManager(ledger, self.scheduler, self.runs)
@@ -33,9 +33,9 @@ class World:
         slab, bottom = co_on_cu111()
         self.structure = artifacts.put_bytes(geometry_text(slab, fixed=bottom).encode(), label="geometry.in")
 
-    def task(self, authored=None, **overrides) -> ScientificTaskSpec:
+    def task(self, authored=None, version="0.1", **overrides) -> ScientificTaskSpec:
         return ScientificTaskSpec(
-            protocol=ProtocolRef(name="fhiaims.run", version="0.1"), observable=TOTAL_ENERGY,
+            protocol=ProtocolRef(name="fhiaims.run", version=version), observable=TOTAL_ENERGY,
             estimand="total energy of CO/Cu(111) atop", system_label="CO/Cu(111) atop (synthetic)",
             structure=self.structure, authored_files=authored or {}, **declared(**overrides))
 

@@ -25,11 +25,13 @@ from cedar.contracts.plan import Priority
 from cedar.contracts.status import INVESTIGATION_MACHINE, InvestigationMode, InvestigationStatus
 from cedar.state.projection import (
     AgentRecord,
+    AgentRunRecord,
     AgentTaskRecord,
     ClosingRecord,
     EvidenceRecord,
     InvestigationState,
     ProposalRecord,
+    WorkbenchRecord,
     agent_id_for,
     evidence_owner,
     review_deadline,
@@ -219,6 +221,14 @@ def _evidence_line(state: InvestigationState, record: EvidenceRecord) -> str:
             + (f"; not comparable when: {'; '.join(ev.non_comparability)}" if ev.non_comparability else ""))
 
 
+def _commands_during(state: InvestigationState, run: AgentRunRecord) -> list[WorkbenchRecord]:
+    """The workbench commands an agent ran during one of its runs: since its previous run ended."""
+    earlier = max((r.recorded_at for r in state.agent_runs if r.actor_id == run.actor_id
+                   and r.recorded_at < run.recorded_at), default=0)
+    return [w for w in state.workbench_runs.values()
+            if w.agent_id == run.actor_id and earlier < w.recorded_at < run.recorded_at]
+
+
 def review_material(state: InvestigationState, task: AgentTaskRecord) -> str:
     """What the Chief Scientist reviews: the reports, the evidence and the Evidence Judge's assessments recorded, and
     the researcher's messages, since the previous review."""
@@ -245,6 +255,10 @@ def review_material(state: InvestigationState, task: AgentTaskRecord) -> str:
             agent = state.agents.get(run.actor_id)
             who = f"{agent_label(agent)} on {agent.hypothesis_id}" if agent else run.actor_id
         lines += ["", f"[{who}; run {run.run.outcome}]", (run.run.report or "(no report)").strip()]
+        commands = _commands_during(state, run)
+        if commands:
+            lines.append("Workbench commands it ran (context, not evidence):")
+            lines += [f"- {w.run_id}: {w.run.outcome.value}: {w.run.command}" for w in commands]
     evidence = [r for r in state.evidence.values() if since < r.recorded_at <= task.queued_at]
     lines += ["", "Evidence recorded since your last review, as the record holds it:"]
     lines += [_evidence_line(state, r) for r in evidence] or ["None."]

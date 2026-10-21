@@ -73,6 +73,32 @@ class SchedulerLimits(Contract):
         return self
 
 
+class LocalExecution(Contract):
+    """How the agents' workbench commands may use the machine CEDAR runs on.
+
+    On a login node, shared with other users, each command gets few cores; on an interactive node, inside the
+    researcher's Slurm allocation, commands share the allocation's cores with local calculations. Commands always
+    have a time limit, because the agent waits for each one.
+    """
+
+    login_cores_per_command: int = Field(default=1, gt=0)
+    login_max_commands: int = Field(default=2, gt=0)
+    """Commands running at once on a login node, whichever agents started them."""
+    default_command_minutes: int = Field(default=10, gt=0)
+    login_max_command_minutes: int = Field(default=30, gt=0)
+    node_max_command_minutes: int = Field(default=60, gt=0)
+    python_environments: tuple[AbsolutePath, ...] = ()
+    """Further Python environments (their prefixes), whose programs commands may run besides CEDAR's own."""
+    hidden_paths: tuple[AbsolutePath, ...] = ()
+    """Programs or directories commands must not see, besides the codes' binaries and the MPI launchers."""
+
+    @model_validator(mode="after")
+    def _consistent(self) -> "LocalExecution":
+        if self.default_command_minutes > min(self.login_max_command_minutes, self.node_max_command_minutes):
+            raise ValueError("the default command time exceeds a maximum")
+        return self
+
+
 def template_fields(text: str) -> set[str]:
     return {m.group(1) for m in _PLACEHOLDER.finditer(text)}
 
@@ -91,6 +117,8 @@ class ComputeProfile(Contract):
     runs_root: AbsolutePath
     """Directory for run directories, on a filesystem the compute nodes can reach."""
     sources: tuple[ProfileSource, ...] = ()
+    local: LocalExecution | None = None
+    """How workbench commands use this machine; the defaults of ``LocalExecution`` when not given."""
 
     @model_validator(mode="after")
     def _template_well_formed(self) -> "ComputeProfile":
@@ -104,8 +132,14 @@ class ComputeProfile(Contract):
             raise ValueError("exactly one template line must launch {{binary}} writing to {{output}}")
         return self
 
+    @property
+    def local_execution(self) -> LocalExecution:
+        return self.local or LocalExecution()
+
     def content_hash(self) -> str:
-        return sha256_hex(canonical_json(self))
+        # A profile approved before ``local`` existed keeps its hash, and so its approval.
+        data = self.model_dump(mode="json", exclude={"local"} if self.local is None else None)
+        return sha256_hex(canonical_json(data))
 
 
 class ProfileApproval(Contract):
@@ -132,6 +166,9 @@ def check_profile(profile: ComputeProfile) -> list[Finding]:
         for role, path in code.data_paths.items():
             if not Path(path).is_dir():
                 add(FindingSeverity.ERROR, "missing_data_path", f"{name}: {role} directory {path} does not exist")
+    for prefix in profile.local_execution.python_environments:
+        if not (Path(prefix) / "bin").is_dir():
+            add(FindingSeverity.ERROR, "missing_python_environment", f"{prefix} has no bin directory")
     runs_root = Path(profile.runs_root)
     existing = next((p for p in (runs_root, *runs_root.parents) if p.exists()), None)
     if existing is None or not os.access(existing, os.W_OK):

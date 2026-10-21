@@ -24,8 +24,11 @@ flowchart TB
     H1 & H2 & Hn --> T[Task request: declared intent + agent-written or generated inputs]
     T --> P[Versioned Protocol Registry]
     P --> Q[Input Examination: approve / reject / needs user review]
-    Q --> J[Job Manager: Slurm]
+    Q --> J[Job Manager: Slurm, or local on an interactive node]
     J --> HPC[HPC: FHI-aims / other registered engines]
+    H1 & H2 & Hn --> WB[Workbench: sandboxed commands in each agent's workspace]
+    H1 & H2 & Hn --> REG[Run Registrar: earlier runs into the record]
+    REG --> VAL
     HPC --> MON[Job Monitor & Event Dispatcher]
     HPC -. raw outputs .-> H1 & H2 & Hn
     H1 & H2 & Hn --> AN[Analysis Runner: agent-written scripts on the login node, guarded]
@@ -53,11 +56,13 @@ Chief Scientist and research orchestrator are separate concerns. The LLM supervi
 | TUI client | Chat, control requests, live agent/job state, report browsing | Hold sole authoritative state; launch DFT directly |
 | Conversation API / Chief Scientist | Scientific planning, delegations, user coordination, query state | Run scientific computation or arbitrary remote shell |
 | Orchestrator | Durable plan/task graph, worker scheduling, retries, dependency resolution | Pretend a job is scientifically valid from Slurm status alone |
-| Hypothesis agent | Commit hypotheses/predictions, write or request inputs and job scripts, read raw outputs, write analysis scripts, interpret evidence, for its own hypothesis | Submit anything that has not passed input examination; claim values it can neither cite nor compute with a recorded analysis; see or act on another hypothesis's work |
+| Hypothesis agent | Commit hypotheses/predictions, write or request inputs and job scripts, read any of the researcher's files, register earlier runs, run commands in its workspace, write analysis scripts, interpret evidence, for its own hypothesis | Submit anything that has not passed input examination and authorization; claim values it can neither cite nor compute with a recorded analysis; see or act on another hypothesis's work; write outside its workspace |
+| Workbench | Run an agent's shell commands and scripts in its workspace, in a sandbox (no network, no scheduler, no DFT codes, secrets and other work hidden), pinned to its cores, time-limited; record each | Run DFT; let a command write outside the workspace or reach the network; count what a command computes as evidence |
+| Run registrar | Store a run computed outside CEDAR by hash, check its health from its output, record the settings its inputs used | Run anything; validate a run whose checks failed; present it as computed by CEDAR |
 | Analysis runner | Examine and run agent-written analysis scripts on the login node against hashed copies of run outputs; record each run | Start programs (DFT included), reach the network, read beyond the staged inputs, pass credentials to scripts |
 | Protocol registry | Resolve allowable methods; examine agent-written or generated inputs and job scripts against the declared task; optionally generate inputs; define output checks | Approve content it cannot verify; assert universal physical applicability |
 | Environment setup agent | Work out how to run codes on this system from local files or user answers; propose a compute profile with sources | Activate a profile without user approval; hard-code site settings |
-| Job manager | Create deterministic manifests, submit / track / control authorized jobs through the scheduler adapter | Fabricate scheduler IDs, skip deduplication |
+| Job manager | Create deterministic manifests, submit / track / control authorized jobs through the scheduler adapter: Slurm, or the local backend on the interactive node CEDAR runs on | Fabricate scheduler IDs, skip deduplication, start anything local on a login node |
 | Job monitor | Observe scheduler status with permitted polling/callback mechanism | Treat missing `squeue` rows as proof of success |
 | Result validator | Check run health and convergence; verify values agents quote against the cited raw output; record analysis results | Convert nonconverged numbers, unverified readings or values no analysis reported into validated evidence |
 | Evidence Judge | Critique/evaluate evidence, interactions and uncertainty | Average agents' confidence guesses or decide by vote |
@@ -185,6 +190,8 @@ The UI can subscribe to a local event stream or poll at a restrained interval fo
 - LLM-written inputs and Slurm scripts are allowed, but only after input examination (and user approval where the verdict is `NEEDS_REVIEW`). Nothing LLM- or user-supplied is passed unchecked to subprocess or SSH, and agents never execute commands on the cluster themselves.
 - Each hypothesis agent's tools reach only its own hypothesis: its calculations (shared identical runs included), its analyses, its own readings, and its calculations' run directories. The research record refuses anything an agent records about another hypothesis.
 - LLM-written analysis scripts run on the login node only through the analysis runner: examined first, then run without credentials, under resource limits and an audit hook that keeps them to their staged inputs and refuses programs and sockets. These guards stop mistakes, not deliberate evasion; independent review agents are a planned second layer.
+- A hypothesis agent reads any file the researcher can, except secrets (the configuration directory, credential stores), CEDAR's data and run directories (the other hypotheses' work) and the pseudo-filesystems; it writes only in its workspace. Its shell commands run only in the workbench: bubblewrap namespaces with the filesystem read-only and those paths hidden, the DFT binaries and launchers hidden, no network, a time limit, its cores pinned. A DFT binary installed outside the profile's paths stays visible; on a login node it could run on one core until the time limit. See [`WORKBENCH.md`](WORKBENCH.md).
+- Local calculations run only where CEDAR runs inside a Slurm allocation, after examination and the researcher's authorization; on a login node they are refused.
 - Use distinct permissions for `read`, `prepare`, `submit`, `cancel`, `delete`, or expensive compute. Default to limits and explicit authorization for potentially destructive operations.
 - Mark literature and file content as *untrusted external data*, not executable instructions. Tool output must never override task policies or trigger arbitrary commands.
 - Web access is the researcher's setting for each investigation (`/web`), off by default. When on, the Chief Scientist and the hypothesis agents use the model provider's own web search and fetch, which run at the provider, never on the cluster; the Evidence Judge and the approver never get them. Files the researcher attaches (`/attach`) are stored by hash and every agent of the investigation can view them; the configuration directory can be neither read nor attached.

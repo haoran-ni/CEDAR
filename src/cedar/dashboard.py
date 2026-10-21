@@ -74,6 +74,9 @@ def short_id(calculation_id: str) -> str:
 def job_status(state: InvestigationState, calc: CalculationRecord) -> str:
     """Where a calculation stands, in the scheduler's terms once it has a job."""
     exam = calc.examination
+    if calc.registered:
+        healthy = calc.run_check is not None and calc.run_check.healthy
+        return f"{short_id(calc.calculation_id)} registered" + ("" if healthy else ", run failed its checks")
     if calc.state is _C.SPECIFIED:
         if exam is None:
             text = "being examined"
@@ -393,7 +396,8 @@ def mode_line(state: InvestigationState | None, web: RetrievalRecord | None = No
     which the panel highlights; a new investigation starts in human-in-the-loop. ``web`` is the setting before
     the investigation exists. ``/mode`` and ``/web`` give the details."""
     mode = InvestigationMode.HUMAN_IN_THE_LOOP if state is None else state.mode
-    return (f"Mode: {mode.value} · Web: {web_summary(state.retrieval if state is not None else web)}",
+    workbench = " · Workbench: off" if state is not None and not state.workbench_enabled else ""
+    return (f"Mode: {mode.value} · Web: {web_summary(state.retrieval if state is not None else web)}{workbench}",
             mode is InvestigationMode.FULL_AUTOMATION)
 
 

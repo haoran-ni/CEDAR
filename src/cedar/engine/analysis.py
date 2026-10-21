@@ -166,13 +166,15 @@ def _remove_tree(path: Path) -> None:
 
 
 class AnalysisRunner:
-    def __init__(self, ledger: ResearchLedger, artifacts: ArtifactStore, runs_root: str | Path, work_root: str | Path,
-                 *, limits: AnalysisLimits = AnalysisLimits(), read_roots: Sequence[Path] | None = None,
-                 actor: Actor = ANALYSIS_RUNNER, slots: threading.Semaphore | None = None) -> None:
-        """``slots``, shared between runners, limits how many scripts run at once on the login node."""
+    def __init__(self, ledger: ResearchLedger, artifacts: ArtifactStore, runs_root: str | Path | None,
+                 work_root: str | Path, *, limits: AnalysisLimits = AnalysisLimits(),
+                 read_roots: Sequence[Path] | None = None, actor: Actor = ANALYSIS_RUNNER,
+                 slots: threading.Semaphore | None = None) -> None:
+        """``slots``, shared between runners, limits how many scripts run at once on the login node. Without a
+        ``runs_root`` (no compute profile) scripts analyse registered runs only."""
         self._ledger = ledger
         self._artifacts = artifacts
-        self._runs_root = Path(runs_root)
+        self._runs_root = Path(runs_root) if runs_root is not None else None
         self._work_root = Path(work_root)
         self.limits = limits
         self._read_roots = tuple(read_roots) if read_roots is not None else default_read_roots()
@@ -195,13 +197,13 @@ class AnalysisRunner:
             calc = state.calculations.get(calculation_id)
             if calc is None:
                 problems.append(f"unknown calculation {calculation_id}")
-            elif hypothesis_id not in calc.hypothesis_ids:
+            elif not calc.visible_to(hypothesis_id):
                 problems.append(f"{calculation_id} is not one of {hypothesis_id}'s calculations")
             elif calc.run_check is None:
                 problems.append(f"the run of {calculation_id} has not been checked yet ({calc.state.value})")
             else:
                 plan[calculation_id] = (calc, list(names) if names else
-                                        sorted({*calc.run_check.outputs, *calc.examination.files}))
+                                        sorted({*calc.run_check.outputs, *calc.input_files}))
         if problems:
             return AnalysisReport(None, None, tuple(problems))
 
@@ -262,13 +264,18 @@ class AnalysisRunner:
         return staged, problems
 
     def _input_file(self, calc: CalculationRecord, name: str) -> tuple[ArtifactRef | None, str | None]:
-        stored = {**calc.examination.files, **calc.run_check.outputs}
+        stored = {**calc.input_files, **calc.run_check.outputs}
         if name in stored:
             return stored[name], None
         relative = Path(name)
         if relative.is_absolute() or ".." in relative.parts or not relative.parts:
             return None, f"{name!r}: give a path relative to the run directory of {calc.calculation_id}"
-        run_dir = (self._runs_root / calc.workdir).resolve()
+        if calc.registered:
+            run_dir = Path(calc.registration.source).resolve()
+        elif self._runs_root is not None and calc.workdir is not None:
+            run_dir = (self._runs_root / calc.workdir).resolve()
+        else:
+            return None, f"{name} is not a stored file of {calc.calculation_id}"
         path = (run_dir / relative).resolve()
         if not path.is_relative_to(run_dir) or not path.is_file():
             return None, f"{name} is not a file in the run directory of {calc.calculation_id}"

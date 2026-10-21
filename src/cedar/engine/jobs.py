@@ -3,6 +3,9 @@
 Submission is journaled: SUBMISSION_PENDING is recorded before the scheduler is called,
 and a calculation found in that state is reconciled by job name before anything is
 submitted again, so a crash between the two never produces a duplicate job.
+
+Each manager and monitor serves calculations of one execution: ``slurm`` through the Slurm
+adapter, ``local`` through the local backend on the interactive node CEDAR runs on.
 """
 
 import hashlib
@@ -13,6 +16,7 @@ from cedar.contracts.base import Actor, ActorKind
 from cedar.contracts.events import CalculationStateChanged, EventDraft, RecordedEvent
 from cedar.contracts.plan import PermissionAction
 from cedar.contracts.status import SCHEDULER_TERMINAL_STATES, CalculationState, SchedulerState
+from cedar.contracts.task import Execution
 from cedar.errors import RuleViolation
 from cedar.hpc.slurm import SchedulerBackend, SchedulerError, default_lookback
 from cedar.state.ledger import ResearchLedger
@@ -42,11 +46,12 @@ def verify_run_directory(directory: Path, calc: CalculationRecord) -> None:
 
 class JobManager:
     def __init__(self, ledger: ResearchLedger, backend: SchedulerBackend, runs_root: str | Path, *,
-                 actor: Actor = JOB_MANAGER) -> None:
+                 actor: Actor = JOB_MANAGER, execution: Execution = "slurm") -> None:
         self._ledger = ledger
         self._backend = backend
         self._runs_root = Path(runs_root)
         self._actor = actor
+        self.execution = execution
 
     def submit(self, investigation_id: str, calculation_id: str) -> str:
         """Submit examined inputs and return the scheduler job id. Safe to call again."""
@@ -56,6 +61,8 @@ class JobManager:
             raise RuleViolation(f"unknown calculation {calculation_id}")
         if calc.scheduler_job_id is not None:
             return calc.scheduler_job_id
+        if calc.task.execution != self.execution:
+            raise RuleViolation(f"{calculation_id} is a {calc.task.execution} run, not a {self.execution} one")
         if calc.state not in (_C.VALIDATED_INPUT, _C.SUBMISSION_PENDING):
             raise RuleViolation(f"cannot submit a calculation that is {calc.state}")
         authorization = None
@@ -87,7 +94,7 @@ class JobManager:
         state = self._ledger.load(investigation_id)
         settled: dict[str, str | None] = {}
         for calc in state.calculations.values():
-            if calc.state is not _C.SUBMISSION_PENDING:
+            if calc.state is not _C.SUBMISSION_PENDING or calc.task.execution != self.execution:
                 continue
             found = self._backend.find_by_name(job_name_for(calc.calculation_id), default_lookback())
             if len(found) == 1:
@@ -133,15 +140,18 @@ class PollResult:
 
 
 class JobMonitor:
-    def __init__(self, ledger: ResearchLedger, backend: SchedulerBackend, *, actor: Actor = JOB_MONITOR) -> None:
+    def __init__(self, ledger: ResearchLedger, backend: SchedulerBackend, *, actor: Actor = JOB_MONITOR,
+                 execution: Execution = "slurm") -> None:
         self._ledger = ledger
         self._backend = backend
         self._actor = actor
+        self.execution = execution
 
     def poll(self, investigation_id: str) -> PollResult:
         """One scheduler query for all live jobs; records only real state changes."""
         state = self._ledger.load(investigation_id)
-        live = [c for c in state.calculations.values() if c.state in _AT_SCHEDULER and c.scheduler_job_id]
+        live = [c for c in state.calculations.values() if c.state in _AT_SCHEDULER and c.scheduler_job_id
+                and c.task.execution == self.execution]
         observations = self._backend.query([c.scheduler_job_id for c in live])
         result = PollResult()
         for calc in live:

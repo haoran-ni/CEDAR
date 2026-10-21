@@ -75,10 +75,12 @@ class ProtocolEngine:
         refs = {name: self._artifacts.put_bytes(data, label=name) for name, data in sorted(files.items())}
         execution = tuple(name for name in protocol.execution_files if name in refs)
         input_hash = scientific_input_hash(protocol.ref, protocol.code_version, refs, execution)
-        duplicate = calculation_with_inputs(state, input_hash)
+        duplicate = calculation_with_inputs(state, input_hash, calc.hypothesis_ids)
         if duplicate is not None:
-            findings.append(Finding(severity=FindingSeverity.ERROR, code="duplicate_inputs",
-                                    message=f"these inputs are identical to calculation {duplicate}; link it instead"))
+            message = (f"these inputs are identical to registered run {duplicate}, which already has outputs; read "
+                       "or analyse it instead of running it again" if state.calculations[duplicate].registered else
+                       f"these inputs are identical to calculation {duplicate}; link it instead")
+            findings.append(Finding(severity=FindingSeverity.ERROR, code="duplicate_inputs", message=message))
         verdict = verdict_for(findings)
         examination = InputExamination(protocol=protocol.ref, code_version=protocol.code_version, files=refs,
                                        execution_files=execution, input_hash=input_hash, findings=tuple(findings),

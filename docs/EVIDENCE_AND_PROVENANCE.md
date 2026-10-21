@@ -24,12 +24,13 @@ Under the data directory (`$CEDAR_DATA_DIR`, else `$XDG_DATA_HOME/cedar`, else
 | `events.sqlite` | The event log of every investigation |
 | `artifacts/objects/<aa>/<sha256>` | Stored files: structures, examined inputs and job scripts, raw outputs, analysis scripts with what they printed and wrote, and the materials the researcher attached. Written once, read-only, addressed by content hash |
 | `analyses/` | Working directories of analysis scripts while they run; each is removed when its script ends |
+| `workspaces/<investigation>/<hypothesis>/` | Each hypothesis agent's workspace, the only place it writes; what its workbench commands printed is in `workbench-output/` there |
 | `transcripts/` | Each agent session's conversation, one JSON line per message (mode 600), including the images and PDF pages an agent viewed and the web results the provider returned. Operational memory for resuming agents, not the research record |
 | `notebooks/<investigation>/` | The research notebook |
-| `dispatcher.lock`, `dispatcher.heartbeat`, `dispatcher.pid`, `dispatcher.log` | The dispatcher's lock, last-pass time and process id, and the output of one the chat started |
+| `dispatcher.lock`, `dispatcher.heartbeat`, `dispatcher.pid`, `dispatcher.host`, `dispatcher.log` | The dispatcher's lock, last-pass time, process id and machine, and the output of one the chat started |
 | `activity/` | One file per agent run in progress, for the live panel; removed when the run ends |
 
-Run directories, where jobs actually execute, are under the compute profile's `runs_root`.
+Run directories, where jobs actually execute, are under the compute profile's `runs_root`; the local backend's records of local runs are in `.cedar-local/` there.
 The compute profile itself and the API keys live in the configuration directory, never in
 the data directory.
 
@@ -38,7 +39,7 @@ the data directory.
 Each event is an envelope around one typed payload. The envelope records:
 
 - `event_id`, `investigation_id`, and `stream_version` (contiguous from 1 per investigation)
-- `occurred_at` (UTC) and the `actor`: its kind (user, Chief Scientist, hypothesis agent, Evidence Judge, approver, protocol engine, job manager, job monitor, validator, analysis runner, system) and id. A hypothesis agent's id, such as `agent-hyp-xc`, names the one hypothesis it works on
+- `occurred_at` (UTC) and the `actor`: its kind (user, Chief Scientist, hypothesis agent, Evidence Judge, approver, protocol engine, job manager, job monitor, validator, analysis runner, workbench, system) and id. A hypothesis agent's id, such as `agent-hyp-xc`, names the one hypothesis it works on
 - `round` and `plan_version` at the time of recording
 - an optional `idempotency_key`, so a retried write is recorded once
 - an optional `causation_id`
@@ -48,11 +49,12 @@ Payloads cover the whole research process:
 | Area | Events |
 |---|---|
 | Problem | `investigation_created`, `investigation_status_changed` (closing carries the researcher's authorization), `closing_proposed` (by the Chief Scientist; only the researcher closes), `observable_alignment_recorded` |
-| Direction | `user_intervention_recorded` (the researcher's words, verbatim, with any authorization), `plan_revised` (with the message that prompted it), `round_started`, `next_actions_recommended` (the Chief Scientist's candidate next steps, compared, and its choice; delegations and agent proposals cite it), `mode_changed` (human-in-the-loop or full automation, with its limits), `approver_decision` (in full automation, the approver's approval or refusal of starting agents or a submission, with its reason), `retrieval_policy_changed` (the researcher's setting of the agents' web access: off, on, or only some domains), `token_budget_changed` (the researcher's total token budget, or none) |
+| Direction | `user_intervention_recorded` (the researcher's words, verbatim, with any authorization), `plan_revised` (with the message that prompted it), `round_started`, `next_actions_recommended` (the Chief Scientist's candidate next steps, compared, and its choice; delegations and agent proposals cite it), `mode_changed` (human-in-the-loop or full automation, with its limits), `approver_decision` (in full automation, the approver's approval or refusal of starting agents or a submission, with its reason), `retrieval_policy_changed` (the researcher's setting of the agents' web access: off, on, or only some domains), `workbench_policy_changed` (the researcher's setting of the agents' workbench: on or off), `token_budget_changed` (the researcher's total token budget, or none) |
 | Materials | `material_attached` (a file the researcher gave the agents: its stored copy, name and note; context, not evidence) |
 | Hypotheses | `hypothesis_proposed`, `hypothesis_status_changed`, `prediction_registered` |
-| Computation | `calculation_requested`, `calculation_linked`, `calculation_inputs_examined`, `calculation_state_changed`, `run_checked` (the run's health checks and stored outputs) |
+| Computation | `calculation_requested` (with where it runs: Slurm or local), `calculation_linked`, `calculation_inputs_examined`, `calculation_state_changed`, `run_checked` (the run's health checks and stored outputs), `run_registered` (a run computed outside CEDAR: who registered it and from where, its stored inputs and outputs, the settings its inputs used, its health checks; for one hypothesis or shared by every agent) |
 | Results | `analysis_recorded` (a script an agent ran: the script, its hashed inputs, output and results), `evidence_recorded`, `assessment_recorded` |
+| Workbench | `workbench_run_recorded` (a command an agent ran in its workspace: what, where, with which resources, how it ended, what it printed, and the hash of each file it wrote; context, not evidence) |
 | Agents | `agents_proposed` (by the Chief Scientist: per hypothesis a role and a first task), `agents_started` (by the researcher's command or after the review window), `proposal_withdrawn`, `agent_retired`, `agent_task_queued` (work for an agent, the Judge, or a Chief Scientist review), `agent_run_recorded` (model, tokens, web searches and fetches, outcome, and the agent's final report) |
 
 Events are never updated or deleted; database triggers refuse both. A correction is a new
@@ -62,7 +64,7 @@ event.
 
 An `evidence_recorded` event carries an `EvidenceObject`:
 
-- **kind**: direct computation (a reading of one run), analysis (a result of a recorded analysis script), archived computation, published experiment, inference, or indirect constraint
+- **kind**: direct computation (a reading of one run CEDAR made), archived computation (a reading of one registered run, computed outside CEDAR), analysis (a result of a recorded analysis script), published experiment, inference, or indirect constraint
 - **observable**, with its definition and unit, and the **value** with unit, reference state and uncertainty components
 - **quality**: `VALIDATED`, `PROVISIONAL`, `INCONCLUSIVE` or `INVALID`, with every **quality check** that produced it
 - **sources**: stored artifacts (raw outputs, inputs, analysis scripts) or external citations
@@ -72,7 +74,7 @@ An `evidence_recorded` event carries an `EvidenceObject`:
 - **limitations**, **assumptions**, and **non-comparability** conditions
 - the **method**: the code, protocol and declared settings
 
-A run gives evidence only after its run check. A value read from an output cites the lines
+A run gives evidence only after its run check; a registered run, after the health check made when it was registered. A value read from an output cites the lines
 it came from, checked verbatim against the stored, hashed file. A value computed by an
 analysis script is taken from the analysis record, which holds the script and every input
 by hash ([`ANALYSIS_SCRIPTS.md`](ANALYSIS_SCRIPTS.md)). Either way the evidence is
@@ -100,7 +102,7 @@ Pages under `notebooks/<investigation>/`:
 |---|---|
 | `index.md` | Question and target claim; compared quantities and their alignment; web access and the attached materials; the plan and its versions; tables of hypotheses, agents (with every proposal) and calculations; links to rounds; what waits for the researcher; model usage |
 | `round-NN.md` | One page per round, answering the questions laid out in [`templates/ROUND_REPORT.md`](../templates/ROUND_REPORT.md): what we hypothesized and why, what we predicted, tested and observed, what changed our assessment, what remains unknown, and what is next; then the researcher's messages and the agents' reports |
-| `hypotheses/<id>.md` | One hypothesis: statement, falsifiers, its agent, predictions, calculations, analyses, evidence, assessment history, agent reports |
+| `hypotheses/<id>.md` | One hypothesis: statement, falsifiers, its agent, predictions, calculations (where each ran, or that it was computed outside CEDAR), analyses, workbench commands (context, not evidence), evidence, assessment history, agent reports |
 | `timeline.md` | Every event, one line each, in order |
 
 A **round** is one stretch of investigating. Round 0 is the setup. A new round starts each

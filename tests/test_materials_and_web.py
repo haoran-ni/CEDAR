@@ -189,7 +189,7 @@ def test_the_notebook_shows_web_access_and_materials(system, tmp_path):
     events = system["workspace"].store.read_stream(INV)
     pages = render_notebook(events)
     index = pages["index.md"]
-    assert "## Web access and materials" in index and "agents: **only arxiv.org**" in index
+    assert "## Web access, workbench and materials" in index and "agents: **only arxiv.org**" in index
     assert "- Set only arxiv.org by the researcher's msg-1" in index
     assert "- **mat-1** [fig.png](../../artifacts/objects/" in index and "msg-2): “Fig. 3”" in index
     round_page = pages[round_file(events[-1].round)]

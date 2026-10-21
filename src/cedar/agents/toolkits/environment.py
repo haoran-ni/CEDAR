@@ -22,6 +22,7 @@ from cedar.contracts.examination import FindingSeverity
 from cedar.hpc.profile import (
     CodeInstallation,
     ComputeProfile,
+    LocalExecution,
     ProfileSource,
     ProfileStore,
     SchedulerLimits,
@@ -102,6 +103,12 @@ class ProposeArgs(Contract):
     job_template: NonEmptyStr = Field(description="Job script with {{job_name}}, {{partition}}, {{nodes}}, "
                                                   "{{ntasks}}, {{walltime}}, {{binary}}, {{output}} placeholders.")
     runs_root: str = Field(description="Directory for run directories, reachable from compute nodes.")
+    python_environments: list[str] = Field(default=[], description="Further Python environments (their prefixes) "
+                                                                   "whose programs agents' workbench commands may "
+                                                                   "run, if the researcher wants them.")
+    hidden_paths: list[str] = Field(default=[], description="Further programs or directories workbench commands "
+                                                            "must not see, e.g. other DFT installations; the codes' "
+                                                            "binaries and the MPI launchers are always hidden.")
     source_notes: dict[str, str] = Field(default={}, description="For files and commands you consulted "
                                                                  "(by path or command): which values they support.")
 
@@ -155,6 +162,9 @@ def environment_tools(store: ProfileStore, queries: SchedulerQueries, session: S
                        for name, code in args.codes.items()},
                 job_template=args.job_template, runs_root=args.runs_root,
                 sources=session.with_notes(args.source_notes),
+                local=LocalExecution(python_environments=tuple(args.python_environments),
+                                     hidden_paths=tuple(args.hidden_paths))
+                if args.python_environments or args.hidden_paths else None,
             )
         except ValidationError as exc:
             problems = "\n".join(f"- {'.'.join(str(p) for p in e['loc'])}: {e['msg']}" for e in exc.errors())

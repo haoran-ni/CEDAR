@@ -82,17 +82,27 @@ def judge_tools(ctx: JudgeContext) -> list[AgentTool]:
             p = record.prediction
             lines.append(f"Prediction {pid} (recorded at event {record.registered_at}): {p.statement} Expected: "
                          f"{p.expected_outcome}. Falsified if: {p.falsified_if}.")
-        for cid in hyp.calculation_ids:
+        evidence = hypothesis_evidence(state, hyp.hypothesis_id)
+        used = [c for record in evidence for c in (record.evidence.calculation_id, *record.evidence.calculation_ids)
+                if c is not None]
+        for cid in dict.fromkeys([*hyp.calculation_ids, *used]):
             calc = state.calculations[cid]
             task = calc.task
             lines.append(f"Calculation {cid}: {calc.state.value}; {task.observable.name} ({task.observable.definition}); "
                          f"estimand: {task.estimand}; system: {task.system_label}")
+            if calc.registered:
+                registration = calc.registration
+                lines.append(f"  registered run from {registration.source}, "
+                             + ("shared with every agent" if calc.shared else f"for {registration.hypothesis_id}")
+                             + f": computed outside CEDAR (FHI-aims {registration.code_version}), its inputs not "
+                             f"examined before it ran, its outputs there before any prediction; "
+                             f"{registration.description}")
             lines.append(f"  interventions {task.interventions}; controls {task.controls}; numerical "
                          f"{task.numerical_settings}")
             if calc.run_check is not None:
                 failed = [c.name for c in calc.run_check.checks if not c.passed]
                 lines.append("  run check: " + (f"FAILED {', '.join(failed)}" if failed else "healthy"))
-        for record in hypothesis_evidence(state, hyp.hypothesis_id):
+        for record in evidence:
             ev = record.evidence
             value = f"{ev.value.value!r} {ev.value.unit}" if ev.value else "no value"
             source = (f"analysis {ev.analysis_id} of {', '.join(ev.calculation_ids)}" if ev.analysis_id

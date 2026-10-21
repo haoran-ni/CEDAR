@@ -1,4 +1,4 @@
-"""One FHI-aims run of one structure, at fixed geometry or relaxing it (``fhiaims.run`` 0.1).
+"""One FHI-aims run of one structure, at fixed geometry or relaxing it (``fhiaims.run`` 0.2, and 0.1).
 
 The protocol examines the inputs before the run and checks the run's health after it. What
 to take from a healthy run is declared by the agent, who reads it from the outputs or
@@ -12,21 +12,43 @@ keyword means: whether it changes the physical model, sets numerical accuracy, o
 affects how convergence is reached. It holds no site paths and no preferred values;
 agents declare every setting and the examiner checks that ``control.in`` implements
 exactly what was declared.
+
+Version 0.2 adds runs on the interactive node CEDAR runs on (``execution: local``): instead
+of a Slurm job script, ``local.sh``, the approved job template without its Slurm directives,
+whose task count and time limit must fit the researcher's allocation here. On a login node a
+local run is refused. Version 0.1 runs through Slurm only; it stays for the calculations
+recorded under it.
 """
 
 import math
-from collections.abc import Mapping
+import re
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 
-from cedar.codes.fhiaims.control import normalize_lines, parse_control, render_control, species_default_path
+from pydantic import JsonValue
+
+from cedar.codes.fhiaims.control import (
+    ControlFile,
+    normalize_lines,
+    parse_control,
+    render_control,
+    species_default_path,
+)
 from cedar.codes.fhiaims.geometry import Geometry, minimum_distance, parse_geometry, vacuum_along_c
 from cedar.codes.fhiaims.output import parse_output
-from cedar.contracts.base import Observable, Quantity
+from cedar.contracts.base import Observable, Quantity, sha256_hex
 from cedar.contracts.evidence import QualityCheck
 from cedar.contracts.examination import Finding, FindingSeverity
 from cedar.contracts.status import EvidenceQuality, SchedulerState
 from cedar.contracts.task import ProtocolRef, ScientificTaskSpec
-from cedar.hpc.jobscript import JobResources, examine_job_script, render_job_script
+from cedar.hpc.jobscript import (
+    JobResources,
+    examine_job_script,
+    examine_local_script,
+    render_job_script,
+    render_local_script,
+)
+from cedar.hpc.node import ExecutionHost, HostWatch
 from cedar.hpc.profile import ComputeProfile
 from cedar.protocols.base import Protocol, Reading, RunReport
 
@@ -73,6 +95,24 @@ FORBIDDEN_KEYWORDS = {
 }
 ALWAYS_DECLARED = ("xc", "spin", "charge", "relativistic", "occupation_type", SPECIES_DEFAULTS)
 """Stated explicitly by every task, so no record depends on an unstated code default."""
+RUN_LIMITATION = (
+    "One run at the declared numerical settings; convergence of the quantities taken from it (and of differences "
+    "between runs) with respect to k-points, basis, slab thickness and vacuum must be established by a declared "
+    "convergence comparison."
+)
+REGISTERED_OBSERVABLE = Observable(
+    name="registered run",
+    definition="the outputs of an FHI-aims run computed outside CEDAR, as registered; what is taken from them is "
+               "declared with each reading or analysis",
+)
+REGISTERED_ESTIMAND = "what the registered run's outputs show, at the settings its inputs used"
+_KEYWORD_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
+LOCAL_MARGIN_MINUTES = 5
+"""A local run must end this long before the allocation does."""
+LOGIN_NODE = ("CEDAR is running on a login node ({host}), and DFT cannot run locally on login nodes. Start CEDAR "
+              "on an interactive node (inside a Slurm allocation) to run it locally, or request it through Slurm.")
+current_host = HostWatch()
+"""Where this process runs, asked again at most every minute."""
 SLAB_VACUUM = 5.0
 """Å of empty space along c above which a periodic structure is treated as a slab."""
 MIN_DISTANCE = 0.5
@@ -120,17 +160,24 @@ def _same_args(expected: tuple[str, ...], actual: tuple[str, ...]) -> bool:
 
 
 class FhiAimsRun(Protocol):
-    ref = ProtocolRef(name="fhiaims.run", version="0.1")
-    input_files = ("control.in", "geometry.in", "job.sh")
+    ref = ProtocolRef(name="fhiaims.run", version="0.2")
+    input_files = ("control.in", "geometry.in", "job.sh", "local.sh")
     structure_file = "geometry.in"
-    execution_files = ("job.sh",)
+    execution_files = ("job.sh", "local.sh")
     output_files = ("aims.out",)
+    runs_locally = True
 
-    def __init__(self, profile: ComputeProfile) -> None:
+    def __init__(self, profile: ComputeProfile, host: Callable[[], ExecutionHost] | None = None) -> None:
+        """``host`` says where CEDAR runs, which bounds a local run."""
         if CODE not in profile.codes:
             raise ValueError(f"compute profile {profile.name} has no {CODE!r} installation")
         self._profile = profile
         self._code = profile.codes[CODE]
+        self._host = host or current_host
+
+    @staticmethod
+    def _script(task: ScientificTaskSpec) -> str:
+        return "local.sh" if task.execution == "local" else "job.sh"
 
     @property
     def code_version(self) -> str:
@@ -160,7 +207,19 @@ class FhiAimsRun(Protocol):
             "If you write control.in yourself it must set exactly the declared physical and numerical keywords, "
             "with species blocks copied unchanged from the declared level (changed blocks need user review). "
             "Keywords the examiner does not know also need user review.",
+            *self._where(),
         ])
+
+    def _where(self) -> list[str]:
+        if not self.runs_locally:
+            return ["Runs through Slurm only (job.sh); use version 0.2 for a local run."]
+        host = self._host()
+        local = (f"possible here: CEDAR runs on the {host.describe()}; a local run may use up to {host.cores} "
+                 "tasks and must end before the allocation does" if host.interactive else
+                 "not possible here: " + LOGIN_NODE.format(host=host.hostname))
+        return ["Where it runs: execution 'slurm' (default) submits job.sh to the scheduler; execution 'local' runs "
+                f"local.sh on the interactive node CEDAR runs on, inside the researcher's allocation. Local runs are "
+                f"{local}. Both need the researcher's approval to start."]
 
     # -- declared variables -----------------------------------------------------------
 
@@ -245,7 +304,23 @@ class FhiAimsRun(Protocol):
             if not any(f.severity is _E for f in problems):
                 geometry = parse_geometry(present["geometry.in"].decode(errors="replace"))
                 generated["control.in"] = self._render_control(values, geometry).encode()
-        if "job.sh" not in present:
+        script = self._script(task)
+        other = "job.sh" if script == "local.sh" else "local.sh"
+        if other in present:
+            findings.append(Finding(severity=_E, code="wrong_script", file=other,
+                                    message=f"a {task.execution} run takes {script}, not {other}"))
+        elif script not in present and script == "local.sh":
+            if self.runs_locally and self._host().interactive:
+                resources = self._default_local_resources(task)
+                if resources is None:
+                    findings.append(Finding(severity=_E, code="budget_too_small",
+                                            message="the task budget or the allocation's time left does not allow "
+                                                    "a local run of one minute"))
+                else:
+                    generated["local.sh"] = render_local_script(
+                        self._profile, self._code, ntasks=resources.ntasks,
+                        walltime_minutes=resources.walltime_minutes, output_file="aims.out").encode()
+        elif script not in present:
             resources = self._default_resources(task)
             if resources is None:
                 findings.append(Finding(severity=_E, code="budget_too_small",
@@ -273,15 +348,31 @@ class FhiAimsRun(Protocol):
 
     def _default_resources(self, task: ScientificTaskSpec) -> JobResources | None:
         limits = self._profile.limits
+        ntasks = task.budget.cores or limits.default_ntasks
         minutes = limits.default_walltime_minutes
         if task.budget.max_walltime_hours is not None:
             minutes = min(minutes, math.floor(task.budget.max_walltime_hours * 60))
         if task.budget.max_core_hours is not None:
-            minutes = min(minutes, math.floor(task.budget.max_core_hours * 60 / limits.default_ntasks))
+            minutes = min(minutes, math.floor(task.budget.max_core_hours * 60 / ntasks))
         if minutes < 1:
             return None
-        nodes = math.ceil(limits.default_ntasks / limits.cores_per_node)
-        return JobResources(limits.default_partition, nodes, limits.default_ntasks, minutes)
+        nodes = math.ceil(ntasks / limits.cores_per_node)
+        return JobResources(limits.default_partition, nodes, ntasks, minutes)
+
+    def _default_local_resources(self, task: ScientificTaskSpec) -> JobResources | None:
+        """The allocation's cores here (or the task's, if fewer), for the profile's default walltime, ending well
+        before the allocation does."""
+        host = self._host()
+        ntasks = min(task.budget.cores or host.cores, host.cores)
+        minutes = self._profile.limits.default_walltime_minutes
+        if task.budget.max_walltime_hours is not None:
+            minutes = min(minutes, math.floor(task.budget.max_walltime_hours * 60))
+        if task.budget.max_core_hours is not None:
+            minutes = min(minutes, math.floor(task.budget.max_core_hours * 60 / ntasks))
+        left = host.seconds_left()
+        if left is not None:
+            minutes = min(minutes, math.floor(left / 60) - LOCAL_MARGIN_MINUTES)
+        return JobResources("local", 1, ntasks, minutes) if minutes >= 1 else None
 
     # -- examination ------------------------------------------------------------------
 
@@ -289,7 +380,9 @@ class FhiAimsRun(Protocol):
         findings: list[Finding] = []
         values, problems = self.resolve(task)
         findings += problems
-        for name in self.input_files:
+        if task.execution == "local":
+            findings += self._examine_where()
+        for name in ("control.in", "geometry.in", self._script(task)):
             if name not in files:
                 findings.append(Finding(severity=_E, code="missing_file", file=name, message=f"{name} is missing"))
         geometry = None
@@ -304,13 +397,50 @@ class FhiAimsRun(Protocol):
             findings += script.findings
             if script.resources is not None:
                 findings += self._examine_budget(task, script.resources)
+        if "local.sh" in files:
+            script = examine_local_script(files["local.sh"].decode(errors="replace"), self._profile, self._code,
+                                          output_file="aims.out")
+            findings += script.findings
+            if script.resources is not None:
+                findings += self._examine_budget(task, script.resources) + self._examine_fit(script.resources)
+        return findings
+
+    def _examine_where(self) -> list[Finding]:
+        if not self.runs_locally:
+            return [Finding(severity=_E, code="no_local_runs",
+                            message=f"{self.ref.name} {self.ref.version} runs through Slurm only; request "
+                                    f"{FhiAimsRun.ref.name} {FhiAimsRun.ref.version} for a local run")]
+        host = self._host()
+        if not host.interactive:
+            return [Finding(severity=_E, code="local_on_login_node", message=LOGIN_NODE.format(host=host.hostname))]
+        return [Finding(severity=_I, code="local_host", message=f"runs on the {host.describe()}")]
+
+    def _examine_fit(self, resources: JobResources) -> list[Finding]:
+        """A local run must fit the allocation CEDAR runs in: its cores here, and its time left."""
+        host = self._host()
+        if not host.interactive:
+            return []
+        findings = []
+        if resources.ntasks > host.cores:
+            findings.append(Finding(severity=_E, code="too_many_tasks", file="local.sh",
+                                    message=f"{resources.ntasks} tasks exceed the allocation's {host.cores} cores on "
+                                            f"{host.hostname}"))
+        left = host.seconds_left()
+        if left is not None and resources.walltime_minutes > left / 60 - LOCAL_MARGIN_MINUTES:
+            findings.append(Finding(severity=_E, code="past_the_allocation", file="local.sh",
+                                    message=f"{resources.walltime_minutes} minutes would run past the end of "
+                                            f"allocation {host.allocation}, {left / 60:.0f} minutes from now"))
         return findings
 
     def requested_core_hours(self, files: Mapping[str, bytes]) -> float | None:
-        if "job.sh" not in files:
+        if "local.sh" in files:
+            script = examine_local_script(files["local.sh"].decode(errors="replace"), self._profile, self._code,
+                                          output_file="aims.out")
+        elif "job.sh" in files:
+            script = examine_job_script(files["job.sh"].decode(errors="replace"), self._profile, self._code,
+                                        output_file="aims.out")
+        else:
             return None
-        script = examine_job_script(files["job.sh"].decode(errors="replace"), self._profile, self._code,
-                                    output_file="aims.out")
         return script.resources.core_hours if script.resources is not None else None
 
     def _examine_geometry(self, geometry: Geometry, values: Mapping[str, object]) -> list[Finding]:
@@ -444,44 +574,161 @@ class FhiAimsRun(Protocol):
     def check_run(self, task: ScientificTaskSpec, outputs: Mapping[str, bytes],
                   scheduler_state: SchedulerState | None) -> RunReport:
         values, _ = self.resolve(task)
-        relax = self._relaxes(values)
-        limitations = (
-            "One run at the declared numerical settings; convergence of the quantities taken from it (and of "
-            "differences between runs) with respect to k-points, basis, slab thickness and vacuum must be "
-            "established by a declared convergence comparison.",
-        )
         method: dict = {"code": "FHI-aims", "protocol": f"{self.ref.name} {self.ref.version}", **values}
-        checks = [QualityCheck(name="scheduler_completed", passed=scheduler_state is SchedulerState.COMPLETED,
-                               detail=f"scheduler state {scheduler_state}")]
-        raw = outputs.get("aims.out")
-        if raw is None:
-            checks.append(QualityCheck(name="output_present", passed=False, detail="aims.out is missing"))
-            return RunReport(tuple(checks), EvidenceQuality.INVALID, (), limitations, method)
-        out = parse_output(raw.decode(errors="replace"))
-        method["code_version"] = out.version_string
-        end = out.normal_termination
-        checks += [
-            QualityCheck(name="code_version", passed=out.version_string == self.code_version,
-                         detail=f"aims.out reports {out.version_string}; profile records {self.code_version}"),
-            QualityCheck(name="normal_termination", passed=end is not None,
-                         detail=f"'Have a nice day.' at line {end.line}" if end else
-                         (f"killed (line {out.killed.line})" if out.killed else "no normal end of run")),
-            QualityCheck(name="scf_converged", passed=bool(out.scf_converged) and not out.scf_failures,
-                         detail=f"'Self-consistency cycle converged.' appears {len(out.scf_converged)} time(s)"
-                                + (f"; failure at line {out.scf_failures[0].line}" if out.scf_failures else "")),
-        ]
-        if relax:
-            converged = out.geometry_converged is not None and out.optimization_aborted is None
-            checks.append(QualityCheck(
-                name="geometry_converged", passed=converged,
-                detail=f"converged at line {out.geometry_converged.line} after {out.relaxation_steps} steps"
-                if converged else f"not converged after {out.relaxation_steps} steps"))
-        readings = tuple(
-            Reading(observable.name, Quantity(value=energy.value, unit="eV"), "aims.out", energy.line, energy.line,
-                    energy.text.strip())
-            for observable, energy in ((TOTAL_ENERGY, out.final_total_energy),
-                                       (ZERO_BROADENING_ENERGY, out.final_zero_broadening_energy))
-            if energy is not None)
-        only_geometry_failed = all(c.passed for c in checks if c.name != "geometry_converged")
-        failure = EvidenceQuality.INCONCLUSIVE if relax and only_geometry_failed else EvidenceQuality.INVALID
-        return RunReport(tuple(checks), failure, readings, limitations, method)
+        scheduler = QualityCheck(name="scheduler_completed", passed=scheduler_state is SchedulerState.COMPLETED,
+                                 detail=f"scheduler state {scheduler_state}")
+        return output_report(outputs.get("aims.out"), relax=self._relaxes(values), method=method,
+                             checks=(scheduler,), expected_version=self.code_version)
+
+
+def output_report(raw: bytes | None, *, relax: bool, method: dict, checks: Sequence[QualityCheck] = (),
+                  expected_version: str | None = None, output_file: str = "aims.out",
+                  limitations: tuple[str, ...] = (RUN_LIMITATION,)) -> RunReport:
+    """The health of one FHI-aims run from its output, after any ``checks`` made before; ``expected_version`` is the
+    version the run must report, if one is required."""
+    checks = list(checks)
+    if raw is None:
+        checks.append(QualityCheck(name="output_present", passed=False, detail=f"{output_file} is missing"))
+        return RunReport(tuple(checks), EvidenceQuality.INVALID, (), limitations, method)
+    out = parse_output(raw.decode(errors="replace"))
+    method["code_version"] = out.version_string
+    end = out.normal_termination
+    if expected_version is not None:
+        checks.append(QualityCheck(name="code_version", passed=out.version_string == expected_version,
+                                   detail=f"{output_file} reports {out.version_string}; profile records "
+                                          f"{expected_version}"))
+    checks += [
+        QualityCheck(name="normal_termination", passed=end is not None,
+                     detail=f"'Have a nice day.' at line {end.line}" if end else
+                     (f"killed (line {out.killed.line})" if out.killed else "no normal end of run")),
+        QualityCheck(name="scf_converged", passed=bool(out.scf_converged) and not out.scf_failures,
+                     detail=f"'Self-consistency cycle converged.' appears {len(out.scf_converged)} time(s)"
+                            + (f"; failure at line {out.scf_failures[0].line}" if out.scf_failures else "")),
+    ]
+    if relax:
+        converged = out.geometry_converged is not None and out.optimization_aborted is None
+        checks.append(QualityCheck(
+            name="geometry_converged", passed=converged,
+            detail=f"converged at line {out.geometry_converged.line} after {out.relaxation_steps} steps"
+            if converged else f"not converged after {out.relaxation_steps} steps"))
+    readings = tuple(
+        Reading(observable.name, Quantity(value=energy.value, unit="eV"), output_file, energy.line, energy.line,
+                energy.text.strip())
+        for observable, energy in ((TOTAL_ENERGY, out.final_total_energy),
+                                   (ZERO_BROADENING_ENERGY, out.final_zero_broadening_energy))
+        if energy is not None)
+    only_geometry_failed = all(c.passed for c in checks if c.name != "geometry_converged")
+    failure = EvidenceQuality.INCONCLUSIVE if relax and only_geometry_failed else EvidenceQuality.INVALID
+    return RunReport(tuple(checks), failure, readings, limitations, method)
+
+
+class FhiAimsRunSlurmOnly(FhiAimsRun):
+    """``fhiaims.run`` 0.1: the same examination and checks, through Slurm only."""
+
+    ref = ProtocolRef(name="fhiaims.run", version="0.1")
+    input_files = ("control.in", "geometry.in", "job.sh")
+    execution_files = ("job.sh",)
+    runs_locally = False
+
+
+# -- runs computed outside CEDAR ----------------------------------------------------------
+
+
+def declared_value(args: tuple[str, ...]) -> JsonValue:
+    """control.in arguments as a task declares them: true for a flag, a number, a list of numbers, or the text."""
+    if not args:
+        return True
+    numbers: list[int | float] = []
+    for arg in args:
+        try:
+            numbers.append(int(arg))
+            continue
+        except ValueError:
+            pass
+        try:
+            number = float(arg.replace("d", "e").replace("D", "E"))
+        except ValueError:
+            return " ".join(args)
+        if not math.isfinite(number):
+            return " ".join(args)
+        numbers.append(number)
+    return numbers[0] if len(numbers) == 1 else numbers
+
+
+def registered_settings(control_text: str, geometry_text: str, species_root: Path | None
+                        ) -> tuple[dict[str, JsonValue], dict[str, JsonValue], list[Finding]]:
+    """The settings a run's inputs used, classified as a task declares them: (controls, numerical settings, notes).
+
+    Physical keywords, and keywords this protocol does not know, become controls, so that a comparison of runs
+    sees every difference; numerical keywords become numerical settings; keywords that only change how a result
+    is reached are left out, as they are for a task. ``species_defaults`` names the species-defaults level the
+    species blocks equal, per element where they differ, or a hash of a block that equals none.
+    """
+    control = parse_control(control_text)
+    geometry = parse_geometry(geometry_text)
+    controls: dict[str, JsonValue] = {}
+    numerical: dict[str, JsonValue] = {}
+    notes: list[Finding] = []
+    grouped: dict[str, list] = {}
+    for keyword in control.keywords:
+        grouped.setdefault(keyword.name, []).append(keyword)
+    for name, occurrences in grouped.items():
+        if name in CONVERGENCE_PATH_KEYWORDS:
+            continue
+        where = {"file": "control.in", "line": occurrences[0].line}
+        if not _KEYWORD_NAME.fullmatch(name) or name in (SPECIES_DEFAULTS, "structure"):
+            notes.append(Finding(severity=_W, code="unrecorded_keyword", message=f"{name} cannot be recorded as a "
+                                 "setting; compare runs that use it by their files", **where))
+            continue
+        value = (declared_value(occurrences[0].args) if len(occurrences) == 1
+                 else [" ".join(k.args) for k in occurrences])
+        if name in NUMERICAL_KEYWORDS:
+            numerical[name] = value
+            continue
+        controls[name] = value
+        if name in FORBIDDEN_KEYWORDS:
+            notes.append(Finding(severity=_W, code="forbidden_keyword", message=f"{name} {FORBIDDEN_KEYWORDS[name]}",
+                                 **where))
+        elif name not in PHYSICAL_KEYWORDS:
+            notes.append(Finding(severity=_I, code="unclassified_keyword",
+                                 message=f"{name} is not known to {FhiAimsRun.ref.name} {FhiAimsRun.ref.version}; "
+                                         "recorded among the controls", **where))
+    notes += [Finding(severity=_W, code="malformed_geometry", file="geometry.in", line=line or None,
+                      message=f"cannot read: {text}") for line, text in geometry.malformed_lines]
+    numerical[SPECIES_DEFAULTS] = _species_levels(control, geometry, species_root, notes)
+    return controls, numerical, notes
+
+
+def _species_levels(control: ControlFile, geometry: Geometry, root: Path | None, notes: list[Finding]) -> JsonValue:
+    levels = sorted(d.name for d in root.iterdir() if d.is_dir()) if root is not None and root.is_dir() else []
+    found: dict[str, str] = {}
+    for element in geometry.elements:
+        block = control.species_block(element)
+        if block is None:
+            notes.append(Finding(severity=_W, code="missing_species", file="control.in",
+                                 message=f"no species block for {element}"))
+            found[element] = "missing"
+            continue
+        normalized = block.normalized()
+        found[element] = next(
+            (level for level in levels if (path := species_default_path(root, level, element)) is not None
+             and normalize_lines(path.read_text().splitlines()) == normalized),
+            "sha256:" + sha256_hex("\n".join(normalized))[:16])
+    unmatched = sorted(e for e, level in found.items() if level.startswith("sha256:"))
+    if unmatched:
+        notes.append(Finding(severity=_I, code="species_not_a_default", file="control.in",
+                             message=f"species blocks of {', '.join(unmatched)} equal no species-defaults level "
+                                     + ("of the compute profile" if levels else "(no compute profile to compare "
+                                                                                "with)") + "; recorded by hash"))
+    distinct = set(found.values())
+    if len(distinct) == 1 and not unmatched and "missing" not in distinct:
+        return distinct.pop()
+    return found
+
+
+def registered_report(raw: bytes, controls: Mapping[str, JsonValue], *, output_file: str, method: dict,
+                      limitations: tuple[str, ...]) -> RunReport:
+    """The health of a registered run from its output: no scheduler state, and the version it reports is recorded,
+    not required."""
+    relax = _args(controls, "relax_geometry") is not None
+    return output_report(raw, relax=relax, method=method, output_file=output_file, limitations=limitations)

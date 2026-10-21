@@ -532,8 +532,8 @@ def test_the_chief_knows_whether_a_dispatcher_is_running(system):
     clients.add("chief_scientist", reply(call("investigation_state")), reply(TextPart(text="Start the dispatcher.")))
     chat.handle("Why are the agents not working?")
     seen = clients.models["chief_scientist"].calls[-1].messages[-1].parts[0].content
-    assert seen.endswith("the researcher starts it with `cedar dispatch`): no dispatcher has run: start "
-                         "`cedar dispatch`")
+    assert ("the researcher starts it with `cedar dispatch`): no dispatcher has run: start `cedar dispatch`\n"
+            "Local DFT (calculations with execution 'local'): ") in seen
     chat.auto_dispatch = True  # as `cedar start` does: the Chief need not send the researcher to start one
     assert chat._dispatcher_status().startswith("none is running now; this chat starts one in the background by "
                                                 "itself right after your turn")

@@ -12,6 +12,12 @@ messages). A new sim2real version can change tool definitions under a resumed se
 ``options.thinking_prefix_mismatch`` decides what happens to blocks that fail: "drop_block"
 (the default) leaves them out and reports how many, "error" fails the request, and "off"
 sends no thinking settings at all, for models without adaptive thinking.
+
+Web search and web fetch are Anthropic's own server tools: Anthropic runs them, and their
+blocks come back among the assistant's native blocks. When Anthropic pauses its tool loop
+(``pause_turn``), sending the reply back unchanged lets it continue. The tool versions can
+be set with ``options.web_search_tool`` and ``options.web_fetch_tool`` for models that need
+older ones.
 """
 
 from collections.abc import Sequence
@@ -29,12 +35,15 @@ from sim2real.models.types import (
     ToolResult,
     ToolSpec,
     Usage,
+    WebAccess,
 )
 
 _FALLBACK_BETA = "server-side-fallback-2026-07-01"
 _BINDING_BETA = "thinking-binding-controls-2026-08-01"
 _PREFIX_MISMATCH = ("drop_block", "error", "off")
-_STOPS = {"end_turn": "end_turn", "tool_use": "tool_use", "max_tokens": "max_tokens", "refusal": "refusal"}
+_STOPS = {"end_turn": "end_turn", "tool_use": "tool_use", "max_tokens": "max_tokens", "refusal": "refusal",
+          "pause_turn": "pause_turn"}
+_WEB_SEARCH, _WEB_FETCH = "web_search_20260209", "web_fetch_20260209"
 
 
 class AnthropicClient:
@@ -46,7 +55,7 @@ class AnthropicClient:
         self._secrets = [api_key]
 
     def complete(self, *, system: str, messages: Sequence[Message], tools: Sequence[ToolSpec],
-                 settings: ModelSettings) -> ModelReply:
+                 settings: ModelSettings, web: WebAccess | None = None) -> ModelReply:
         params: dict = {
             "model": settings.model,
             "max_tokens": settings.max_output_tokens,
@@ -54,9 +63,12 @@ class AnthropicClient:
             "messages": [self._to_wire(m) for m in messages],
             "cache_control": {"type": "ephemeral"},
         }
-        if tools:
-            params["tools"] = [{"name": t.name, "description": t.description, "input_schema": t.input_schema,
-                                "eager_input_streaming": True} for t in tools]
+        wire_tools = [{"name": t.name, "description": t.description, "input_schema": t.input_schema,
+                       "eager_input_streaming": True} for t in tools]
+        if web is not None:
+            wire_tools += self._web_tools(web, settings)
+        if wire_tools:
+            params["tools"] = wire_tools
         if settings.effort:
             params["output_config"] = {"effort": settings.effort}
         betas = []
@@ -94,6 +106,16 @@ class AnthropicClient:
     def _clean(self, text: str) -> str:
         return redact(text, self._secrets)
 
+    @staticmethod
+    def _web_tools(web: WebAccess, settings: ModelSettings) -> list[dict]:
+        domains = {"allowed_domains": list(web.allowed_domains)} if web.allowed_domains else {}
+        return [
+            {"type": settings.options.get("web_search_tool", _WEB_SEARCH), "name": "web_search",
+             "max_uses": web.max_searches, **domains},
+            {"type": settings.options.get("web_fetch_tool", _WEB_FETCH), "name": "web_fetch",
+             "max_uses": web.max_fetches, "max_content_tokens": web.max_fetch_tokens, **domains},
+        ]
+
     def _to_wire(self, message: Message) -> dict:
         if message.role == "assistant" and message.provider == self.provider and message.native is not None:
             return {"role": "assistant", "content": list(message.native)}
@@ -104,6 +126,17 @@ class AnthropicClient:
                 content.append({"type": "text", "text": part.text})
             elif isinstance(part, ToolCall):
                 content.append({"type": "tool_use", "id": part.id, "name": part.name, "input": part.arguments})
+            elif part.media:
+                blocks = [{"type": "text", "text": part.content}] if part.content else []
+                for media in part.media:
+                    source = {"type": "base64", "media_type": media.media_type, "data": media.data}
+                    if media.media_type == "application/pdf":
+                        blocks.append({"type": "document", "source": source,
+                                       **({"title": media.title} if media.title else {})})
+                    else:
+                        blocks.append({"type": "image", "source": source})
+                content.append({"type": "tool_result", "tool_use_id": part.call_id, "content": blocks,
+                                "is_error": part.is_error})
             else:
                 content.append({"type": "tool_result", "tool_use_id": part.call_id, "content": part.content,
                                 "is_error": part.is_error})
@@ -119,6 +152,7 @@ class AnthropicClient:
                 parts.append(ToolCall(id=block.id, name=block.name, arguments=arguments))
         native = tuple(block.to_dict() for block in response.content)
         usage = response.usage
+        server = getattr(usage, "server_tool_use", None)
         details = response.stop_details
         transformations = getattr(response, "input_transformations", None) or ()
         return ModelReply(
@@ -126,7 +160,9 @@ class AnthropicClient:
             stop=_STOPS.get(response.stop_reason, "other"),
             usage=Usage(input_tokens=usage.input_tokens or 0, output_tokens=usage.output_tokens or 0,
                         cache_read_tokens=usage.cache_read_input_tokens or 0,
-                        cache_write_tokens=usage.cache_creation_input_tokens or 0),
+                        cache_write_tokens=usage.cache_creation_input_tokens or 0,
+                        web_searches=(server.web_search_requests or 0) if server else 0,
+                        web_fetches=(server.web_fetch_requests or 0) if server else 0),
             requested_model=requested_model,
             served_model=response.model,
             refusal_category=getattr(details, "category", None) if response.stop_reason == "refusal" else None,

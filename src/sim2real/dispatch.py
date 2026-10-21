@@ -54,6 +54,7 @@ from sim2real.agents.toolkits import ResearchContext, file_tools, research_tools
 from sim2real.agents.toolkits.approver import ApproverContext, approver_tools, decisions_text
 from sim2real.agents.toolkits.chief import ChiefContext, chief_tools
 from sim2real.agents.toolkits.judge import JudgeContext, judge_tools
+from sim2real.agents.toolkits.materials import material_tools, recorded_materials
 from sim2real.agents.toolkits.research import agent_file_access
 from sim2real.contracts.base import Actor, ActorKind, new_id
 from sim2real.automation import approver_due, judgements_due
@@ -89,6 +90,7 @@ from sim2real.swarm import (
     review_material,
     start_drafts,
 )
+from sim2real.web import web_access
 from sim2real.workspace import ModelClients, Services, Workspace, profile_for, registry_for, services_for
 
 SYSTEM = Actor(kind=ActorKind.SYSTEM, id="dispatcher")
@@ -621,6 +623,8 @@ class Dispatcher:
                 dispatcher=lambda: "running; it is carrying out this review"))
             system, session = CHIEF_SCIENTIST, f"{investigation_id}.chief-review"
             instruction += "\n\n" + review_material(state, task)
+        ledger = self.workspace.ledger
+        tools += material_tools(lambda: recorded_materials(ledger.load(investigation_id)), self.workspace.artifacts)
         activity = {"investigation_id": investigation_id, "task_id": task.task_id, "role": role,
                     "hypothesis_id": task.hypothesis_id, "agent_id": task.agent_id,
                     "started_at": self.clock().isoformat()}
@@ -636,7 +640,8 @@ class Dispatcher:
         _write_atomically(activity_path, json.dumps(activity))
         try:
             result = runner.run(session[:128], system=system, tools=tools, instruction=instruction, limits=limits,
-                                observer=step, should_stop=lambda: self._interruption(investigation_id, task))
+                                observer=step, should_stop=lambda: self._interruption(investigation_id, task),
+                                web=web_access(state.retrieval, role))
         finally:
             activity_path.unlink(missing_ok=True)
         record_agent_run(self.workspace.ledger, investigation_id, actor, session_id=session[:128], role=role,

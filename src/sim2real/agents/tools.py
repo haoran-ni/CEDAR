@@ -15,7 +15,7 @@ from pydantic import BaseModel, ValidationError
 
 from sim2real.errors import RuleViolation
 from sim2real.store.event_store import ConcurrencyConflict
-from sim2real.models.types import ToolSpec
+from sim2real.models.types import MediaPart, ToolSpec
 
 
 @dataclass(frozen=True)
@@ -24,6 +24,8 @@ class ToolOutcome:
     is_error: bool = False
     end_run: bool = False
     """Stop the agent's invocation after this turn, e.g. once it waits for a job."""
+    media: tuple[MediaPart, ...] = ()
+    """Images and PDFs shown to the model with the text."""
 
 
 class ToolFailure(Exception):

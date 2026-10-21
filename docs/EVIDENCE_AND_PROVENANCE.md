@@ -23,9 +23,9 @@ Under the data directory (`$SIM2REAL_DATA_DIR`, else `$XDG_DATA_HOME/sim2real`, 
 | Path | Contents |
 |---|---|
 | `events.sqlite` | The event log of every investigation |
-| `artifacts/objects/<aa>/<sha256>` | Stored files: structures, examined inputs and job scripts, raw outputs, analysis scripts with what they printed and wrote. Written once, read-only, addressed by content hash |
+| `artifacts/objects/<aa>/<sha256>` | Stored files: structures, examined inputs and job scripts, raw outputs, analysis scripts with what they printed and wrote, and the materials the researcher attached. Written once, read-only, addressed by content hash |
 | `analyses/` | Working directories of analysis scripts while they run; each is removed when its script ends |
-| `transcripts/` | Each agent session's conversation, one JSON line per message (mode 600). Operational memory for resuming agents, not the research record |
+| `transcripts/` | Each agent session's conversation, one JSON line per message (mode 600), including the images and PDF pages an agent viewed and the web results the provider returned. Operational memory for resuming agents, not the research record |
 | `notebooks/<investigation>/` | The research notebook |
 | `dispatcher.lock`, `dispatcher.heartbeat`, `dispatcher.pid`, `dispatcher.log` | The dispatcher's lock, last-pass time and process id, and the output of one the chat started |
 | `activity/` | One file per agent run in progress, for the live panel; removed when the run ends |
@@ -49,11 +49,12 @@ Payloads cover the whole research process:
 | Area | Events |
 |---|---|
 | Problem | `investigation_created`, `investigation_status_changed` (closing carries the researcher's authorization), `closing_proposed` (by the Chief Scientist; only the researcher closes), `observable_alignment_recorded` |
-| Direction | `user_intervention_recorded` (the researcher's words, verbatim, with any authorization), `plan_revised` (with the message that prompted it), `round_started`, `next_actions_recommended` (the Chief Scientist's candidate next steps, compared, and its choice; delegations and agent proposals cite it), `mode_changed` (human-in-the-loop or full automation, with its limits), `approver_decision` (in full automation, the approver's approval or refusal of starting agents or a submission, with its reason) |
+| Direction | `user_intervention_recorded` (the researcher's words, verbatim, with any authorization), `plan_revised` (with the message that prompted it), `round_started`, `next_actions_recommended` (the Chief Scientist's candidate next steps, compared, and its choice; delegations and agent proposals cite it), `mode_changed` (human-in-the-loop or full automation, with its limits), `approver_decision` (in full automation, the approver's approval or refusal of starting agents or a submission, with its reason), `retrieval_policy_changed` (the researcher's setting of the agents' web access: off, on, or only some domains) |
+| Materials | `material_attached` (a file the researcher gave the agents: its stored copy, name and note; context, not evidence) |
 | Hypotheses | `hypothesis_proposed`, `hypothesis_status_changed`, `prediction_registered` |
 | Computation | `calculation_requested`, `calculation_linked`, `calculation_inputs_examined`, `calculation_state_changed`, `run_checked` (the run's health checks and stored outputs) |
 | Results | `analysis_recorded` (a script an agent ran: the script, its hashed inputs, output and results), `evidence_recorded`, `assessment_recorded` |
-| Agents | `agents_proposed` (by the Chief Scientist: per hypothesis a role and a first task), `agents_started` (by the researcher's command or after the review window), `proposal_withdrawn`, `agent_retired`, `agent_task_queued` (work for an agent, the Judge, or a Chief Scientist review), `agent_run_recorded` (model, tokens, outcome, and the agent's final report) |
+| Agents | `agents_proposed` (by the Chief Scientist: per hypothesis a role and a first task), `agents_started` (by the researcher's command or after the review window), `proposal_withdrawn`, `agent_retired`, `agent_task_queued` (work for an agent, the Judge, or a Chief Scientist review), `agent_run_recorded` (model, tokens, web searches and fetches, outcome, and the agent's final report) |
 
 Events are never updated or deleted; database triggers refuse both. A correction is a new
 event.
@@ -98,7 +99,7 @@ Pages under `notebooks/<investigation>/`:
 
 | Page | Contents |
 |---|---|
-| `index.md` | Question and target claim; compared quantities and their alignment; the plan and its versions; tables of hypotheses, agents (with every proposal) and calculations; links to rounds; what waits for the researcher; model usage |
+| `index.md` | Question and target claim; compared quantities and their alignment; web access and the attached materials; the plan and its versions; tables of hypotheses, agents (with every proposal) and calculations; links to rounds; what waits for the researcher; model usage |
 | `round-NN.md` | One page per round, answering the questions laid out in [`templates/ROUND_REPORT.md`](../templates/ROUND_REPORT.md): what we hypothesized and why, what we predicted, tested and observed, what changed our assessment, what remains unknown, and what is next; then the researcher's messages and the agents' reports |
 | `hypotheses/<id>.md` | One hypothesis: statement, falsifiers, its agent, predictions, calculations, analyses, evidence, assessment history, agent reports |
 | `timeline.md` | Every event, one line each, in order |
@@ -114,6 +115,7 @@ Rules the pages follow:
 - **Values from evidence.** Numbers come from evidence objects at full recorded precision, with quality and failed checks shown next to them.
 - **Job state is not validity.** Scheduler state and evidence quality are separate columns and sentences.
 - **Unknowns are listed.** Unaligned observables, unassessed or unsettled hypotheses, and evidence that is not `VALIDATED` are listed as open.
+- **Context is not evidence.** Attached materials and what agents read on the web inform the work, and reports say where a fact came from; values count only where they appear in recorded evidence.
 - **No hidden reasoning.** The notebook contains the agents' stated summaries and the reasons they recorded, never model-internal reasoning. Secrets never reach the log, so they cannot reach the notebook.
 
 The dispatcher regenerates the notebook of every investigation whose log grew, on each

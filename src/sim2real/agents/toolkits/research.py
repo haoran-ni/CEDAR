@@ -35,6 +35,7 @@ from sim2real.state.ledger import ResearchLedger
 from sim2real.state.projection import CalculationRecord, InvestigationState
 from sim2real.store.artifacts import ArtifactStore
 from sim2real.summaries import calculation_summary
+from sim2real.web import web_summary
 
 
 @dataclass
@@ -223,7 +224,11 @@ def research_tools(ctx: ResearchContext) -> list[AgentTool]:
             f"Your hypothesis {hyp.hypothesis_id} ({hyp.status.value}; assessment {hyp.assessment.value}; "
             f"plan priority {state.plan.priority(hyp.hypothesis_id).value}): {hyp.spec.statement}",
             f"Falsifiers: {'; '.join(hyp.spec.falsifiers)}",
+            f"Web search and fetch: {web_summary(state.retrieval)} (set by the researcher)",
         ]
+        if state.materials:
+            lines.append("Materials the researcher attached: " + "; ".join(
+                f"{m.material_id} {m.name}" + (f" ({m.note})" if m.note else "") for m in state.materials.values()))
         for pid in hyp.prediction_ids:
             p = state.predictions[pid].prediction
             lines.append(f"Prediction {pid}: {p.statement} Expected: {p.expected_outcome}. Falsified if: "

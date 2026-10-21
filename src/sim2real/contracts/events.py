@@ -6,7 +6,7 @@ produces. Payloads only add information; nothing edits or deletes an earlier rec
 
 from typing import Annotated, Literal
 
-from pydantic import AwareDatetime, Field, JsonValue, model_validator
+from pydantic import AwareDatetime, Field, JsonValue, StringConstraints, model_validator
 
 from sim2real.contracts.agents import AgentSpec
 from sim2real.contracts.analysis import AnalysisRun
@@ -25,7 +25,13 @@ from sim2real.contracts.base import (
 from sim2real.contracts.evidence import EvidenceObject, QualityCheck, RunReading
 from sim2real.contracts.examination import InputExamination
 from sim2real.contracts.hypothesis import HypothesisSpec, Prediction
-from sim2real.contracts.investigation import InvestigationSpec, ObservableAlignment
+from sim2real.contracts.investigation import (
+    Domain,
+    InvestigationSpec,
+    ObservableAlignment,
+    RetrievalPolicy,
+    check_retrieval,
+)
 from sim2real.contracts.next_actions import CandidateAction
 from sim2real.contracts.plan import Authorization, PermissionAction, ResearchPlan
 from sim2real.contracts.status import (
@@ -122,6 +128,40 @@ class ModeChanged(Contract):
         if automated != (self.max_core_hours is not None) or automated != (self.max_tokens is not None):
             raise ValueError("full automation needs a core-hour and a token limit; human-in-the-loop takes none")
         return self
+
+
+class RetrievalPolicyChanged(Contract):
+    """The researcher sets whether the investigation's agents may use the web. Hypothesis agents and the Chief
+    Scientist then get the provider's web search and fetch; the Evidence Judge and the approver never do."""
+
+    type: Literal["retrieval_policy_changed"] = "retrieval_policy_changed"
+    policy: RetrievalPolicy
+    allowed_domains: tuple[Domain, ...] = ()
+    intervention_id: Identifier
+    """The researcher's command."""
+
+    @model_validator(mode="after")
+    def _domains_with_curated_only(self) -> "RetrievalPolicyChanged":
+        check_retrieval(self.policy, self.allowed_domains)
+        return self
+
+
+MaterialName = Annotated[str, StringConstraints(min_length=1, max_length=255, pattern=r"^[^/\x00]+$")]
+
+
+class MaterialAttached(Contract):
+    """A file the researcher gives the investigation's agents, such as a figure, a paper or measured data. Every
+    agent of the investigation may view it. It is context, not evidence."""
+
+    type: Literal["material_attached"] = "material_attached"
+    material_id: Identifier
+    name: MaterialName
+    """The file's name as the researcher had it."""
+    artifact: ArtifactRef
+    note: str | None = None
+    """What the researcher said about it."""
+    intervention_id: Identifier
+    """The researcher's command."""
 
 
 APPROVER_ACTIONS = frozenset({PermissionAction.START_AGENTS, PermissionAction.SUBMIT})
@@ -384,6 +424,8 @@ class AgentRunRecorded(Contract):
     """The agent's final message: its stated summary and justification, not hidden reasoning."""
     dropped_reasoning_blocks: int = Field(default=0, ge=0)
     """Earlier reasoning blocks the provider left out because the conversation changed under them."""
+    web_searches: int = Field(default=0, ge=0)
+    web_fetches: int = Field(default=0, ge=0)
 
 
 class EvidenceRecorded(Contract):
@@ -408,6 +450,8 @@ EventPayload = Annotated[
     | ClosingProposed
     | NextActionsRecommended
     | ModeChanged
+    | RetrievalPolicyChanged
+    | MaterialAttached
     | ApproverDecision
     | ObservableAlignmentRecorded
     | UserInterventionRecorded

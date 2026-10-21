@@ -380,9 +380,9 @@ def test_a_slash_at_the_start_of_a_line_lists_the_matching_commands(system):
         composer.value = "/a"
         await settle(pilot)
         assert shown() == ["/agents", "/approve agents", "/approve submit <calc>", "/approve inputs <calc>",
-                           "/approve close"]
+                           "/approve close", "/attach <path> <note>"]
         await pilot.press("up")  # the arrows wrap around the menu
-        assert app.query_one("#commands", OptionList).highlighted == 4
+        assert app.query_one("#commands", OptionList).highlighted == 5
         await pilot.press("down", "down", "down", "tab")
         assert composer.value == "/approve submit " and shown() == ["/approve submit <calc>"]
         await pilot.press("escape")  # closed until the line changes
@@ -433,7 +433,7 @@ def test_each_table_shows_at_most_three_rows_and_scrolls_for_the_rest(system):
     drive(app, script, size=(120, 40))
 
 
-def test_the_panel_shows_the_mode_on_its_own_line(system):
+def test_the_panel_shows_the_mode_and_web_access_on_their_own_line(system):
     system["clients"].add("chief_scientist", open_and_delegate(system["site"]), reply(TextPart(text="Opened.")))
     app = Sim2RealApp(system["chat"], refresh_seconds=3600, clock=lambda: NOW)
 
@@ -443,16 +443,20 @@ def test_the_panel_shows_the_mode_on_its_own_line(system):
 
     async def script(pilot):
         await settle(pilot)
-        assert mode() == ("Mode: human-in-the-loop", False)  # before any investigation: new ones start so
+        assert mode() == ("Mode: human-in-the-loop · Web: off", False)  # before any investigation: new ones start so
+        await send(pilot, "/web only arxiv.org")
+        await refresh(pilot)
+        assert mode() == ("Mode: human-in-the-loop · Web: only arxiv.org", False)  # held until it opens
         await send(pilot, "PBE puts CO in the fcc hollow on Cu(111); experiments see atop.")
         await refresh(pilot)
-        assert mode() == ("Mode: human-in-the-loop", False)
+        assert mode() == ("Mode: human-in-the-loop · Web: only arxiv.org", False)
         await send(pilot, "/mode full-automation 100 1000000")
         await refresh(pilot)
-        assert mode() == ("Mode: full-automation", True)
+        assert mode() == ("Mode: full-automation · Web: only arxiv.org", True)
+        await send(pilot, "/web off")
         await send(pilot, "/mode human-in-the-loop")
         await refresh(pilot)
-        assert mode() == ("Mode: human-in-the-loop", False)
+        assert mode() == ("Mode: human-in-the-loop · Web: off", False)
 
     drive(app, script)
 

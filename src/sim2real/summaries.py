@@ -16,6 +16,7 @@ from sim2real.state.projection import (
     evidence_owner,
 )
 from sim2real.swarm import agent_label, proposal_note
+from sim2real.web import web_summary
 
 
 def calculation_summary(state: InvestigationState, calc: CalculationRecord, *, findings: bool = True,
@@ -122,11 +123,15 @@ def investigation_summary(state: InvestigationState) -> str:
         f"  status {state.status.value}; round {state.round}; plan v{state.plan_version}; "
         f"compute profile {spec.constraints.compute_profile or 'none'}",
         f"  mode: {mode_summary(state)}",
+        f"  web access for the Chief Scientist and the hypothesis agents: {web_summary(state.retrieval)}",
         f"  question: {spec.question}",
         f"  observables: simulated '{state.alignment.simulated.name}' vs measured '{state.alignment.measured.name}' "
         f"({state.alignment.status.value})",
         f"  plan objective: {state.plan.objective}",
     ]
+    if state.materials:
+        lines.append("Materials the researcher attached (view_material shows them):")
+        lines += [f"  {m.material_id}: {m.name}" + (f": {m.note}" if m.note else "") for m in state.materials.values()]
     if not state.hypotheses:
         lines.append("Hypotheses: none yet")
     for hyp in state.hypotheses.values():

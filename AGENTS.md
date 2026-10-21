@@ -206,7 +206,7 @@ The system should classify proposed mechanisms as:
 
 If computing a mechanism's contribution, specify reference state, method, controlled variables and estimator. Coupled mechanisms may require interaction terms or joint models. Statistical sampling noise, numerical truncation, model bias and experimental uncertainty are distinct and potentially correlated. Propagate covariance where known; do not assign uncalibrated LLM “confidence” as a probability. If only one theory value and one measured value are available, a detailed percentage split is usually not identifiable.
 
-Evidence must link to raw code outputs or a verifiable external source, plus method/condition information, not merely an LLM assertion. A value an agent read from an output cites the file and lines it came from. Source credibility and access are part of provenance; blind/offline evaluation may intentionally withhold external literature, and this must be enforced through tool permissions and data access.
+Evidence must link to raw code outputs or a verifiable external source, plus method/condition information, not merely an LLM assertion. A value an agent read from an output cites the file and lines it came from. Source credibility and access are part of provenance; blind/offline evaluation may intentionally withhold external literature, and this must be enforced through tool permissions and data access. The researcher sets each investigation's web access (off by default; only the Chief Scientist and hypothesis agents ever get it) and attaches the files agents may view; what agents read on the web or in those files is context, not evidence.
 
 ## 8. Scientific Research Recorder and human-readable documentation
 

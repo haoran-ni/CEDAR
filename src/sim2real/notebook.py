@@ -45,12 +45,14 @@ from sim2real.contracts.events import (
     HypothesisStatusChanged,
     InvestigationCreated,
     InvestigationStatusChanged,
+    MaterialAttached,
     ModeChanged,
     NextActionsRecommended,
     ObservableAlignmentRecorded,
     PlanRevised,
     PredictionRegistered,
     RecordedEvent,
+    RetrievalPolicyChanged,
     RoundStarted,
     RunChecked,
     UserInterventionRecorded,
@@ -78,6 +80,7 @@ from sim2real.state.projection import (
     review_deadline,
 )
 from sim2real.summaries import approval_requests
+from sim2real.web import web_summary
 
 if TYPE_CHECKING:
     from sim2real.workspace import Workspace
@@ -365,13 +368,24 @@ def _run_lines(event: RecordedEvent, p: AgentRunRecorded) -> list[str]:
         task = "review of the agents' reports; " + task
     dropped = (f"; {p.dropped_reasoning_blocks} earlier reasoning block{'s' if p.dropped_reasoning_blocks > 1 else ''} "
                "left out because the conversation changed") if p.dropped_reasoning_blocks else ""
+    web = f"; {_web_use(p)}" if p.web_searches or p.web_fetches else ""
     lines = [f"- **{_actor(event.actor)}** ({p.role.replace('_', ' ')}; {task}{p.outcome}; {p.turns} turns; "
-             f"{model}; {_when(event)}{dropped}):"]
+             f"{model}{web}; {_when(event)}{dropped}):"]
     return lines + (_quote(p.report, "  ") if p.report and p.report.strip() else ["  (no report)"])
 
 
 _REPORTS_NOTE = ("In the agents' own words. A report is not evidence: its values count only where they appear in "
                  "recorded evidence.")
+
+
+def _web_use(p: AgentRunRecorded) -> str:
+    return f"{p.web_searches} web search{'es' if p.web_searches != 1 else ''}, {p.web_fetches} page" \
+        f"{'s' if p.web_fetches != 1 else ''} fetched"
+
+
+def _web_change(p: RetrievalPolicyChanged) -> str:
+    setting = {"disabled": "off", "enabled": "on"}.get(p.policy.value, "only " + ", ".join(p.allowed_domains))
+    return f"Web access for the Chief Scientist and the hypothesis agents set {setting}"
 
 
 def _tokens(p: AgentRunRecorded) -> int:
@@ -473,6 +487,12 @@ def _why(rnd: _Round, state: InvestigationState) -> list[str]:
             lines.append(f"- Proposal {p.proposal_id} withdrawn by {who}: {_said(p.reason)}")
         elif isinstance(p, ModeChanged):
             lines.append(f"- {_mode_change(p)}, by {who}: {_said(p.reason)}")
+        elif isinstance(p, RetrievalPolicyChanged):
+            lines.append(f"- {_web_change(p)} by {who} ({p.intervention_id})")
+        elif isinstance(p, MaterialAttached):
+            note = f": {_said(p.note)}" if p.note else ""
+            lines.append(f"- {who} attached {p.material_id}, {ROOT.artifact(p.artifact, _flat(p.name))} "
+                         f"({p.intervention_id}){note}")
         elif isinstance(p, ApproverDecision):
             lines.append(f"- The approver {_decided(p)} ({p.decision_id}): {_said(p.reason)}")
     return lines or ["No decisions were recorded this round."]
@@ -806,13 +826,15 @@ def _index_page(state: InvestigationState, events: Sequence[RecordedEvent], roun
                    f"#{r.events[-1].stream_version}, {_when(r.events[0])} to {_when(r.events[-1])}" for r in rounds]
     waiting = [f"- `{command}` ({note})" for command, note in approval_requests(state)] or ["Nothing."]
 
-    usage = Counter()
-    runs = Counter()
+    usage, runs, searches, fetches = Counter(), Counter(), Counter(), Counter()
     for run in state.agent_runs:
         usage[run.role] += _tokens(run.run)
         runs[run.role] += 1
+        searches[run.role] += run.run.web_searches
+        fetches[run.role] += run.run.web_fetches
     model_usage = [f"- {role.replace('_', ' ')}: {runs[role]} run{'s' if runs[role] > 1 else ''}, {usage[role]:,} tokens"
-                   for role in runs]
+                   + (f", {searches[role]} web searches, {fetches[role]} pages fetched"
+                      if searches[role] or fetches[role] else "") for role in runs]
     budget = spec.constraints.model_token_budget
     model_usage.append(f"- Total: {state.model_tokens_used:,} tokens" + (f" of a {budget:,} budget" if budget else ""))
 
@@ -837,9 +859,20 @@ def _index_page(state: InvestigationState, events: Sequence[RecordedEvent], roun
             agents.append(f"- {proposal.proposal_id} (event #{proposal.recorded_at}, {outcome}{replies}): "
                           + ", ".join(f"{_flat(a.role)} on {ROOT.hyp(a.hypothesis_id)}" for a in proposal.agents))
 
+    sources = [f"Web access for the Chief Scientist and the hypothesis agents: **{web_summary(state.retrieval)}**. "
+               "The Evidence Judge and the approver never use the web. What agents read on the web or in attached "
+               "materials is context, not evidence.", ""]
+    sources += [f"- Set {web_summary(r)} by the researcher's {r.intervention_id} (event #{r.recorded_at})"
+                for r in state.retrieval_changes]
+    sources += ["", "Materials the researcher attached, which every agent of the investigation can view:", ""]
+    sources += [f"- **{m.material_id}** {ROOT.artifact(m.artifact, _flat(m.name))} ({m.artifact.media_type or 'file'}, "
+                f"{m.artifact.size_bytes:,} bytes; {m.intervention_id})" + (f": {_said(m.note)}" if m.note else "")
+                for m in state.materials.values()] or ["None."]
+
     blocks = [f"# {spec.title}", header, generated, _NOTE,
               _section("Question", [_flat(spec.question), "", f"Target claim: {_flat(spec.target_claim)}"]),
               _section("Compared quantities", quantities),
+              _section("Web access and materials", sources),
               _section("Plan", plan),
               _section("Hypotheses", hypotheses),
               _section("Agents", agents),
@@ -914,6 +947,10 @@ def _describe(event: RecordedEvent) -> str:
                     + ", ".join(f"{a.role} on {a.hypothesis_id}" for a in p.agents))
         case ModeChanged():
             return f"{_mode_change(p)}: {_said(p.reason)}"
+        case RetrievalPolicyChanged():
+            return f"{_web_change(p)} ({p.intervention_id})"
+        case MaterialAttached():
+            return f"{p.material_id} attached ({p.intervention_id}): {_said(p.name)}"
         case ApproverDecision():
             return f"{p.decision_id}: the approver {_decided(p)}: {_said(p.reason)}"
         case NextActionsRecommended():
@@ -928,7 +965,9 @@ def _describe(event: RecordedEvent) -> str:
         case ProposalWithdrawn():
             return f"{p.proposal_id} withdrawn: {_said(p.reason)}"
         case AgentRunRecorded():
-            return f"{p.role.replace('_', ' ')} run ended {p.outcome} after {p.turns} turns ({_tokens(p):,} tokens)"
+            web = f"; {_web_use(p)}" if p.web_searches or p.web_fetches else ""
+            return (f"{p.role.replace('_', ' ')} run ended {p.outcome} after {p.turns} turns ({_tokens(p):,} "
+                    f"tokens{web})")
     return p.type
 
 

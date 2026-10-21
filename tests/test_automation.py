@@ -90,7 +90,7 @@ def test_in_full_automation_the_approver_and_the_judge_carry_the_investigation(t
     dispatcher.tick()
     state = ledger.load(INV)
     assert state.automation_core_hours_left == pytest.approx(1000 - hours)
-    assert mode_line(state) == ("Mode: full-automation", True)
+    assert mode_line(state) == ("Mode: full-automation · Web: off", True)
 
     output = aims_output(energy=-5000.123456789)
     scheduler.on_submit = lambda job, workdir: (workdir / "aims.out").write_text(output)
@@ -134,7 +134,7 @@ def test_the_researcher_switches_modes_and_sees_which_one_is_on(system, monkeypa
     assert state.mode is InvestigationMode.FULL_AUTOMATION and state.automation.intervention_id == "msg-3"
     left = "500 of 500 core-hours and 2,000,000 of 2,000,000 tokens left"
     assert f"  mode: full automation: {left}" in investigation_summary(state)
-    assert mode_line(state) == ("Mode: full-automation", True)
+    assert mode_line(state) == ("Mode: full-automation · Web: off", True)
     assert chat.handle("/mode").startswith(f"{INV} is in full automation: {left}.")
     assert chat.handle("/mode human-in-the-loop") == (f"{INV} is in human-in-the-loop (msg-4): agent proposals and "
                                                       "submissions wait for you again.")

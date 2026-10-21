@@ -28,12 +28,14 @@ from sim2real.state.projection import (
     AgentTaskRecord,
     CalculationRecord,
     InvestigationState,
+    RetrievalRecord,
     agent_id_for,
     authorization_for,
     hypothesis_evidence,
 )
 from sim2real.summaries import approval_requests
 from sim2real.swarm import FIRST_TASK, WAKE_TASK, minutes_left
+from sim2real.web import web_summary
 
 STALE_DISPATCHER_SECONDS = 600
 """A dispatcher silent for longer than this is reported as not running."""
@@ -386,11 +388,13 @@ def work_summary(state: InvestigationState) -> str:
     return f"{n} hypothes{'is' if n == 1 else 'es'} · jobs: {jobs} · evidence: {evidence}"
 
 
-def mode_line(state: InvestigationState | None) -> tuple[str, bool]:
-    """The panel's own line for the mode, and whether it is full automation, which the panel highlights; a new
-    investigation starts in human-in-the-loop. ``/mode`` gives the details."""
+def mode_line(state: InvestigationState | None, web: RetrievalRecord | None = None) -> tuple[str, bool]:
+    """The panel's own line for the mode and the agents' web access, and whether the mode is full automation,
+    which the panel highlights; a new investigation starts in human-in-the-loop. ``web`` is the setting before
+    the investigation exists. ``/mode`` and ``/web`` give the details."""
     mode = InvestigationMode.HUMAN_IN_THE_LOOP if state is None else state.mode
-    return f"Mode: {mode.value}", mode is InvestigationMode.FULL_AUTOMATION
+    return (f"Mode: {mode.value} · Web: {web_summary(state.retrieval if state is not None else web)}",
+            mode is InvestigationMode.FULL_AUTOMATION)
 
 
 def status_line(state: InvestigationState, now: datetime) -> str:

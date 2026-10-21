@@ -18,24 +18,40 @@ researcher starting anything.
 Commands may run while the Chief Scientist is still working on an earlier message (the
 terminal interface does this); every record they make is built from the state at the
 moment it is written.
+
+``/web`` sets whether the agents may use the web, and ``/attach`` gives them a file to view.
+Both work before the investigation exists: what they set is recorded, with the researcher's
+command, the moment it opens, and the Chief Scientist works under it meanwhile.
 """
 
 import getpass
+import mimetypes
 import shlex
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 
 from sim2real.agents import AgentRunner, RunLimits, RunResult, record_agent_run
 from sim2real.agents.tools import ToolOutcome
 from sim2real.agents.prompts import CHIEF_SCIENTIST
+from sim2real.agents.media import viewable
 from sim2real.agents.toolkits.chief import ChiefContext, chief_tools
+from sim2real.agents.toolkits.materials import Material, material_line, material_tools, recorded_materials
 from sim2real.contracts.base import Actor, ActorKind
 from pydantic import ValidationError
 
 from sim2real.automation import mode_summary
-from sim2real.contracts.events import EventDraft, ModeChanged, UserInterventionRecorded
+from sim2real.contracts.base import ArtifactRef
+from sim2real.contracts.events import (
+    EventDraft,
+    MaterialAttached,
+    ModeChanged,
+    RetrievalPolicyChanged,
+    UserInterventionRecorded,
+)
+from sim2real.contracts.investigation import RetrievalPolicy
 from sim2real.contracts.plan import Authorization, PermissionAction
 from sim2real.contracts.status import INVESTIGATION_MACHINE, CalculationState, InvestigationMode
 from sim2real.errors import RuleViolation
@@ -55,9 +71,11 @@ from sim2real.dispatch import (
     stop_dispatcher,
 )
 from sim2real.notebook import round_file, update_notebook
-from sim2real.state.projection import AgentRunRecord, InvestigationState
+from sim2real.paths import config_dir
+from sim2real.state.projection import AgentRunRecord, InvestigationState, RetrievalRecord
 from sim2real.summaries import approval_requests, investigation_summary, pending_approvals, recommendation_text
 from sim2real.swarm import CHIEF, agent_label, agents_summary, close_drafts, halt_drafts, start_drafts
+from sim2real.web import web_access, web_summary
 from sim2real.workspace import ModelClients, Workspace, profile_for, registry_for, services_for
 
 @dataclass(frozen=True)
@@ -87,6 +105,12 @@ COMMANDS = (
     Command("/mode human-in-the-loop", "take your decisions back: agent proposals and submissions wait for you"),
     Command("/mode full-automation <core-hours> <tokens>", "while you are away, an approver decides on agents and "
             "submissions and the Evidence Judge assesses new evidence, within these limits"),
+    Command("/web", "show whether the agents may use the web"),
+    Command("/web on", "let the Chief Scientist and the hypothesis agents search and read the web"),
+    Command("/web only <domains>", "the same, limited to these domains, e.g. arxiv.org doi.org"),
+    Command("/web off", "no web for any agent (the default; keeps blind tests blind)"),
+    Command("/attach <path> <note>", "give the agents an image, PDF or text file to view; the note is optional"),
+    Command("/materials", "the files you attached"),
     Command("/cancel <calc> <reason>", "cancel a calculation, stopping its job if it has one"),
     Command("/report", "update the research notebook and show where it is"),
     Command("/halt <reason>", "stop this investigation now: cancel its jobs, retire its agents, pause it (reason "
@@ -105,6 +129,7 @@ def command_lines(commands: tuple[Command, ...]) -> str:
 
 RESTART_SECONDS = 60
 """The least time between two dispatchers this chat starts."""
+MAX_ATTACH_BYTES = 100_000_000
 HALT_WAIT_SECONDS = 60
 """How long /halt lets agent runs end before it kills the dispatcher."""
 _AT_SCHEDULER = frozenset({CalculationState.SUBMISSION_PENDING, CalculationState.SUBMITTED, CalculationState.QUEUED,
@@ -140,7 +165,10 @@ class ChatSession:
     backend: SchedulerBackend | None = None
     limits: RunLimits = field(default_factory=lambda: RunLimits(max_turns=30, max_tokens=600_000))
     clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc)
-    _unrecorded_messages: list[str] = field(default_factory=list)
+    _unrecorded: list[tuple] = field(default_factory=list)
+    """What the researcher said and set before the investigation existed, in order: ("message", text),
+    ("web", line, policy, domains) and ("attach", line, Material)."""
+    _announced_materials: set[str] = field(default_factory=set)
     _unrecorded_runs: list[RunResult] = field(default_factory=list)
     _seen_runs: int = 0
     _shown_approvals: set[str] = field(default_factory=set)
@@ -164,6 +192,7 @@ class ChatSession:
             chats = [r for r in state.agent_runs if r.role == "chief_scientist" and not _is_review(r)]
             self.chief_session = chats[-1].session_id if chats else f"{self.investigation_id}.chief"
             self._shown_starts = set(state.agents)
+            self._announced_materials = set(state.materials)
         else:
             self.chief_session = f"chief-{self.clock():%Y%m%d%H%M%S}"
 
@@ -203,6 +232,12 @@ class ChatSession:
         name, args = words[0], words[1:]
         if name == "/help":
             return HELP
+        if name == "/web":
+            return self._web(args, line)
+        if name == "/attach":
+            return self._attach(args, line)
+        if name == "/materials":
+            return "\n".join(material_line(m) for m in self._materials()) or "You have attached no materials."
         if name == "/halt" and args[:1] == ["all"]:
             open_ones = [i for i in self.workspace.store.investigation_ids()
                          if self.workspace.ledger.load(i).status not in INVESTIGATION_MACHINE.terminal]
@@ -326,6 +361,104 @@ class ChatSession:
                 "back to human-in-the-loop and pauses. /approve inputs, /approve close, /cancel and /halt stay yours; "
                 "/mode human-in-the-loop takes everything back.")
 
+    # -- the agents' web access and materials --------------------------------------------------
+
+    def web_setting(self) -> RetrievalRecord:
+        """The setting the agents work under now; before the investigation exists, the researcher's latest /web."""
+        if self.investigation_id is not None:
+            return self.workspace.ledger.load(self.investigation_id).retrieval
+        pending = [entry for entry in self._unrecorded if entry[0] == "web"]
+        if not pending:
+            return RetrievalRecord(RetrievalPolicy.DISABLED, (), None, 0)
+        _, _, policy, domains = pending[-1]
+        return RetrievalRecord(policy, domains, None, 0)
+
+    def _web(self, args: list[str], line: str) -> str:
+        usage = "Usage: /web, /web on, /web only <domain> [<domain> ...], or /web off"
+        if not args:
+            return f"Web access for the agents: {web_summary(self.web_setting())}.\n{usage}"
+        wanted = args[0].lower()
+        if wanted in ("on", "off") and len(args) == 1:
+            policy, domains = (RetrievalPolicy.ENABLED if wanted == "on" else RetrievalPolicy.DISABLED), ()
+        elif wanted == "only" and len(args) > 1:
+            policy = RetrievalPolicy.CURATED_ONLY
+            names = [d for arg in args[1:] for d in arg.replace(",", " ").split()]
+            domains = tuple(d.removeprefix("https://").removeprefix("http://").rstrip("/") for d in names)
+        else:
+            return usage
+        try:
+            check = RetrievalPolicyChanged(policy=policy, allowed_domains=domains, intervention_id="msg-0")
+        except ValidationError:
+            return f"Give plain domain names such as arxiv.org, not paths or addresses.\n{usage}"
+        if self.investigation_id is None:
+            self._unrecorded.append(("web", line, policy, check.allowed_domains))
+            return (f"Web access will be {web_summary(self.web_setting())} for this investigation; it is recorded "
+                    "when the investigation opens, and the Chief Scientist works under it meanwhile.")
+        try:
+            message_id = self._record_web(line, policy, check.allowed_domains)
+        except RuleViolation as exc:
+            return f"Web access could not be changed: {exc}"
+        if policy is RetrievalPolicy.DISABLED:
+            return (f"No agent may use the web from now on ({message_id}). Pages read earlier stay in the agents' "
+                    "conversations.")
+        return (f"The Chief Scientist and the hypothesis agents may use the web from their next runs: "
+                f"{web_summary(self.web_setting())} ({message_id}). What they search for reaches the search "
+                "provider, and what they read there is untrusted and is not evidence. The Evidence Judge and the "
+                "approver keep to the research record. /web off takes it back.")
+
+    def _record_web(self, line: str, policy: RetrievalPolicy, domains: tuple[str, ...]) -> str:
+        def build(state: InvestigationState) -> list[EventDraft]:
+            message = self._message_draft(state, line, ())
+            return [message, EventDraft(actor=self.user, payload=RetrievalPolicyChanged(
+                policy=policy, allowed_domains=domains, intervention_id=message.payload.intervention_id))]
+
+        return self.workspace.ledger.record_with(self.investigation_id, build).events[0].payload.intervention_id
+
+    def _materials(self) -> list[Material]:
+        if self.investigation_id is not None:
+            return recorded_materials(self.workspace.ledger.load(self.investigation_id))
+        return [entry[2] for entry in self._unrecorded if entry[0] == "attach"]
+
+    def _attach(self, args: list[str], line: str) -> str:
+        usage = "Usage: /attach <path> <note>, e.g. /attach ~/papers/stm.pdf \"Fig. 3 shows the tilted phase\""
+        if not args:
+            return usage
+        path = Path(args[0]).expanduser().resolve()
+        if path == config_dir().resolve() or path.is_relative_to(config_dir().resolve()):
+            return "Files in sim2real's configuration directory, which holds your API keys, cannot be attached."
+        if not path.is_file():
+            return f"No file {path}.\n{usage}"
+        if path.stat().st_size > MAX_ATTACH_BYTES:
+            return f"{path} is larger than {MAX_ATTACH_BYTES:,} bytes."
+        data = path.read_bytes()
+        if not viewable(data) and b"\x00" in data[:8192]:
+            return f"{path.name} is neither an image, a PDF nor a text file, so no agent could view it."
+        artifact = self.workspace.artifacts.put_bytes(data, label=path.name,
+                                                      media_type=mimetypes.guess_type(path.name)[0])
+        note = " ".join(args[1:]).strip() or None
+        if self.investigation_id is None:
+            material = Material(f"mat-{len(self._materials()) + 1}", path.name, artifact, note)
+            self._unrecorded.append(("attach", line, material))
+            return (f"Attached {material_line(material)}. It is recorded when the investigation opens; the Chief "
+                    "Scientist can view it meanwhile.")
+        try:
+            material_id, message_id = self._record_material(line, path.name, artifact, note)
+        except RuleViolation as exc:
+            return f"The file could not be attached: {exc}"
+        material = next(m for m in self._materials() if m.material_id == material_id)
+        return (f"Attached {material_line(material)} ({message_id}). Every agent of the investigation can view it; "
+                "the Chief Scientist hears of it with your next message.")
+
+    def _record_material(self, line: str, name: str, artifact: ArtifactRef, note: str | None) -> tuple[str, str]:
+        def build(state: InvestigationState) -> list[EventDraft]:
+            message = self._message_draft(state, line, ())
+            return [message, EventDraft(actor=self.user, payload=MaterialAttached(
+                material_id=f"mat-{len(state.materials) + 1}", name=name, artifact=artifact, note=note,
+                intervention_id=message.payload.intervention_id))]
+
+        events = self.workspace.ledger.record_with(self.investigation_id, build).events
+        return events[1].payload.material_id, events[0].payload.intervention_id
+
     def _close(self, line: str) -> str:
         found = []
 
@@ -434,12 +567,14 @@ class ChatSession:
     # -- the Chief Scientist ------------------------------------------------------------------
 
     def _ask_chief(self, text: str, observer: Callable[[ToolCall, ToolOutcome], None] | None = None) -> str:
+        attached = self._newly_attached()
         if self.investigation_id is not None:
             message_id = self._record_message(text)
-            instruction = self._reviews_since_last_turn() + f"[researcher, recorded as {message_id}] {text}"
+            instruction = (self._reviews_since_last_turn() + attached
+                           + f"[researcher, recorded as {message_id}] {text}")
         else:
-            self._unrecorded_messages.append(text)
-            instruction = f"[researcher] {text}"
+            self._unrecorded.append(("message", text))
+            instruction = attached + f"[researcher] {text}"
         context = ChiefContext(ledger=self.workspace.ledger, profiles=self.profiles, actor=CHIEF,
                                registry_for=lambda name: registry_for(self.profiles.load_approved(name)),
                                investigation_id=self.investigation_id, on_open=self._opened, clock=self.clock,
@@ -447,8 +582,10 @@ class ChatSession:
         settings = self.clients.settings("chief_scientist")
         runner = AgentRunner(self.clients.client("chief_scientist"), settings, self.workspace.transcripts,
                              secrets=self.clients.secrets())
-        result = runner.run(self.chief_session, system=CHIEF_SCIENTIST, tools=chief_tools(context),
-                            instruction=instruction, limits=self.limits, observer=observer)
+        tools = chief_tools(context) + material_tools(self._materials, self.workspace.artifacts)
+        result = runner.run(self.chief_session, system=CHIEF_SCIENTIST, tools=tools, instruction=instruction,
+                            limits=self.limits, observer=observer,
+                            web=web_access(self.web_setting(), "chief_scientist"))
         if self.investigation_id is None:
             self._unrecorded_runs.append(result)
         else:
@@ -479,11 +616,26 @@ class ChatSession:
         return "".join(f"[record: your background review of the agents' reports, run {r.run.outcome}]\n"
                        f"{r.run.report.strip()}\n\n" for r in reviews)
 
+    def _newly_attached(self) -> str:
+        """The materials the Chief Scientist has not been told of, as notes for its next instruction."""
+        fresh = [m for m in self._materials() if m.material_id not in self._announced_materials]
+        self._announced_materials.update(m.material_id for m in fresh)
+        return "".join(f"[record: the researcher attached {material_line(m)}]\n" for m in fresh)
+
     def _opened(self, investigation_id: str) -> list[str]:
-        """Record the messages sent before the investigation existed, in order, as soon as it does."""
+        """Record what the researcher said and set before the investigation existed, in order, as soon as it does;
+        returns the ids of their messages."""
         self.investigation_id = investigation_id
-        recorded = [self._record_message(text) for text in self._unrecorded_messages]
-        self._unrecorded_messages.clear()
+        recorded = []
+        for kind, *entry in self._unrecorded:
+            if kind == "message":
+                recorded.append(self._record_message(entry[0]))
+            elif kind == "web":
+                self._record_web(*entry)
+            else:
+                line, material = entry
+                self._record_material(line, material.name, material.artifact, material.note)
+        self._unrecorded.clear()
         return recorded
 
     def _message_draft(self, state: InvestigationState, text: str,

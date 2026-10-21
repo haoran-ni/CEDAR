@@ -138,6 +138,15 @@ class FileScreen(Screen):
         self.path, self.line = path, line
 
     def compose(self) -> ComposeResult:
+        with self.path.open("rb") as stream:
+            binary = b"\x00" in stream.read(8192)
+        if binary:  # an attached image or PDF, which a terminal cannot show
+            self.start, self.line = 1, None
+            yield Static(Text(str(self.path)), classes="title")
+            yield TextArea(f"A binary file of {self.path.stat().st_size:,} bytes, such as an image or a PDF. Open it "
+                           f"with another program:\n{self.path}", read_only=True)
+            yield Footer()
+            return
         lines = self.path.read_text(errors="replace").splitlines()
         start = 1
         if len(lines) > FILE_WINDOW_LINES:
@@ -515,7 +524,7 @@ class Sim2RealApp(App):
         investigation_id = self.session.investigation_id
         settings = self.session.clients.settings
         if investigation_id is None:
-            mode, automated = mode_line(None)
+            mode, automated = mode_line(None, self.session.web_setting())
             return _Snapshot("No investigation yet: describe the discrepancy to the Chief Scientist.", dispatcher,
                              alarm, subagent_status(None, activities, now, running, automatic),
                              model_line(settings, None), mode=mode, automated=automated,

@@ -3,7 +3,7 @@
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 
-from sim2real.models.types import Message, ModelReply, ModelSettings, TextPart, ToolCall, ToolSpec, Usage
+from sim2real.models.types import Message, ModelReply, ModelSettings, TextPart, ToolCall, ToolSpec, Usage, WebAccess
 
 
 @dataclass
@@ -12,6 +12,7 @@ class ScriptedCall:
     messages: tuple[Message, ...]
     tools: tuple[ToolSpec, ...]
     settings: ModelSettings
+    web: WebAccess | None = None
 
 
 Script = ModelReply | Callable[[ScriptedCall], ModelReply]
@@ -24,8 +25,8 @@ class ScriptedModel:
     calls: list[ScriptedCall] = field(default_factory=list)
 
     def complete(self, *, system: str, messages: Sequence[Message], tools: Sequence[ToolSpec],
-                 settings: ModelSettings) -> ModelReply:
-        call = ScriptedCall(system, tuple(messages), tuple(tools), settings)
+                 settings: ModelSettings, web: WebAccess | None = None) -> ModelReply:
+        call = ScriptedCall(system, tuple(messages), tuple(tools), settings, web)
         self.calls.append(call)
         if not self.script:
             raise AssertionError("the scripted model ran out of replies")

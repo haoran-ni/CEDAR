@@ -13,7 +13,7 @@ from enum import StrEnum
 
 from sim2real.contracts.agents import AgentSpec
 from sim2real.contracts.analysis import SCRIPT_CHECK_PREFIX, AnalysisOutcome, AnalysisRun, as_evidence_check
-from sim2real.contracts.base import Actor, ActorKind
+from sim2real.contracts.base import Actor, ActorKind, ArtifactRef
 from sim2real.contracts.events import (
     APPROVER_ACTIONS,
     AgentRetired,
@@ -36,12 +36,14 @@ from sim2real.contracts.events import (
     HypothesisStatusChanged,
     InvestigationCreated,
     InvestigationStatusChanged,
+    MaterialAttached,
     ModeChanged,
     NextActionsRecommended,
     ObservableAlignmentRecorded,
     PlanRevised,
     PredictionRegistered,
     RecordedEvent,
+    RetrievalPolicyChanged,
     RoundStarted,
     RunChecked,
     UserInterventionRecorded,
@@ -53,6 +55,7 @@ from sim2real.contracts.investigation import (
     Discrepancy,
     InvestigationSpec,
     ObservableAlignment,
+    RetrievalPolicy,
     discrepancy,
 )
 from sim2real.contracts.plan import Authorization, PermissionAction, Priority, ResearchPlan
@@ -82,6 +85,8 @@ EVENT_ACTORS: dict[type, frozenset[ActorKind]] = {
     ClosingProposed: frozenset({_A.CHIEF_SCIENTIST}),
     NextActionsRecommended: frozenset({_A.CHIEF_SCIENTIST}),
     ModeChanged: frozenset({_A.USER, _A.SYSTEM}),
+    RetrievalPolicyChanged: frozenset({_A.USER}),
+    MaterialAttached: frozenset({_A.USER}),
     ApproverDecision: frozenset({_A.APPROVER}),
     ObservableAlignmentRecorded: frozenset({_A.USER, _A.CHIEF_SCIENTIST}),
     UserInterventionRecorded: frozenset({_A.USER}),
@@ -281,6 +286,29 @@ class ModeRecord:
 
 
 @dataclass(frozen=True)
+class RetrievalRecord:
+    """The researcher's setting of the agents' web access."""
+
+    policy: RetrievalPolicy
+    allowed_domains: tuple[str, ...]
+    intervention_id: str | None
+    """None for the setting the investigation was opened with."""
+    recorded_at: int
+
+
+@dataclass(frozen=True)
+class MaterialRecord:
+    """A file the researcher attached for the agents to view."""
+
+    material_id: str
+    name: str
+    artifact: ArtifactRef
+    note: str | None
+    intervention_id: str
+    recorded_at: int
+
+
+@dataclass(frozen=True)
 class ApprovalRecord:
     """The approver's decision, in full automation, on proposed agents or a submission."""
 
@@ -378,10 +406,20 @@ class InvestigationState:
     recommendations: dict[str, RecommendationRecord] = field(default_factory=dict)
     modes: list[ModeRecord] = field(default_factory=list)
     approvals: dict[str, ApprovalRecord] = field(default_factory=dict)
+    retrieval_changes: list[RetrievalRecord] = field(default_factory=list)
+    materials: dict[str, MaterialRecord] = field(default_factory=dict)
 
     @property
     def mode(self) -> InvestigationMode:
         return self.modes[-1].mode if self.modes else InvestigationMode.HUMAN_IN_THE_LOOP
+
+    @property
+    def retrieval(self) -> RetrievalRecord:
+        """The agents' web access now: the researcher's latest setting, or the one the investigation opened with."""
+        if self.retrieval_changes:
+            return self.retrieval_changes[-1]
+        constraints = self.spec.constraints
+        return RetrievalRecord(constraints.external_retrieval, constraints.allowed_domains, None, 1)
 
     @property
     def automation(self) -> ModeRecord | None:
@@ -659,6 +697,24 @@ def _on_mode_changed(state: InvestigationState, event: RecordedEvent, p: ModeCha
         raise RuleViolation("only the researcher switches full automation on")
     state.modes.append(ModeRecord(p.mode, p.reason, event.actor, event.stream_version, p.max_core_hours,
                                   p.max_tokens, p.intervention_id))
+
+
+def _on_retrieval_policy(state: InvestigationState, event: RecordedEvent, p: RetrievalPolicyChanged) -> None:
+    _require_open(state)
+    if p.intervention_id not in state.interventions:
+        raise RuleViolation("the researcher's setting of web access cites their recorded command")
+    state.retrieval_changes.append(RetrievalRecord(p.policy, p.allowed_domains, p.intervention_id,
+                                                   event.stream_version))
+
+
+def _on_material(state: InvestigationState, event: RecordedEvent, p: MaterialAttached) -> None:
+    _require_open(state)
+    if p.intervention_id not in state.interventions:
+        raise RuleViolation("an attached material cites the researcher's recorded command")
+    if p.material_id in state.materials:
+        raise RuleViolation(f"material {p.material_id} already exists")
+    state.materials[p.material_id] = MaterialRecord(p.material_id, p.name, p.artifact, p.note, p.intervention_id,
+                                                    event.stream_version)
 
 
 def _on_approver_decision(state: InvestigationState, event: RecordedEvent, p: ApproverDecision) -> None:
@@ -1164,6 +1220,8 @@ _HANDLERS = {
     InvestigationStatusChanged: _on_status_changed,
     ClosingProposed: _on_closing_proposed,
     ModeChanged: _on_mode_changed,
+    RetrievalPolicyChanged: _on_retrieval_policy,
+    MaterialAttached: _on_material,
     ApproverDecision: _on_approver_decision,
     NextActionsRecommended: _on_next_actions,
     ObservableAlignmentRecorded: _on_alignment,
@@ -1191,7 +1249,7 @@ _HANDLERS = {
 
 __all__ = [
     "AgentRecord", "AnalysisRecord", "AssessmentEntry", "CalculationRecord", "ClosingRecord", "EvidenceRecord", "HypothesisRecord", "InterventionRecord",
-    "InvestigationState", "ApprovalRecord", "ModeRecord", "PlanRecord", "PredictionRecord", "ProposalRecord",
+    "InvestigationState", "ApprovalRecord", "MaterialRecord", "ModeRecord", "PlanRecord", "RetrievalRecord", "PredictionRecord", "ProposalRecord",
     "ProposalStatus", "RecommendationRecord", "agent_id_for", "apply",
     "authorization_for", "calculation_with_inputs", "evidence_owner", "hypothesis_evidence", "replay",
     "reusable_calculation", "review_deadline",

@@ -1,4 +1,5 @@
-"""Read-only file tools: list, find, read and search, with line numbers for citations.
+"""Read-only file tools: list, find, read and search, with line numbers for citations, and
+view images and PDFs.
 
 Paths must resolve (after following symlinks) inside one of the allowed roots and outside
 every denied directory, such as the one holding API keys. Nothing here writes. Roots can
@@ -13,12 +14,15 @@ from pathlib import Path
 
 from pydantic import Field
 
-from sim2real.agents.tools import AgentTool, ToolFailure
+from sim2real.agents.media import MAX_PDF_PAGES, load_media
+from sim2real.agents.tools import AgentTool, ToolFailure, ToolOutcome
 from sim2real.contracts.base import Contract
 
 MAX_LINE = 400
 MAX_LINES = 400
 MAX_ENTRIES = 300
+MAX_VIEW_BYTES = 100_000_000
+"""Larger files are refused before they are read."""
 
 
 class FileAccess:
@@ -71,6 +75,12 @@ class ReadArgs(Contract):
     path: str = Field(description="Absolute path of a text file.")
     start_line: int = Field(default=1, ge=1, description="First line to return (1-based).")
     max_lines: int = Field(default=200, ge=1, le=MAX_LINES, description="How many lines to return.")
+
+
+class ViewArgs(Contract):
+    path: str = Field(description="Absolute path of an image or a PDF.")
+    pages: str | None = Field(default=None, description=f"PDF pages to view, e.g. '1-3, 7'; needed when the PDF "
+                                                        f"has more than {MAX_PDF_PAGES} pages.")
 
 
 class SearchArgs(Contract):
@@ -147,6 +157,18 @@ def file_tools(access: FileAccess, on_read: Callable[[Path], None] | None = None
         note = f"\n[stopped after {args.max_matches} matches]" if matches > args.max_matches else ""
         return ("\n".join(out) or "no matching lines") + note + f"\n[file has {len(lines)} lines]"
 
+    def view_file(args: ViewArgs) -> ToolOutcome:
+        resolved = access.resolve(args.path)
+        if not resolved.is_file():
+            raise FileNotFoundError(f"{args.path} is not a file")
+        if resolved.stat().st_size > MAX_VIEW_BYTES:
+            raise ToolFailure(f"{args.path} is larger than {MAX_VIEW_BYTES:,} bytes")
+        if on_read is not None:
+            on_read(resolved)
+        media, note = load_media(resolved.read_bytes(), resolved.name, args.pages)
+        return ToolOutcome(f"Showing {note}. Values read from a picture are not citable lines; say where you read "
+                           "them.", media=(media,))
+
     return [
         AgentTool("list_directory", "List a directory's entries with file sizes. Use it to see what a run "
                   "produced or what files exist before reading them.", ListArgs, list_directory),
@@ -156,4 +178,7 @@ def file_tools(access: FileAccess, on_read: Callable[[Path], None] | None = None
         AgentTool("search_file", "Search a text file for lines matching a regular expression; returns matching "
                   "lines with their line numbers. Prefer this to reading whole large outputs.", SearchArgs,
                   search_file),
+        AgentTool("view_file", "Look at an image (PNG, JPEG, GIF, WebP, or another format Pillow reads, converted) "
+                  f"or a PDF (up to {MAX_PDF_PAGES} pages at a time). It stays in your conversation and costs tokens "
+                  "on every later turn, so view only the pages you need.", ViewArgs, view_file),
     ]

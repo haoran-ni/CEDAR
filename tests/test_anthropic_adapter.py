@@ -5,7 +5,17 @@ import httpx2
 import pytest
 from anthropic.types.beta import BetaMessage
 
-from sim2real.models import Message, ModelError, ModelSettings, TextPart, ToolCall, ToolResult, ToolSpec
+from sim2real.models import (
+    MediaPart,
+    Message,
+    ModelError,
+    ModelSettings,
+    TextPart,
+    ToolCall,
+    ToolResult,
+    ToolSpec,
+    WebAccess,
+)
 from sim2real.models.anthropic_client import AnthropicClient
 
 KEY = "sk-ant-test-0123456789abcdefghij"
@@ -187,3 +197,66 @@ def test_errors_are_classified_and_never_leak_the_key(error, retryable):
                         messages=[Message(role="user", parts=(TextPart(text="go"),))])
     assert raised.value.retryable is retryable
     assert KEY not in str(raised.value)
+
+
+# -- web search and fetch, images and PDFs ------------------------------------------------------
+
+GO = [Message(role="user", parts=(TextPart(text="go"),))]
+SEARCH_TURN = [
+    {"type": "server_tool_use", "id": "srvtoolu_01", "name": "web_search", "input": {"query": "CO Cu(111) site"}},
+    {"type": "web_search_tool_result", "tool_use_id": "srvtoolu_01",
+     "content": [{"type": "web_search_result", "url": "https://example.org/co", "title": "CO on Cu(111)",
+                  "encrypted_content": "opaque", "page_age": None}]},
+    {"type": "text", "text": "A study reports atop adsorption."},
+]
+
+
+def test_web_access_adds_the_providers_own_tools():
+    client, sdk = client_for(message(SEARCH_TURN, stop="end_turn"))
+    client.complete(system="s", tools=[TOOL], settings=SETTINGS, messages=GO,
+                    web=WebAccess(allowed_domains=("arxiv.org", "doi.org"), max_searches=3, max_fetches=4))
+    (params,) = sdk.requests
+    client_tool, search, fetch = params["tools"]
+    assert client_tool["name"] == "read_output"
+    assert search == {"type": "web_search_20260209", "name": "web_search", "max_uses": 3,
+                      "allowed_domains": ["arxiv.org", "doi.org"]}
+    assert fetch == {"type": "web_fetch_20260209", "name": "web_fetch", "max_uses": 4, "max_content_tokens": 50_000,
+                     "allowed_domains": ["arxiv.org", "doi.org"]}
+
+
+def test_without_web_access_no_web_tool_is_sent_and_versions_can_be_chosen():
+    client, sdk = client_for(message([{"type": "text", "text": "ok"}], stop="end_turn"))
+    client.complete(system="s", tools=[], settings=SETTINGS, messages=GO)
+    assert "tools" not in sdk.requests[0]
+    older = SETTINGS.model_copy(update={"options": {"web_search_tool": "web_search_20250305",
+                                                    "web_fetch_tool": "web_fetch_20250910"}})
+    client.complete(system="s", tools=[], settings=older, messages=GO, web=WebAccess())
+    assert [t["type"] for t in sdk.requests[1]["tools"]] == ["web_search_20250305", "web_fetch_20250910"]
+    assert "allowed_domains" not in sdk.requests[1]["tools"][0]
+
+
+def test_web_results_stay_native_and_their_use_is_counted():
+    usage = {"input_tokens": 120, "output_tokens": 30, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0,
+             "server_tool_use": {"web_search_requests": 2, "web_fetch_requests": 1}}
+    client, _ = client_for(message(SEARCH_TURN, stop="pause_turn", usage=usage))
+    reply = client.complete(system="s", tools=[], settings=SETTINGS, messages=GO, web=WebAccess())
+    assert reply.stop == "pause_turn"
+    assert reply.message.text == "A study reports atop adsorption." and reply.message.tool_calls == ()
+    assert [b["type"] for b in reply.message.native] == ["server_tool_use", "web_search_tool_result", "text"]
+    assert (reply.usage.web_searches, reply.usage.web_fetches) == (2, 1)
+
+
+def test_images_and_pdfs_go_inside_tool_results():
+    client, sdk = client_for(message([{"type": "text", "text": "I see it."}], stop="end_turn"))
+    shown = ToolResult(call_id="toolu_01", content="Showing fig.png", media=(
+        MediaPart(media_type="image/png", data="aW1hZ2U=", title="fig.png"),
+        MediaPart(media_type="application/pdf", data="cGRm", title="paper.pdf, pages 1-2 of 9")))
+    client.complete(system="s", tools=[TOOL], settings=SETTINGS,
+                    messages=[*GO, Message(role="user", parts=(shown,))])
+    (result,) = sdk.requests[0]["messages"][1]["content"]
+    assert result == {"type": "tool_result", "tool_use_id": "toolu_01", "is_error": False, "content": [
+        {"type": "text", "text": "Showing fig.png"},
+        {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "aW1hZ2U="}},
+        {"type": "document", "source": {"type": "base64", "media_type": "application/pdf", "data": "cGRm"},
+         "title": "paper.pdf, pages 1-2 of 9"},
+    ]}

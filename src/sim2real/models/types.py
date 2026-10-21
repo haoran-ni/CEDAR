@@ -26,11 +26,25 @@ class ToolCall(Contract):
     arguments: dict[str, JsonValue]
 
 
+MediaType = Literal["image/png", "image/jpeg", "image/gif", "image/webp", "application/pdf"]
+
+
+class MediaPart(Contract):
+    """An image or a PDF a tool hands the model, base64-encoded."""
+
+    type: Literal["media"] = "media"
+    media_type: MediaType
+    data: NonEmptyStr
+    title: str | None = None
+
+
 class ToolResult(Contract):
     type: Literal["tool_result"] = "tool_result"
     call_id: NonEmptyStr
     content: str
     is_error: bool = False
+    media: tuple[MediaPart, ...] = ()
+    """Images and PDFs shown to the model with the text, e.g. a figure the agent asked to view."""
 
 
 Part = Annotated[TextPart | ToolCall | ToolResult, Field(discriminator="type")]
@@ -59,12 +73,27 @@ class ToolSpec(Contract):
     input_schema: dict[str, JsonValue]
 
 
+class WebAccess(Contract):
+    """Web search and web fetch for one request, run by the provider itself, never by sim2real."""
+
+    allowed_domains: tuple[NonEmptyStr, ...] = ()
+    """Only these domains (and their subdomains); empty for the whole web."""
+    max_searches: int = Field(default=5, ge=1)
+    """Per model call."""
+    max_fetches: int = Field(default=10, ge=1)
+    """Per model call."""
+    max_fetch_tokens: int = Field(default=50_000, ge=1)
+    """Approximate limit on the text of one fetched page; PDFs are not cut."""
+
+
 class Usage(Contract):
     input_tokens: int = 0
     """Uncached input; cached input is counted separately below."""
     output_tokens: int = 0
     cache_read_tokens: int = 0
     cache_write_tokens: int = 0
+    web_searches: int = 0
+    web_fetches: int = 0
 
     @property
     def total(self) -> int:
@@ -72,7 +101,9 @@ class Usage(Contract):
         return self.input_tokens + self.output_tokens + self.cache_read_tokens + self.cache_write_tokens
 
 
-StopReason = Literal["end_turn", "tool_use", "max_tokens", "refusal", "other"]
+StopReason = Literal["end_turn", "tool_use", "max_tokens", "refusal", "pause_turn", "other"]
+"""``pause_turn``: the provider paused its own tool loop (e.g. web search) and continues when the reply is sent
+back unchanged."""
 
 
 class ModelReply(Contract):
@@ -112,4 +143,7 @@ class ModelClient(Protocol):
     provider: str
 
     def complete(self, *, system: str, messages: Sequence[Message], tools: Sequence[ToolSpec],
-                 settings: ModelSettings) -> ModelReply: ...
+                 settings: ModelSettings, web: WebAccess | None = None) -> ModelReply:
+        """One model turn. ``web`` gives the model the provider's web search and fetch; an adapter whose provider
+        has none raises a non-retryable ModelError rather than leaving them out silently."""
+        ...

@@ -91,7 +91,7 @@ class ByAgent:
         self.peak_total = 0
         self.order: list[str] = []
 
-    def complete(self, *, system, messages, tools, settings):
+    def complete(self, *, system, messages, tools, settings, web=None):
         agent = next(a for a in self.models if f"you are {a}," in system)
         with self.lock:
             self.busy[agent] += 1
@@ -99,7 +99,8 @@ class ByAgent:
             self.peak_total = max(self.peak_total, sum(self.busy.values()))
             self.order.append(agent)
         try:
-            return self.models[agent].complete(system=system, messages=messages, tools=tools, settings=settings)
+            return self.models[agent].complete(system=system, messages=messages, tools=tools, settings=settings,
+                                               web=web)
         finally:
             with self.lock:
                 self.busy[agent] -= 1

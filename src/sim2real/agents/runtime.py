@@ -6,6 +6,12 @@ the run (for example to wait for a job), a limit is reached, or the caller asks 
 (checked before every model call, where the transcript is complete). Tools from a turn
 that was cut off (``max_tokens``) or refused are never run; their calls are answered with
 an error so the transcript stays valid for the next invocation.
+
+With ``web``, the provider's own web search and fetch run inside a model turn. When the
+provider pauses that loop, the paused reply is sent straight back so it can continue: up to
+``MAX_PAUSED_CONTINUATIONS`` times in a row, even past the turn and token limits, since a
+transcript left on a paused turn could not take the next instruction. A stop request still
+stops it.
 """
 
 from collections.abc import Callable, Sequence
@@ -23,11 +29,14 @@ from sim2real.models.types import (
     TextPart,
     ToolResult,
     Usage,
+    WebAccess,
 )
 from sim2real.secrets import redact
 
 Outcome = Literal["finished", "waiting", "turn_limit", "token_limit", "truncated", "refused", "model_error",
                   "stopped"]
+
+MAX_PAUSED_CONTINUATIONS = 5
 
 
 @dataclass(frozen=True)
@@ -55,6 +64,8 @@ def _add(total: Usage, more: Usage) -> Usage:
         output_tokens=total.output_tokens + more.output_tokens,
         cache_read_tokens=total.cache_read_tokens + more.cache_read_tokens,
         cache_write_tokens=total.cache_write_tokens + more.cache_write_tokens,
+        web_searches=total.web_searches + more.web_searches,
+        web_fetches=total.web_fetches + more.web_fetches,
     )
 
 
@@ -69,28 +80,31 @@ class AgentRunner:
     def run(self, session_id: str, *, system: str, tools: Sequence[AgentTool], instruction: str,
             limits: RunLimits = RunLimits(),
             observer: Callable[[ToolCall, ToolOutcome], None] | None = None,
-            should_stop: Callable[[], str | None] | None = None) -> RunResult:
-        """Run one invocation; ``observer`` sees each tool call and its outcome, e.g. to show progress, and
-        ``should_stop`` is asked before every model call, returning why the run must stop, or None."""
+            should_stop: Callable[[], str | None] | None = None, web: WebAccess | None = None) -> RunResult:
+        """Run one invocation; ``observer`` sees each tool call and its outcome, e.g. to show progress,
+        ``should_stop`` is asked before every model call, returning why the run must stop, or None, and ``web``
+        gives the model the provider's web search and fetch."""
         by_name = {tool.name: tool for tool in tools}
         specs = [tool.spec() for tool in tools]
         history = self._transcripts.load(session_id)
         self._append(session_id, history, Message(role="user", parts=(TextPart(text=instruction),)))
         result = RunResult(outcome="finished")
+        paused = 0
 
         while True:
             reason = should_stop() if should_stop is not None else None
             if reason:
                 result.outcome, result.error = "stopped", f"stopped: {reason}"
                 return result
-            if result.turns >= limits.max_turns:
+            if not paused and result.turns >= limits.max_turns:
                 result.outcome = "turn_limit"
                 return result
-            if limits.max_tokens is not None and result.usage.total >= limits.max_tokens:
+            if not paused and limits.max_tokens is not None and result.usage.total >= limits.max_tokens:
                 result.outcome = "token_limit"
                 return result
             try:
-                reply = self._client.complete(system=system, messages=history, tools=specs, settings=self._settings)
+                reply = self._client.complete(system=system, messages=history, tools=specs, settings=self._settings,
+                                              web=web)
             except ModelError as exc:
                 result.outcome, result.error = "model_error", redact(str(exc), self._secrets)
                 return result
@@ -110,6 +124,14 @@ class AgentRunner:
                     self._append(session_id, history, Message(role="user", parts=tuple(
                         ToolResult(call_id=c.id, content=f"Not run: {result.error}.", is_error=True) for c in calls)))
                 return result
+            if reply.stop == "pause_turn" and not calls:
+                paused += 1
+                if paused > MAX_PAUSED_CONTINUATIONS:
+                    result.outcome = "turn_limit"
+                    result.error = f"the provider paused its web search {paused} times in a row"
+                    return result
+                continue
+            paused = 0
             if not calls:
                 result.final_text = redact(reply.message.text, self._secrets)
                 return result
@@ -119,10 +141,12 @@ class AgentRunner:
                 tool = by_name.get(call.name)
                 outcome = tool.invoke(call.arguments) if tool else ToolOutcome(
                     f"Unknown tool {call.name!r}; available: {', '.join(sorted(by_name))}", is_error=True)
-                outcome = ToolOutcome(redact(outcome.content, self._secrets), outcome.is_error, outcome.end_run)
+                outcome = ToolOutcome(redact(outcome.content, self._secrets), outcome.is_error, outcome.end_run,
+                                      outcome.media)
                 if observer is not None:
                     observer(call, outcome)
-                results.append(ToolResult(call_id=call.id, content=outcome.content, is_error=outcome.is_error))
+                results.append(ToolResult(call_id=call.id, content=outcome.content, is_error=outcome.is_error,
+                                          media=outcome.media))
                 end_run = end_run or outcome.end_run
             self._append(session_id, history, Message(role="user", parts=tuple(results)))
             if end_run:

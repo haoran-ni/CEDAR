@@ -1,8 +1,10 @@
 """The problem statement of an investigation: what disagrees, and under which conditions."""
 
+from collections.abc import Sequence
 from enum import StrEnum
+from typing import Annotated
 
-from pydantic import AwareDatetime, Field, JsonValue, model_validator
+from pydantic import AwareDatetime, BeforeValidator, Field, JsonValue, StringConstraints, model_validator
 
 from sim2real.contracts.base import (
     Contract,
@@ -75,9 +77,21 @@ class ObservableAlignment(Contract):
 
 
 class RetrievalPolicy(StrEnum):
+    """Whether the investigation's agents may use the web: not at all, only some domains, or all of it."""
+
     DISABLED = "disabled"
     CURATED_ONLY = "curated_only"
     ENABLED = "enabled"
+
+
+Domain = Annotated[str, BeforeValidator(lambda v: v.lower() if isinstance(v, str) else v), StringConstraints(
+    max_length=253, pattern=r"^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]{0,62}$")]
+"""A plain host name such as ``arxiv.org``, which also covers its subdomains."""
+
+
+def check_retrieval(policy: RetrievalPolicy, domains: Sequence[str]) -> None:
+    if (policy is RetrievalPolicy.CURATED_ONLY) != bool(domains):
+        raise ValueError("web access limited to some domains names them; no other setting takes domains")
 
 
 class InvestigationConstraints(Contract):
@@ -88,12 +102,20 @@ class InvestigationConstraints(Contract):
     deadline: AwareDatetime | None = None
     clusters: tuple[NonEmptyStr, ...] = ()
     external_retrieval: RetrievalPolicy = RetrievalPolicy.DISABLED
+    """Web access at the start; the researcher changes it with ``retrieval_policy_changed``."""
+    allowed_domains: tuple[Domain, ...] = ()
+    """With ``curated_only``: the domains agents may search and fetch from."""
     submit_requires_approval: bool = True
     """Cancelling a submitted job always requires user authorization, independent of this."""
     model_token_budget: int | None = Field(default=None, gt=0)
     """Tokens the investigation's agents may process in total: input, cached input and output."""
     agent_review_minutes: int = Field(default=10, ge=0)
     """How long proposed hypothesis agents wait for the researcher's reply before they start."""
+
+    @model_validator(mode="after")
+    def _domains_with_curated_only(self) -> "InvestigationConstraints":
+        check_retrieval(self.external_retrieval, self.allowed_domains)
+        return self
 
 
 class InvestigationSpec(Contract):

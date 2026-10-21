@@ -8,7 +8,8 @@ version = "0.0.1"
 description = "Hypothesis-driven agent swarm for simulation-experiment discrepancies (pre-alpha)."
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = ["pydantic>=2.14,<3", "ase>=3.29", "numpy>=2", "anthropic>=1.15,<2", "textual>=8.2,<9"]
+dependencies = ["pydantic>=2.14,<3", "ase>=3.29", "numpy>=2", "anthropic>=1.15,<2", "textual>=8.2,<9", "pypdf>=6",
+                "pillow>=10"]
 
 [project.optional-dependencies]
 dev = ["pytest>=9.1"]

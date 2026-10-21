@@ -125,8 +125,9 @@ class ExperimentArg(Contract):
     preparation: str | None = None
     coverage: str | None = None
     environment: str | None = None
-    citation: str | None = Field(default=None, description="Where the measurement is published, as given by the "
-                                                           "researcher; never invent one.")
+    citation: str | None = Field(default=None, description="Where the measurement is published: as the researcher "
+                                                           "gave it, an attached material's id, or the URL of a page "
+                                                           "you read; never invent one.")
     notes: str | None = None
 
 

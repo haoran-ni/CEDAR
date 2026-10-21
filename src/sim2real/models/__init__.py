@@ -9,6 +9,7 @@ from sim2real.models.credentials import (
     scrubbed_environment,
 )
 from sim2real.models.types import (
+    MediaPart,
     Message,
     ModelClient,
     ModelError,
@@ -19,6 +20,7 @@ from sim2real.models.types import (
     ToolResult,
     ToolSpec,
     Usage,
+    WebAccess,
 )
 
 ADAPTERS = ("anthropic",)
@@ -34,7 +36,7 @@ def create_client(settings: ModelSettings, credentials: CredentialStore) -> Mode
 
 
 __all__ = [
-    "ADAPTERS", "CredentialStore", "InsecureCredentials", "Message", "MissingCredential", "ModelClient",
+    "ADAPTERS", "CredentialStore", "InsecureCredentials", "MediaPart", "Message", "MissingCredential", "ModelClient",
     "ModelConfig", "ModelError", "ModelReply", "ModelSettings", "TextPart", "ToolCall", "ToolResult", "ToolSpec",
-    "Usage", "create_client", "load_model_config", "redact", "scrubbed_environment", "write_starter",
+    "Usage", "WebAccess", "create_client", "load_model_config", "redact", "scrubbed_environment", "write_starter",
 ]

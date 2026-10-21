@@ -8,7 +8,8 @@ from pydantic import Field
 from sim2real.agents import AgentRunner, AgentTool, RunLimits, ToolFailure, ToolOutcome, TranscriptStore
 from sim2real.agents.tools import plain_schema
 from sim2real.contracts.base import Contract
-from sim2real.models import ModelError, ModelSettings, TextPart, ToolCall, ToolResult
+from sim2real.agents.runtime import MAX_PAUSED_CONTINUATIONS
+from sim2real.models import MediaPart, ModelError, ModelSettings, TextPart, ToolCall, ToolResult, Usage, WebAccess
 from sim2real.models.scripted import ScriptedModel, reply
 
 SETTINGS = ModelSettings(provider="scripted", model="scripted-model")
@@ -196,3 +197,52 @@ def test_a_run_stops_before_its_next_model_call_when_asked(transcripts):
     assert asked == [0, 1] and len(model.calls) == 1
     # The transcript ends with the tool's result, so the session can be resumed.
     assert transcripts.load("s1")[-1].role == "user" and tool_results(transcripts)[-1].content == "echo: one"
+
+
+# -- images, PDFs and the provider's web tools ---------------------------------------------------
+
+FIGURE = MediaPart(media_type="image/png", data="aW1hZ2U=", title="fig.png")
+
+
+def test_images_a_tool_shows_reach_the_model_with_its_text(transcripts):
+    def show(args: EchoArgs) -> ToolOutcome:
+        return ToolOutcome(f"Showing {args.text}", media=(FIGURE,))
+
+    model = ScriptedModel([reply(call("show", text="fig.png")), reply(TextPart(text="It shows a tilted molecule."))])
+    AgentRunner(model, SETTINGS, transcripts).run("s1", system="system prompt", instruction="Look.",
+                                                  tools=[AgentTool("show", "Show.", EchoArgs, show)])
+    (result,) = model.calls[1].messages[-1].parts
+    assert result.content == "Showing fig.png" and result.media == (FIGURE,)
+    assert tool_results(transcripts)[0].media == (FIGURE,)  # kept for the next run of the session
+
+
+def test_web_access_is_passed_on_and_its_use_counted(transcripts):
+    searched = reply(TextPart(text="Found it.")).model_copy(update={"usage": Usage(input_tokens=5, web_searches=2,
+                                                                                   web_fetches=1)})
+    model = ScriptedModel([searched])
+    web = WebAccess(allowed_domains=("arxiv.org",))
+    result = AgentRunner(model, SETTINGS, transcripts).run("s1", system="system prompt", tools=[], instruction="Go.",
+                                                           web=web)
+    assert model.calls[0].web == web
+    assert (result.usage.web_searches, result.usage.web_fetches) == (2, 1)
+    _, plain = run(transcripts, [reply(TextPart(text="ok"))], session="s2")
+    assert plain.calls[0].web is None
+
+
+def test_a_paused_turn_is_sent_back_unchanged_even_at_the_limits(transcripts):
+    paused = reply(TextPart(text="Searching..."), stop="pause_turn")
+    model = ScriptedModel([paused, paused, reply(TextPart(text="Done searching."))])
+    result = AgentRunner(model, SETTINGS, transcripts).run("s1", system="system prompt", tools=[], instruction="Go.",
+                                                           web=WebAccess(), limits=RunLimits(max_turns=1))
+    assert (result.outcome, result.final_text, result.turns) == ("finished", "Done searching.", 3)
+    # Each continuation ends on the paused assistant turn; no user message is added in between.
+    assert [m.role for m in model.calls[2].messages] == ["user", "assistant", "assistant"]
+
+
+def test_endless_pauses_end_the_run(transcripts):
+    paused = reply(TextPart(text="Searching..."), stop="pause_turn")
+    model = ScriptedModel([paused] * (MAX_PAUSED_CONTINUATIONS + 1))
+    result = AgentRunner(model, SETTINGS, transcripts).run("s1", system="system prompt", tools=[], instruction="Go.",
+                                                           web=WebAccess())
+    assert result.outcome == "turn_limit" and "paused" in result.error
+    assert len(model.calls) == MAX_PAUSED_CONTINUATIONS + 1

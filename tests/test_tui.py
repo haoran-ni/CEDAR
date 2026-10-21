@@ -23,7 +23,7 @@ from test_orchestration import (
     open_and_delegate,
     open_and_start,
 )
-from textual.widgets import Collapsible, DataTable, Footer, Input, Markdown, OptionList, Static, TextArea
+from textual.widgets import Collapsible, DataTable, Footer, Markdown, OptionList, Static, TextArea
 
 from sim2real.contracts import Assessment, AssessmentRecorded, Completeness, EventDraft, SchedulerState
 from sim2real.dashboard import short_id
@@ -68,7 +68,7 @@ async def settle(pilot) -> None:
 
 
 async def send(pilot, text: str) -> None:
-    composer = pilot.app.query_one(Input)
+    composer = pilot.app.query_one(Composer)
     composer.focus()
     composer.value = text
     await pilot.press("enter")
@@ -192,11 +192,11 @@ def test_commands_answer_while_the_chief_works_and_messages_wait_their_turn(syst
     app = Sim2RealApp(system["chat"], refresh_seconds=3600, clock=lambda: NOW)
 
     async def script(pilot):
-        app.query_one(Input).value = "First question"
+        app.query_one(Composer).value = "First question"
         await pilot.press("enter")
         assert await asyncio.to_thread(started.wait, 10)
         for line in ("Second question", "/status"):
-            app.query_one(Input).value = line
+            app.query_one(Composer).value = line
             await pilot.press("enter")
         for _ in range(100):  # the command answers from its own thread while the Chief is still busy
             await pilot.pause()
@@ -459,6 +459,34 @@ def test_the_panel_shows_the_mode_and_web_access_on_their_own_line(system):
         assert mode() == ("Mode: human-in-the-loop · Web: off", False)
 
     drive(app, script)
+
+
+def test_the_input_box_wraps_grows_and_takes_clicks(system):
+    app = Sim2RealApp(system["chat"], refresh_seconds=3600, clock=lambda: NOW)
+
+    async def script(pilot):
+        await settle(pilot)
+        composer = app.query_one(Composer)
+        assert composer.outer_size.height == 3  # one line inside its border, like the old input line
+        composer.value = "PBE puts CO in the fcc hollow on Cu(111) while experiments see atop. " * 3
+        await pilot.pause()
+        assert composer.wrapped_document.height > 1 and composer.outer_size.height == composer.wrapped_document.height + 2
+        composer.value = "\n".join(f"line {i}" for i in range(20))
+        await pilot.pause()
+        assert composer.outer_size.height == 8  # six lines at most; the rest scrolls
+
+        composer.value = "hello wide world"
+        await pilot.pause()  # the box shrinks back to one line before the click
+        await pilot.click(Composer, offset=(2 + 6, 1))  # inside the border and padding: before "wide"
+        assert composer.cursor_location == (0, 6)
+        composer.value = "first line\nsecond line"
+        await pilot.press("up")  # with the menu closed, the arrows move between lines
+        assert composer.cursor_location[0] == 0 and not app.menu_open
+        await pilot.press("enter")  # sends instead of adding a line
+        await settle(pilot)
+        assert composer.value == "" and "you › first line\nsecond line" in conversation(app)
+
+    drive(app, script, size=(80, 40))
 
 
 def test_the_conversation_has_no_shortcut_keys(system):

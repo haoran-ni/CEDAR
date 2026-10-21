@@ -11,8 +11,8 @@ waiting for jobs, proposed, idle, retired or off), for how long and its task; an
 with one row per hypothesis, keeping lifecycle, scheduler state, evidence quality and
 assessment in separate columns. Each table shows at most three rows and scrolls for the
 rest. Where the tables do not fit, one line says which agents are working. Then the scrolling
-conversation and the input line, above which a menu of matching commands opens when a
-line starts with "/". The Chief Scientist answers in a
+conversation and the input box, which wraps long text and grows up to six lines, above which
+a menu of matching commands opens when a line starts with "/". The Chief Scientist answers in a
 background thread, so the panel keeps updating and commands keep working while it thinks.
 Messages sent meanwhile wait their turn. The Chief Scientist's background reviews of the
 agents' reports appear in the conversation as its messages.
@@ -26,12 +26,14 @@ from functools import partial
 from pathlib import Path
 
 from rich.text import Text
+from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import Screen
 from textual.widget import Widget
-from textual.widgets import Collapsible, DataTable, Footer, Input, Markdown, OptionList, Static, TextArea
+from textual.message import Message
+from textual.widgets import Collapsible, DataTable, Footer, Markdown, OptionList, Static, TextArea
 from textual.widgets.option_list import Option
 
 from sim2real.chat import COMMANDS, HELP, ChatSession, Command, Notice, command_lines
@@ -75,20 +77,58 @@ def suggestions(text: str) -> list[Command]:
     return [c for c in MENU_COMMANDS if c.stem.lower().startswith(typed)]
 
 
-class Composer(Input):
-    """The input line. While the command menu is open, ↑/↓ move through it, Tab completes and Esc closes it;
-    otherwise these keys do what they always do."""
+class Composer(TextArea):
+    """The input box. Long text wraps, and the box grows up to six lines before it scrolls; a click or a drag
+    places the cursor or selects text. Enter sends; line breaks in pasted text are kept. While the command menu is
+    open, ↑/↓ move through it, Tab completes and Esc closes it; otherwise these keys do what they always do (↑/↓
+    move between lines, Tab moves the focus)."""
 
+    DEFAULT_CSS = "Composer { height: auto; max-height: 8; }"
     BINDINGS = [Binding("up", "menu_move(-1)", show=False), Binding("down", "menu_move(1)", show=False),
                 Binding("tab", "menu_complete", show=False), Binding("escape", "menu_close", show=False)]
 
+    class Submitted(Message):
+        """Enter was pressed; ``value`` is the box's text."""
+
+        def __init__(self, composer: "Composer", value: str) -> None:
+            super().__init__()
+            self.composer, self.value = composer, value
+
+    def __init__(self, *, placeholder: str, id: str) -> None:
+        super().__init__(id=id, placeholder=placeholder, soft_wrap=True, show_line_numbers=False,
+                         highlight_cursor_line=False, tab_behavior="focus")
+
+    @property
+    def value(self) -> str:
+        return self.text
+
+    @value.setter
+    def value(self, text: str) -> None:
+        """Replace the text, with the cursor at its end."""
+        self.load_text(text)
+        self.move_cursor(self.document.end)
+
+    async def _on_key(self, event: events.Key) -> None:
+        if event.key == "enter":
+            event.stop()
+            event.prevent_default()
+            self.post_message(self.Submitted(self, self.text))
+            return
+        await super()._on_key(event)
+
     def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
-        if action.startswith("menu_"):
+        if action in ("menu_complete", "menu_close"):  # otherwise Tab moves the focus, and Esc does nothing
             return self.app.menu_open
         return super().check_action(action, parameters)
 
     def action_menu_move(self, step: int) -> None:
-        self.app.move_menu(step)
+        # These bindings replace the text area's own for ↑/↓, so with the menu closed they move the cursor.
+        if self.app.menu_open:
+            self.app.move_menu(step)
+        elif step < 0:
+            self.action_cursor_up()
+        else:
+            self.action_cursor_down()
 
     def action_menu_complete(self) -> None:
         self.app.complete_command()
@@ -326,7 +366,7 @@ class Sim2RealApp(App):
                      "want to investigate. Type /help for commands.", "notice")
         if self._started:
             self.say(self._started, "notice")
-        self.query_one(Input).focus()
+        self.query_one(Composer).focus()
         self._fit_panel()
         self.refresh_state()
         self.set_interval(self.refresh_seconds, self.refresh_state)
@@ -358,9 +398,10 @@ class Sim2RealApp(App):
     def menu_open(self) -> bool:
         return self.query_one("#commands", OptionList).has_class("open")
 
-    def on_input_changed(self, event: Input.Changed) -> None:
-        self._menu_closed = False
-        self._show_menu(event.value)
+    def on_text_area_changed(self, event: TextArea.Changed) -> None:
+        if isinstance(event.text_area, Composer):
+            self._menu_closed = False
+            self._show_menu(event.text_area.value)
 
     def _show_menu(self, text: str) -> None:
         menu = self.query_one("#commands", OptionList)
@@ -388,7 +429,6 @@ class Sim2RealApp(App):
         if command is not None:
             composer = self.query_one(Composer)
             composer.value = command.stem
-            composer.cursor_position = len(command.stem)
             composer.focus()
 
     def close_menu(self) -> None:
@@ -401,13 +441,13 @@ class Sim2RealApp(App):
 
     # -- input --------------------------------------------------------------------------------
 
-    def on_input_submitted(self, event: Input.Submitted) -> None:
+    def on_composer_submitted(self, event: Composer.Submitted) -> None:
         chosen = self._chosen()
         if chosen is not None and event.value.strip() != chosen.stem.strip():
             self.complete_command(chosen)  # Enter on a partial command completes it; Enter again runs it
             return
         line = event.value.strip()
-        event.input.clear()
+        event.composer.clear()
         if not line:
             return
         if line in ("/quit", "/exit"):

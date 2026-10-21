@@ -11,6 +11,7 @@ from factories import (
     SITE_ENERGY,
     USER,
     VALIDATOR,
+    acting_for,
     add_hypothesis,
     authorize,
     computed_evidence,
@@ -97,7 +98,8 @@ def hyp(ledger, inv):
 
 
 def request(ledger, inv, hyp, **task_kwargs):
-    return ledger.request_calculation(inv, AGENT, hyp, task(**task_kwargs), "discriminating test")
+    return ledger.request_calculation(inv, acting_for(ledger, inv, hyp), hyp, task(**task_kwargs),
+                                      "discriminating test")
 
 
 def test_full_investigation_cycle_replays_to_identical_state(ledger, store, tmp_path, inv, hyp):

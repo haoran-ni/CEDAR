@@ -7,7 +7,7 @@ evidence, never from an agent's prose.
 
 Pages, in ``notebooks/<investigation>/`` under the data directory:
 
-- ``index.md``: question, compared quantities, plan, hypotheses, calculations, rounds
+- ``index.md``: question, compared quantities, plan, hypotheses, agents, calculations, rounds
 - ``round-NN.md``: one page per round, under the headings in ``ROUND_SECTIONS``
 - ``hypotheses/<id>.md``: everything recorded about one hypothesis
 - ``timeline.md``: every event, one line each
@@ -19,14 +19,17 @@ import os
 from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from datetime import timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from sim2real.contracts.base import Actor, ActorKind, ArtifactRef, ExternalSource, Observable, Quantity
 from sim2real.contracts.analysis import AnalysisRun
 from sim2real.contracts.events import (
+    AgentRetired,
     AgentRunRecorded,
+    AgentsProposed,
+    AgentsStarted,
     AgentTaskQueued,
     AnalysisRecorded,
     AssessmentRecorded,
@@ -65,6 +68,7 @@ from sim2real.state.projection import (
     InvestigationState,
     apply,
     hypothesis_evidence,
+    review_deadline,
 )
 from sim2real.summaries import approval_requests
 
@@ -136,7 +140,11 @@ def _cell(text: str) -> str:
 
 
 def _when(event: RecordedEvent) -> str:
-    return event.occurred_at.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    return _clock(event.occurred_at)
+
+
+def _clock(moment: datetime) -> str:
+    return moment.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
 
 
 def _quantity(q: Quantity | None) -> str:
@@ -346,6 +354,8 @@ def _assessment_lines(hyp: HypothesisRecord, event: RecordedEvent, p: Assessment
 def _run_lines(event: RecordedEvent, p: AgentRunRecorded) -> list[str]:
     model = ", ".join(p.served_models) or p.requested_model
     task = f"task {p.task_id}; " if p.task_id else ""
+    if p.role == "chief_scientist":
+        task = "review of the agents' reports; " + task
     dropped = (f"; {p.dropped_reasoning_blocks} earlier reasoning block{'s' if p.dropped_reasoning_blocks > 1 else ''} "
                "left out because the conversation changed") if p.dropped_reasoning_blocks else ""
     lines = [f"- **{_actor(event.actor)}** ({p.role.replace('_', ' ')}; {task}{p.outcome}; {p.turns} turns; "
@@ -436,6 +446,17 @@ def _why(rnd: _Round, state: InvestigationState) -> list[str]:
         elif isinstance(p, HypothesisStatusChanged) and event.actor.kind in (ActorKind.CHIEF_SCIENTIST,
                                                                              ActorKind.USER):
             lines.append(f"- {ROOT.hyp(p.hypothesis_id)} moved to {p.status.value} by {who}: {_said(p.reason)}")
+        elif isinstance(p, AgentsProposed):
+            lines.append(f"- Agents proposed by {who} ({p.proposal_id}): {_said(p.rationale)}")
+            lines += [f"  - {ROOT.hyp(a.hypothesis_id)}: {_flat(a.role)}; first task: {_said(a.brief)}"
+                      for a in p.agents]
+        elif isinstance(p, AgentsStarted):
+            how = (f"by the researcher's {p.authorization_id}" if p.authorization_id else
+                   "after the researcher's review window passed without a reply")
+            lines.append(f"- Agents of {p.proposal_id} started {how}: "
+                         + ", ".join(f"{a} on {ROOT.hyp(h)}" for h, a in p.agent_ids.items()))
+        elif isinstance(p, AgentRetired):
+            lines.append(f"- {p.agent_id} retired by {who}: {_said(p.reason)}")
     return lines or ["No decisions were recorded this round."]
 
 
@@ -539,9 +560,20 @@ def _next(state: InvestigationState, next_start: RecordedEvent | None) -> list[s
         n = next_start.payload.round
         lines.append(f"- [{_round_name(n)}]({round_file(n)}) started next, by {_actor(next_start.actor)}: "
                      f"{_said(next_start.payload.reason)}")
+    proposal = state.pending_proposal
+    if proposal is not None:
+        status = (f"held since the researcher's {proposal.feedback_ids[0]}" if proposal.feedback_ids else
+                  f"starts at {_clock(review_deadline(state, proposal))} unless the researcher replies")
+        lines.append(f"- Agents proposed ({proposal.proposal_id}), {status}: "
+                     + ", ".join(f"{_flat(a.role)} on {ROOT.hyp(a.hypothesis_id)}" for a in proposal.agents))
     for task in state.pending_tasks:
-        lines.append(f"- Queued for the {task.role.replace('_', ' ')} on {ROOT.hyp(task.hypothesis_id)}, by "
-                     f"{task.queued_by}: {_said(task.instruction)}")
+        if task.role == "chief_scientist":
+            who = "the Chief Scientist's review of the agents' reports"
+        elif task.role == "evidence_judge":
+            who = f"the Evidence Judge on {ROOT.hyp(task.hypothesis_id)}"
+        else:
+            who = f"{task.agent_id} on {ROOT.hyp(task.hypothesis_id)}"
+        lines.append(f"- Queued for {who}, by {task.queued_by}: {_said(task.instruction)}")
     lines += [f"- Waiting for the researcher: `{command}` ({note})" for command, note in approval_requests(state)]
     lines += [f"- {c.calculation_id} not finished: {_calc_status(c)}" for c in state.calculations.values()
               if c.state not in _FINISHED]
@@ -575,8 +607,9 @@ def _paragraphs(*blocks: list[str]) -> list[str]:
 
 def _reports(rnd: _Round) -> list[str]:
     runs = rnd.of(AgentRunRecorded)
-    reports = [line for event, p in runs if p.role != "chief_scientist" for line in _run_lines(event, p)]
-    chief = sum(1 for _, p in runs if p.role == "chief_scientist")
+    reports = [line for event, p in runs if p.role != "chief_scientist" or p.task_id
+               for line in _run_lines(event, p)]
+    chief = sum(1 for _, p in runs if p.role == "chief_scientist" and not p.task_id)
     tokens = sum(_tokens(p) for _, p in runs)
     lines = _paragraphs(
         [_REPORTS_NOTE] if reports else [], reports,
@@ -595,6 +628,14 @@ def _hypothesis_page(hyp: HypothesisRecord, state: InvestigationState, events: S
               f"{hyp.assessment.value} · priority {state.plan.priority(hyp.hypothesis_id).value} · proposed by "
               f"{_actor(proposed.actor)} in {_round_name(proposed.round).lower()}, {_when(proposed)}")
     statement = [_flat(spec.statement), "", f"- Rationale: {_said(spec.rationale)}", *_spec_details(spec)]
+    agents = []
+    for agent in (a for a in state.agents.values() if a.hypothesis_id == hyp.hypothesis_id):
+        how = (f"by the researcher's {agent.authorization_id}" if agent.authorization_id else
+               "after the review window passed without a reply")
+        agents.append(f"- **{agent.agent_id}**, {_flat(agent.spec.role)}: started {how} (event #{agent.started_at}, "
+                      f"proposal {agent.proposal_id})" + (f"; retired: {_said(agent.retire_reason)}"
+                                                         if not agent.active else ""))
+        agents.append(f"  - First task: {_said(agent.spec.brief)}")
 
     predictions = []
     for pid in hyp.prediction_ids:
@@ -629,6 +670,7 @@ def _hypothesis_page(hyp: HypothesisRecord, state: InvestigationState, events: S
 
     blocks = [f"# Hypothesis {hyp.hypothesis_id}: {_flat(spec.title)}", header, _NOTE,
               _section("Statement", statement),
+              _section("Agent", agents or ["None started yet."]),
               _section("Predictions", predictions or ["None registered yet."]),
               _section("Calculations", calculations or ["None requested yet."]),
               _section("Analyses", analyses or ["None run yet."]),
@@ -720,20 +762,41 @@ def _index_page(state: InvestigationState, events: Sequence[RecordedEvent], roun
     for run in state.agent_runs:
         usage[run.role] += _tokens(run.run)
         runs[run.role] += 1
-    agents = [f"- {role.replace('_', ' ')}: {runs[role]} run{'s' if runs[role] > 1 else ''}, {usage[role]:,} tokens"
-              for role in runs]
+    model_usage = [f"- {role.replace('_', ' ')}: {runs[role]} run{'s' if runs[role] > 1 else ''}, {usage[role]:,} tokens"
+                   for role in runs]
     budget = spec.constraints.model_token_budget
-    agents.append(f"- Total: {state.model_tokens_used:,} tokens" + (f" of a {budget:,} budget" if budget else ""))
+    model_usage.append(f"- Total: {state.model_tokens_used:,} tokens" + (f" of a {budget:,} budget" if budget else ""))
+
+    agents = ["Each hypothesis has at most one agent at a time; agents see only their own hypothesis's work.", "",
+              "| Agent | Hypothesis | Role | Started | Status | Runs | Tokens |", "|---|---|---|---|---|---|---|"]
+    for agent in state.agents.values():
+        mine = [r for r in state.agent_runs if r.actor_id == agent.agent_id]
+        started = agent.authorization_id or "review window passed"
+        status = "active" if agent.active else f"retired: {_short(agent.retire_reason or '', 80)}"
+        limit = f" of {agent.spec.token_budget:,}" if agent.spec.token_budget else ""
+        agents.append(f"| {agent.agent_id} | {ROOT.hyp(agent.hypothesis_id)} | {_cell(agent.spec.role)} | {started} | "
+                      f"{_cell(status)} | {len(mine)} | {state.agent_tokens_used(agent.agent_id):,}{limit} |")
+    if not state.agents:
+        agents = ["None started yet."]
+    if state.proposals:
+        agents += ["", "Proposals:", ""]
+        for proposal in state.proposals.values():
+            outcome = {"pending": "waiting for the researcher's review", "started": "started",
+                       "superseded": "replaced by a later proposal"}[proposal.status.value]
+            replies = f"; researcher replied: {', '.join(proposal.feedback_ids)}" if proposal.feedback_ids else ""
+            agents.append(f"- {proposal.proposal_id} (event #{proposal.recorded_at}, {outcome}{replies}): "
+                          + ", ".join(f"{_flat(a.role)} on {ROOT.hyp(a.hypothesis_id)}" for a in proposal.agents))
 
     blocks = [f"# {spec.title}", header, generated, _NOTE,
               _section("Question", [_flat(spec.question), "", f"Target claim: {_flat(spec.target_claim)}"]),
               _section("Compared quantities", quantities),
               _section("Plan", plan),
               _section("Hypotheses", hypotheses),
+              _section("Agents", agents),
               _section("Calculations", calculations),
               _section("Rounds", round_links),
               _section("Waiting for the researcher", waiting),
-              _section("Agents", agents),
+              _section("Model usage", model_usage),
               _section("Timeline", ["[Every recorded event, in order](timeline.md)."])]
     return "\n\n".join(blocks) + "\n"
 
@@ -787,7 +850,17 @@ def _describe(event: RecordedEvent) -> str:
             return (f"{p.hypothesis_id} assessed {p.assessment.value} ({p.completeness.value.lower()}), citing "
                     f"{', '.join(p.evidence_ids) or 'no evidence'}")
         case AgentTaskQueued():
-            return f"{p.task_id} queued for the {p.role.replace('_', ' ')} on {p.hypothesis_id}"
+            if p.role == "chief_scientist":
+                return f"{p.task_id} queued for the Chief Scientist's review of the agents' reports"
+            who = p.agent_id or f"the {p.role.replace('_', ' ')}"
+            return f"{p.task_id} queued for {who} on {p.hypothesis_id}"
+        case AgentsProposed():
+            return f"{p.proposal_id}: agents proposed: " + ", ".join(f"{a.role} on {a.hypothesis_id}" for a in p.agents)
+        case AgentsStarted():
+            how = f"by {p.authorization_id}" if p.authorization_id else "after the review window"
+            return f"{p.proposal_id} started {how}: " + ", ".join(p.agent_ids.values())
+        case AgentRetired():
+            return f"{p.agent_id} retired: {_said(p.reason)}"
         case AgentRunRecorded():
             return f"{p.role.replace('_', ' ')} run ended {p.outcome} after {p.turns} turns ({_tokens(p):,} tokens)"
     return p.type

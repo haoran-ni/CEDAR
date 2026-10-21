@@ -14,11 +14,13 @@ from test_orchestration import (
     HYP,
     INV,
     NOW,
+    ROLE,
     agent_reads,
     agent_requests,
     latest_calc,
     make_system,
     open_and_delegate,
+    open_and_start,
 )
 from textual.widgets import Collapsible, DataTable, Input, Markdown, Static, TextArea
 
@@ -88,10 +90,9 @@ def status(app) -> str:
 
 
 def validated_run(system) -> str:
-    """Open, delegate, approve and finish one calculation without the interface; returns its id."""
+    """Open, start the agent, approve and finish one calculation without the interface; returns its id."""
     chat, clients, dispatcher, scheduler = system["chat"], system["clients"], system["dispatcher"], system["scheduler"]
-    clients.add("chief_scientist", open_and_delegate(system["site"]), reply(TextPart(text="Opened.")))
-    chat.handle("Investigate CO on Cu(111).")
+    open_and_start(system)
     clients.add("hypothesis_agent", *agent_requests(system))
     dispatcher.tick()
     calc = latest_calc(system["workspace"])
@@ -121,8 +122,17 @@ def test_conversation_live_panel_and_approval(system):
 
         await refresh(pilot)
         (row,) = panel(app)
-        assert row[0] == HYP and row[1] == "ACTIVE" and row[2].startswith("agent queued")
-        assert status(app).startswith(f"{INV} · INVESTIGATING · round 1 · plan v1")
+        assert row[0] == HYP and row[1] == "ACTIVE" and row[2] == f"proposed {ROLE}; starts in 10 min"
+        assert status(app).startswith(f"{INV} · INVESTIGATING · round 1 · plan v1 · 0 agents")
+        assert "1 agent proposed: start in 10 min unless you reply (/agents)" in status(app)
+        assert "[waiting for you] /approve agents" in conversation(app)
+
+        await send(pilot, "/agents")
+        assert f"{HYP}: {ROLE}" in conversation(app) and "first task: Compute a PBE baseline" in conversation(app)
+        await send(pilot, "/approve agents")
+        assert f"Started agent-{HYP} on {HYP}" in conversation(app)
+        await refresh(pilot)
+        assert panel(app)[0][2].startswith(f"{ROLE}: queued") and "proposed" not in status(app)
 
         # The dispatcher works in its own thread, as a separate process would.
         clients.add("hypothesis_agent", *agent_requests(system))
@@ -131,7 +141,7 @@ def test_conversation_live_panel_and_approval(system):
         calc = latest_calc(system["workspace"])
         (row,) = panel(app)
         assert row[3] == f"{short_id(calc)} needs /approve submit" and row[4] == "none" and row[5] == "NOT_TESTED"
-        assert row[2] == "agent waiting for jobs" and "dispatcher seen 0 s ago" in status(app)
+        assert row[2] == f"{ROLE}: waiting for jobs" and "dispatcher seen 0 s ago" in status(app)
         assert "1 waiting for you (/pending)" in status(app)
         assert f"[waiting for you] /approve submit {calc}" in conversation(app)
         assert "Requested the PBE baseline; waiting for it." in conversation(app)
@@ -144,7 +154,7 @@ def test_conversation_live_panel_and_approval(system):
 
     drive(app, script)
     calc = latest_calc(system["workspace"])
-    authorization = system["workspace"].ledger.load(INV).interventions["msg-2"]
+    authorization = system["workspace"].ledger.load(INV).interventions["msg-3"]
     assert authorization.text == f"/approve submit {short_id(calc)}"
     assert authorization.authorizations[0].target_ids == (calc,)
 
@@ -265,3 +275,25 @@ def test_narrow_terminals_start_with_the_panel_hidden_and_a_summary_shown(system
         assert not app.query_one(DataTable).display
 
     drive(app, script, size=(90, 30))
+
+
+def test_the_chief_scientists_reviews_appear_as_its_messages(system):
+    clients, dispatcher = system["clients"], system["dispatcher"]
+    open_and_start(system)
+    clients.add("hypothesis_agent", reply(TextPart(text="Nothing to compute before the baseline is approved.")))
+    dispatcher.tick()
+    dispatcher.chief_reviews = True
+    clients.add("chief_scientist", reply(TextPart(text="The agent has **not requested** any calculation yet.")))
+    app = Sim2RealApp(system["chat"], refresh_seconds=3600, clock=lambda: NOW)
+
+    async def script(pilot):
+        await settle(pilot)
+        assert "Nothing to compute before the baseline" in conversation(app)
+        await asyncio.to_thread(dispatcher.tick)
+        await refresh(pilot)
+        text = conversation(app)
+        assert "Chief Scientist (review of the agents' reports) ›" in text
+        assert "The agent has **not requested** any calculation yet." in [
+            w.source for w in app.query_one("#chat").query(Markdown)]
+
+    drive(app, script)

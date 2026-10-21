@@ -1,13 +1,16 @@
 """Tools of the Chief Scientist: plan, delegate and explain; never compute or authorize.
 
 The Chief can open an investigation, record observable alignment, propose and manage
-hypotheses, revise the plan, start rounds, and queue work for hypothesis agents and the
-Evidence Judge. Submissions, cancellations and input approvals belong to the researcher
-and are granted with explicit commands, never through these tools.
+hypotheses, propose hypothesis agents (one per hypothesis, each with the role the work
+needs), give agents further work or retire them, revise the plan, start rounds, and queue
+assessments by the Evidence Judge. Proposed agents start only after the researcher's review
+window. Submissions, cancellations, input approvals and early starts of agents belong to
+the researcher and are granted with explicit commands, never through these tools.
 """
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Literal
 
 from pydantic import Field
@@ -25,7 +28,10 @@ from sim2real.contracts.base import (
     UncertaintyKind,
     new_id,
 )
+from sim2real.contracts.agents import AgentSpec
 from sim2real.contracts.events import (
+    AgentRetired,
+    AgentsProposed,
     AgentTaskQueued,
     EventDraft,
     HypothesisProposed,
@@ -51,7 +57,9 @@ from sim2real.contracts.task import ProtocolRef
 from sim2real.hpc.profile import ProfileStore
 from sim2real.protocols.base import ProtocolRegistry
 from sim2real.state.ledger import ResearchLedger
+from sim2real.state.projection import review_deadline
 from sim2real.summaries import investigation_summary, pending_approvals
+from sim2real.swarm import agent_label, agents_summary, clock_time
 
 
 @dataclass
@@ -65,6 +73,7 @@ class ChiefContext:
     on_open: Callable[[str], list[str]] | None = None
     """Told the new investigation's id once it is opened; returns the ids under which the researcher's
     earlier messages were recorded."""
+    clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc)
 
 
 class NoArgs(Contract):
@@ -175,6 +184,29 @@ class PlanArgs(Contract):
 
 
 class ReasonArgs(Contract):
+    reason: NonEmptyStr
+
+
+class AgentArg(Contract):
+    hypothesis_id: Identifier = Field(description="An activated hypothesis without an agent.")
+    role: NonEmptyStr = Field(max_length=200, description="The specialization the work needs, in a few words, e.g. "
+                                                           "'exchange-correlation specialist'.")
+    brief: NonEmptyStr = Field(description="Its first task: what to test, with which protocol, and within what "
+                                           "limits.")
+    token_budget: int | None = Field(default=None, gt=0, description="Tokens it may process over its lifetime; "
+                                                                     "omit to leave only the investigation's budget.")
+    max_turns: int | None = Field(default=None, ge=1, le=200, description="Model calls per run; omit for the "
+                                                                         "default.")
+
+
+class ProposeArgs(Contract):
+    agents: list[AgentArg] = Field(min_length=1, description="At most one agent per hypothesis.")
+    rationale: NonEmptyStr = Field(description="Why these agents and roles, and why the other open hypotheses get "
+                                               "none.")
+
+
+class RetireArgs(Contract):
+    hypothesis_id: Identifier
     reason: NonEmptyStr
 
 
@@ -313,25 +345,69 @@ def chief_tools(ctx: ChiefContext) -> list[AgentTool]:
         record(RoundStarted(round=state.round + 1, reason=args.reason))
         return f"Round {state.round + 1} started."
 
+    def propose_agents(args: ProposeArgs) -> str:
+        state = ctx.ledger.load(current())
+        if state.status is not InvestigationStatus.INVESTIGATING:
+            raise ToolFailure(f"the investigation is {state.status.value}; move it to INVESTIGATING before "
+                              "proposing agents")
+        earlier = state.pending_proposal
+        proposal_id = new_id("prop")
+        record(AgentsProposed(proposal_id=proposal_id, rationale=args.rationale, agents=tuple(
+            AgentSpec(**a.model_dump()) for a in args.agents)))
+        state = ctx.ledger.load(current())
+        deadline = review_deadline(state, state.proposals[proposal_id])
+        replaced = f" It replaces {earlier.proposal_id}, which never started." if earlier else ""
+        return (f"Proposed {len(args.agents)} agent{'s' if len(args.agents) > 1 else ''} as {proposal_id}.{replaced} "
+                f"They start at {clock_time(deadline)} ({state.spec.constraints.agent_review_minutes} minutes from "
+                "now) unless the researcher replies; a reply holds them until you propose again. The researcher can "
+                "start them at once with /approve agents. Tell the researcher what you propose and why.")
+
+    def retire_agent(args: RetireArgs) -> str:
+        agent = ctx.ledger.load(current()).active_agent(args.hypothesis_id)
+        if agent is None:
+            raise ToolFailure(f"{args.hypothesis_id} has no active agent")
+        record(AgentRetired(agent_id=agent.agent_id, reason=args.reason))
+        return f"Retired {agent_label(agent)}; its queued work is dropped, its record and evidence remain."
+
     def queue(role: str, args: TaskArgs) -> str:
-        status = ctx.ledger.load(current()).status
+        state = ctx.ledger.load(current())
+        status = state.status
         allowed = (InvestigationStatus.INVESTIGATING,) if role == "hypothesis_agent" else (
             InvestigationStatus.INVESTIGATING, InvestigationStatus.REVIEWING)
         if status not in allowed:
             raise ToolFailure(f"the investigation is {status.value}; move it to "
                               f"{' or '.join(s.value for s in allowed)} before queuing {role.replace('_', ' ')} work")
+        agent_id = None
+        if role == "hypothesis_agent":
+            agent = state.active_agent(args.hypothesis_id)
+            proposal = state.pending_proposal
+            if agent is None and proposal and any(a.hypothesis_id == args.hypothesis_id for a in proposal.agents):
+                raise ToolFailure(f"the agent for {args.hypothesis_id} is proposed but has not started; its brief is "
+                                  "its first task, so revise the proposal instead")
+            if agent is None:
+                raise ToolFailure(f"{args.hypothesis_id} has no agent; propose one with propose_agents")
+            agent_id = agent.agent_id
         task_id = new_id("task")
-        record(AgentTaskQueued(task_id=task_id, role=role, hypothesis_id=args.hypothesis_id,
+        record(AgentTaskQueued(task_id=task_id, role=role, hypothesis_id=args.hypothesis_id, agent_id=agent_id,
                                instruction=args.instruction))
-        return (f"Queued {task_id} for the {role.replace('_', ' ')} on {args.hypothesis_id}. The dispatcher runs it; "
-                "results appear in investigation_state and agent_reports.")
+        who = agent_id or f"the {role.replace('_', ' ')}"
+        return (f"Queued {task_id} for {who} on {args.hypothesis_id}. The dispatcher runs it; results appear in "
+                "investigation_state and agent_reports.")
+
+    def agents(_: NoArgs) -> str:
+        return agents_summary(ctx.ledger.load(current()), ctx.clock())
 
     def agent_reports(args: ReportsArgs) -> str:
         state = ctx.ledger.load(current())
         runs = [r for r in state.agent_runs if r.role != "chief_scientist"]
         if args.hypothesis_id is not None:
             runs = [r for r in runs if r.run.task_id and state.tasks[r.run.task_id].hypothesis_id == args.hypothesis_id]
-        lines = [f"[{r.role} {r.actor_id}, {r.run.outcome}] {r.run.report or '(no report)'}" for r in runs[-args.last:]]
+
+        def who(run) -> str:
+            agent = state.agents.get(run.actor_id)
+            return f"{agent_label(agent)} on {agent.hypothesis_id}" if agent else f"{run.role} {run.actor_id}"
+
+        lines = [f"[{who(r)}, {r.run.outcome}] {r.run.report or '(no report)'}" for r in runs[-args.last:]]
         return "\n\n".join(lines) or "No agent reports yet."
 
     def approvals(_: NoArgs) -> str:
@@ -374,8 +450,18 @@ def chief_tools(ctx: ChiefContext) -> list[AgentTool]:
         AgentTool("start_round", "Start a new round of tests without a review in between. A round also starts by "
                   "itself whenever the investigation moves into INVESTIGATING. Each round gets its own page in the "
                   "research notebook.", ReasonArgs, start_round),
-        AgentTool("delegate", "Queue work for the hypothesis agent of an ACTIVE or PLANNING_TEST hypothesis.",
+        AgentTool("propose_agents", "Propose hypothesis agents: at most one per hypothesis, each with the role its "
+                  "work needs and its first task. Not every hypothesis needs one. The researcher reviews the proposal; "
+                  "it starts after the review window unless they reply, or at once on their /approve agents. A new "
+                  "proposal replaces one still waiting.", ProposeArgs, propose_agents),
+        AgentTool("agents", "List the agents, their roles and token use, and any proposal waiting for the "
+                  "researcher.", NoArgs, agents),
+        AgentTool("delegate", "Queue further work for the agent of a hypothesis. It sees only its own hypothesis: "
+                  "include any other agent's finding its test needs, citing the evidence id.",
                   TaskArgs, lambda a: queue("hypothesis_agent", a)),
+        AgentTool("retire_agent", "Retire a hypothesis's agent when its hypothesis needs no more work, or to "
+                  "replace it with an agent in a different role. Queued work for it is dropped; its record stays.",
+                  RetireArgs, retire_agent),
         AgentTool("request_judgement", "Queue an assessment of a hypothesis by the Evidence Judge.", TaskArgs,
                   lambda a: queue("evidence_judge", a)),
         AgentTool("agent_reports", "Read the latest reports of hypothesis agents and the Evidence Judge.",

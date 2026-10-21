@@ -7,18 +7,22 @@ always shown separately.
 from sim2real.contracts.examination import ExaminationVerdict, FindingSeverity
 from sim2real.contracts.plan import PermissionAction
 from sim2real.contracts.status import CalculationState
-from sim2real.state.projection import CalculationRecord, InvestigationState, authorization_for
+from sim2real.state.projection import CalculationRecord, InvestigationState, authorization_for, evidence_owner
+from sim2real.swarm import agent_label, proposal_note
 
 
-def calculation_summary(state: InvestigationState, calc: CalculationRecord, *, findings: bool = True) -> str:
+def calculation_summary(state: InvestigationState, calc: CalculationRecord, *, findings: bool = True,
+                        viewer: str | None = None) -> str:
+    """One calculation; ``viewer`` is the hypothesis whose agent reads it, which then sees only its own work."""
     head = f"{calc.calculation_id}: {calc.state.value}"
     if calc.examination is not None:
         head += f"; inputs {calc.examination.verdict.value}"
     if calc.scheduler_job_id:
         job_state = calc.scheduler_state.value if calc.scheduler_state else "submitted"
         head += f"; job {calc.scheduler_job_id} {job_state}"
+    used_by = "" if viewer is not None else f"; for {', '.join(calc.hypothesis_ids)}"
     lines = [head, f"  {calc.task.observable.name} via {calc.task.protocol.name} {calc.task.protocol.version}; "
-                   f"estimand: {calc.task.estimand}; for {', '.join(calc.hypothesis_ids)}"]
+                   f"estimand: {calc.task.estimand}{used_by}"]
     if findings and calc.examination is not None:
         for f in calc.examination.findings:
             if f.severity is not FindingSeverity.INFO or f.code == "generated":
@@ -32,6 +36,8 @@ def calculation_summary(state: InvestigationState, calc: CalculationRecord, *, f
                   f"{r.quote}" for r in calc.run_check.readings]
     for evidence_id in calc.evidence_ids:
         evidence = state.evidence[evidence_id].evidence
+        if viewer is not None and evidence_owner(state, evidence) not in (None, viewer):
+            continue  # another hypothesis's reading of a shared run
         value = f"{evidence.value.value!r} {evidence.value.unit}" if evidence.value else "no value"
         failed = [c.name for c in evidence.quality_checks if not c.passed]
         origin = f" (analysis {evidence.analysis_id})" if evidence.analysis_id else ""
@@ -40,9 +46,21 @@ def calculation_summary(state: InvestigationState, calc: CalculationRecord, *, f
     return "\n".join(lines)
 
 
+def task_owner(task) -> str:
+    """Who a queued task is for, in words."""
+    if task.role == "chief_scientist":
+        return "Chief Scientist's review of agent reports"
+    if task.role == "evidence_judge":
+        return f"Evidence Judge on {task.hypothesis_id}"
+    return f"{task.agent_id} on {task.hypothesis_id}"
+
+
 def approval_requests(state: InvestigationState) -> list[tuple[str, str]]:
     """What waits for the researcher: the command that grants it, and what it concerns."""
     needs = []
+    proposal = state.pending_proposal
+    if proposal is not None:
+        needs.append(("/approve agents", proposal_note(state, proposal)))
     for calc in state.calculations.values():
         if (calc.state is CalculationState.SPECIFIED and calc.examination is not None
                 and calc.examination.verdict is ExaminationVerdict.NEEDS_REVIEW
@@ -74,8 +92,10 @@ def investigation_summary(state: InvestigationState) -> str:
     if not state.hypotheses:
         lines.append("Hypotheses: none yet")
     for hyp in state.hypotheses.values():
+        agent = state.active_agent(hyp.hypothesis_id)
         lines.append(f"Hypothesis {hyp.hypothesis_id} [{hyp.status.value}; assessment {hyp.assessment.value}; "
-                     f"priority {state.plan.priority(hyp.hypothesis_id).value}]: {hyp.spec.title}")
+                     f"priority {state.plan.priority(hyp.hypothesis_id).value}; "
+                     f"agent {agent_label(agent) if agent else 'none'}]: {hyp.spec.title}")
         if hyp.assessments:
             last = hyp.assessments[-1]
             lines.append(f"  latest assessment ({last.completeness.value}): {last.rationale}")
@@ -83,9 +103,12 @@ def investigation_summary(state: InvestigationState) -> str:
         lines.append("Calculations:")
         lines += ["  " + line for c in state.calculations.values()
                   for line in calculation_summary(state, c, findings=False).splitlines()]
+    proposal = state.pending_proposal
+    if proposal is not None:
+        lines.append("Agents proposed, not started: " + "; ".join(f"{s.hypothesis_id}: {s.role}" for s in proposal.agents)
+                     + f" ({proposal_note(state, proposal)})")
     if state.pending_tasks:
-        lines.append("Queued agent work: " + "; ".join(f"{t.task_id} ({t.role} for {t.hypothesis_id})"
-                                                      for t in state.pending_tasks))
+        lines.append("Queued agent work: " + "; ".join(f"{t.task_id} ({task_owner(t)})" for t in state.pending_tasks))
     approvals = pending_approvals(state)
     if approvals:
         lines.append("Waiting for the researcher:")

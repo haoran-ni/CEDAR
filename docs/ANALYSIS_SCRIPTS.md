@@ -13,10 +13,10 @@ No quantity is built into sim2real. The FHI-aims protocol (`fhiaims.run`) checks
    - imports modules that start processes, open network connections, load foreign code or import dynamically (`subprocess`, `socket`, `urllib`, `multiprocessing`, `ctypes`, `importlib`, …)
    - calls `os.system`, `os.popen`, `os.exec*`, `os.spawn*`, `os.fork` or `os.kill`
    - uses `eval`, `exec`, `compile` or `__import__`
-2. **Staging.** For each calculation it names, the requested files are copied read-only to `inputs/<calculation_id>/` in a fresh working directory: by default the run's stored outputs and its input files, or any file of the run directory named by relative path. Each file is identified by its content hash, and a file the run check already stored must be that same file.
+2. **Staging.** For each calculation it names, which must be one of its own hypothesis's, the requested files are copied read-only to `inputs/<calculation_id>/` in a fresh working directory: by default the run's stored outputs and its input files, or any file of the run directory named by relative path. Each file is identified by its content hash, and a file the run check already stored must be that same file.
 3. **Execution.** The script runs on the login node with the Python environment sim2real runs in (NumPy, SciPy, ASE and matplotlib available), with:
    - a clean environment: no credentials, a private home and temporary directory, single-threaded numerical libraries
-   - limits: 10 minutes of CPU, 15 minutes of wall-clock time, 4 GiB of memory, 200 MiB per file written
+   - limits: 10 minutes of CPU, 15 minutes of wall-clock time, 4 GiB of memory, 200 MiB per file written; at most two scripts run at once, whichever agents started them
    - an audit hook that refuses to read anything but the staged inputs, the Python installation and system libraries; to write, delete or rename anything outside the working directory; to start any program; or to open a socket
 4. **Collection.** What the script printed, every file it wrote, and the results and checks it reported are stored by content hash. The run is recorded as an `analysis_recorded` event whether it completed, failed or timed out. The working directory is then removed.
 

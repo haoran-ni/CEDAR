@@ -4,6 +4,9 @@ from sim2real.contracts import (
     CITATIONS_VERIFIED,
     Actor,
     ActorKind,
+    AgentSpec,
+    AgentsProposed,
+    AgentsStarted,
     AnalysisInput,
     AnalysisOutcome,
     AnalysisRecorded,
@@ -50,10 +53,18 @@ from sim2real.contracts import (
 )
 from sim2real.contracts.analysis import as_evidence_check
 from sim2real.state import ResearchLedger
+from sim2real.state.projection import agent_id_for
 
 USER = Actor(kind=ActorKind.USER, id="researcher")
 CHIEF = Actor(kind=ActorKind.CHIEF_SCIENTIST, id="chief")
-AGENT = Actor(kind=ActorKind.HYPOTHESIS_AGENT, id="agent-1")
+
+
+def agent_for(hypothesis_id: str) -> Actor:
+    """The actor of the first agent started for a hypothesis."""
+    return Actor(kind=ActorKind.HYPOTHESIS_AGENT, id=f"agent-{hypothesis_id}")
+
+
+AGENT = agent_for("hyp-xc")
 JUDGE = Actor(kind=ActorKind.EVIDENCE_JUDGE, id="judge")
 ENGINE = Actor(kind=ActorKind.PROTOCOL_ENGINE, id="protocol-engine")
 MANAGER = Actor(kind=ActorKind.JOB_MANAGER, id="job-manager")
@@ -141,19 +152,44 @@ def start_investigation(ledger: ResearchLedger, investigation_id: str = "inv-1",
     return investigation_id
 
 
-def add_hypothesis(ledger: ResearchLedger, investigation_id: str, hypothesis_id: str = "hyp-xc") -> str:
-    """Propose a hypothesis and bring it to PLANNING_TEST."""
+def add_hypothesis(ledger: ResearchLedger, investigation_id: str, hypothesis_id: str = "hyp-xc", *,
+                   agent: bool = True) -> str:
+    """Propose a hypothesis, activate it, start its agent (unless ``agent`` is False) and bring it to PLANNING_TEST."""
     ledger.record(investigation_id, [
         draft(CHIEF, HypothesisProposed(hypothesis_id=hypothesis_id, spec=hypothesis_spec(hypothesis_id))),
     ])
-    set_hypothesis_status(ledger, investigation_id, hypothesis_id,
-                          HypothesisStatus.SCREENED, HypothesisStatus.ACTIVE, HypothesisStatus.PLANNING_TEST)
+    set_hypothesis_status(ledger, investigation_id, hypothesis_id, HypothesisStatus.SCREENED, HypothesisStatus.ACTIVE)
+    if agent:
+        start_agent(ledger, investigation_id, hypothesis_id)
+    set_hypothesis_status(ledger, investigation_id, hypothesis_id, HypothesisStatus.PLANNING_TEST)
     return hypothesis_id
 
 
+def start_agent(ledger, investigation_id, hypothesis_id, role: str = "test specialist") -> Actor:
+    """Propose an agent for the hypothesis and start it by the researcher's command."""
+    proposal_id = f"prop-{hypothesis_id}-{len(ledger.load(investigation_id).proposals) + 1}"
+    ledger.record(investigation_id, [draft(CHIEF, AgentsProposed(
+        proposal_id=proposal_id, rationale="test", agents=(AgentSpec(hypothesis_id=hypothesis_id, role=role,
+                                                                     brief="test the hypothesis"),)))])
+    auth = authorize(ledger, investigation_id, PermissionAction.START_AGENTS, proposal_id,
+                     intervention_id=f"start-{proposal_id}")
+    agent_id = agent_id_for(ledger.load(investigation_id), hypothesis_id)
+    ledger.record(investigation_id, [draft(USER, AgentsStarted(
+        proposal_id=proposal_id, agent_ids={hypothesis_id: agent_id}, authorization_id=auth))])
+    return Actor(kind=ActorKind.HYPOTHESIS_AGENT, id=agent_id)
+
+
+def acting_for(ledger, investigation_id, hypothesis_id) -> Actor:
+    """The hypothesis's agent, or the Chief Scientist while it has none."""
+    agent = ledger.load(investigation_id).active_agent(hypothesis_id)
+    return Actor(kind=ActorKind.HYPOTHESIS_AGENT, id=agent.agent_id) if agent else CHIEF
+
+
 def set_hypothesis_status(ledger, investigation_id, hypothesis_id, *statuses, awaiting=()):
+    """Move a hypothesis as its agent would, or as the Chief Scientist while it has no agent."""
     for status in statuses:
-        ledger.record(investigation_id, [draft(AGENT, HypothesisStatusChanged(
+        actor = acting_for(ledger, investigation_id, hypothesis_id)
+        ledger.record(investigation_id, [draft(actor, HypothesisStatusChanged(
             hypothesis_id=hypothesis_id, status=status, reason="test",
             awaiting_calculation_ids=awaiting if status is HypothesisStatus.WAITING_FOR_JOB else (),
         ))])

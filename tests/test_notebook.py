@@ -137,7 +137,7 @@ def test_round_page_answers_from_the_record(pages):
     page = rendered["round-01.md"]
     tested = section(page, "What did we test?")
     assert f"**{ids['good']}** for [hyp-xc](hypotheses/hyp-xc.md)" in tested
-    assert "Why, by agent-1: “baseline at PBE”" in tested and "Varied: xc = PBE." in tested
+    assert "Why, by agent-hyp-xc: “baseline at PBE”" in tested and "Varied: xc = PBE." in tested
     assert f"**{ids['good']}** submitted to the scheduler as job 1001, authorized by approve-{ids['good']}" in tested
 
     observed = section(page, "What did we observe?")

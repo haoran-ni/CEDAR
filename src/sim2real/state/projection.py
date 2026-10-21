@@ -8,11 +8,17 @@ On a ``RuleViolation`` the state passed to ``apply`` must be discarded.
 """
 
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from enum import StrEnum
 
+from sim2real.contracts.agents import AgentSpec
 from sim2real.contracts.analysis import SCRIPT_CHECK_PREFIX, AnalysisOutcome, AnalysisRun, as_evidence_check
-from sim2real.contracts.base import ActorKind
+from sim2real.contracts.base import Actor, ActorKind
 from sim2real.contracts.events import (
+    AgentRetired,
     AgentRunRecorded,
+    AgentsProposed,
+    AgentsStarted,
     AgentTaskQueued,
     AnalysisRecorded,
     AssessmentRecorded,
@@ -69,7 +75,7 @@ EVENT_ACTORS: dict[type, frozenset[ActorKind]] = {
     UserInterventionRecorded: frozenset({_A.USER}),
     PlanRevised: frozenset({_A.USER, _A.CHIEF_SCIENTIST}),
     RoundStarted: frozenset({_A.CHIEF_SCIENTIST, _A.SYSTEM}),
-    HypothesisProposed: frozenset({_A.USER, _A.CHIEF_SCIENTIST, _A.HYPOTHESIS_AGENT}),
+    HypothesisProposed: frozenset({_A.USER, _A.CHIEF_SCIENTIST}),
     HypothesisStatusChanged: frozenset({_A.CHIEF_SCIENTIST, _A.HYPOTHESIS_AGENT, _A.SYSTEM}),
     PredictionRegistered: frozenset({_A.HYPOTHESIS_AGENT}),
     CalculationRequested: frozenset({_A.CHIEF_SCIENTIST, _A.HYPOTHESIS_AGENT}),
@@ -82,6 +88,9 @@ EVENT_ACTORS: dict[type, frozenset[ActorKind]] = {
     AssessmentRecorded: frozenset({_A.EVIDENCE_JUDGE}),
     AgentRunRecorded: frozenset({_A.CHIEF_SCIENTIST, _A.HYPOTHESIS_AGENT, _A.EVIDENCE_JUDGE}),
     AgentTaskQueued: frozenset({_A.USER, _A.CHIEF_SCIENTIST, _A.SYSTEM}),
+    AgentsProposed: frozenset({_A.CHIEF_SCIENTIST}),
+    AgentsStarted: frozenset({_A.USER, _A.SYSTEM}),
+    AgentRetired: frozenset({_A.USER, _A.CHIEF_SCIENTIST}),
 }
 """Who may record each event type. Nobody but the computing services moves a calculation."""
 
@@ -114,6 +123,7 @@ _OUTCOME_UNSEEN = frozenset({
     _C.SPECIFIED, _C.VALIDATED_INPUT, _C.SUBMISSION_PENDING, _C.SUBMITTED, _C.QUEUED, _C.RUNNING,
 })
 _CLOSED_HYPOTHESIS = frozenset({HypothesisStatus.DISCARDED, HypothesisStatus.SUPERSEDED})
+_NOT_YET_ACTIVE = frozenset({HypothesisStatus.PROPOSED, HypothesisStatus.SCREENED})
 
 
 @dataclass
@@ -205,16 +215,61 @@ class AnalysisRecord:
     round: int
 
 
+class ProposalStatus(StrEnum):
+    PENDING = "pending"
+    """Waiting for the researcher's review."""
+    STARTED = "started"
+    SUPERSEDED = "superseded"
+    """A newer proposal replaced it before it started."""
+
+
+@dataclass
+class ProposalRecord:
+    proposal_id: str
+    agents: tuple[AgentSpec, ...]
+    rationale: str
+    proposed_by: str
+    recorded_at: int
+    proposed_time: datetime
+    round: int
+    status: ProposalStatus = ProposalStatus.PENDING
+    feedback_ids: list[str] = field(default_factory=list)
+    """Researcher messages recorded while it waited; any one of them stops it starting by itself."""
+    closed_at: int | None = None
+    """Stream version at which it started or was superseded."""
+
+
+@dataclass
+class AgentRecord:
+    agent_id: str
+    hypothesis_id: str
+    spec: AgentSpec
+    proposal_id: str
+    started_at: int
+    started_by: Actor
+    authorization_id: str | None
+    """The researcher's command that started it; None if the review window passed."""
+    retired_at: int | None = None
+    retire_reason: str | None = None
+
+    @property
+    def active(self) -> bool:
+        return self.retired_at is None
+
+
 @dataclass
 class AgentTaskRecord:
     task_id: str
     role: str
-    hypothesis_id: str
+    hypothesis_id: str | None
+    agent_id: str | None
     instruction: str
     queued_by: str
     queued_at: int
     completed_by: int | None = None
     """Stream version of the run that carried it out."""
+    dropped_at: int | None = None
+    """Stream version at which its agent was retired before carrying it out."""
 
 
 @dataclass
@@ -245,10 +300,24 @@ class InvestigationState:
     analyses: dict[str, AnalysisRecord] = field(default_factory=dict)
     agent_runs: list[AgentRunRecord] = field(default_factory=list)
     tasks: dict[str, AgentTaskRecord] = field(default_factory=dict)
+    proposals: dict[str, ProposalRecord] = field(default_factory=dict)
+    agents: dict[str, AgentRecord] = field(default_factory=dict)
 
     @property
     def pending_tasks(self) -> list[AgentTaskRecord]:
-        return [t for t in self.tasks.values() if t.completed_by is None]
+        return [t for t in self.tasks.values() if t.completed_by is None and t.dropped_at is None]
+
+    @property
+    def pending_proposal(self) -> ProposalRecord | None:
+        """The proposal waiting for the researcher's review, if any; there is at most one."""
+        return next((p for p in self.proposals.values() if p.status is ProposalStatus.PENDING), None)
+
+    def active_agent(self, hypothesis_id: str) -> AgentRecord | None:
+        """The hypothesis's agent; a hypothesis has at most one active agent."""
+        return next((a for a in self.agents.values() if a.hypothesis_id == hypothesis_id and a.active), None)
+
+    def agent_tokens_used(self, agent_id: str) -> int:
+        return sum(_run_tokens(r.run) for r in self.agent_runs if r.actor_id == agent_id)
 
     @property
     def plan(self) -> ResearchPlan:
@@ -256,8 +325,7 @@ class InvestigationState:
 
     @property
     def model_tokens_used(self) -> int:
-        return sum(r.run.input_tokens + r.run.output_tokens + r.run.cache_read_tokens + r.run.cache_write_tokens
-                   for r in self.agent_runs)
+        return sum(_run_tokens(r.run) for r in self.agent_runs)
 
     @property
     def model_tokens_remaining(self) -> int | None:
@@ -274,6 +342,34 @@ class InvestigationState:
             self.spec.experiments[experiment].quantity,
             self.alignment,
         )
+
+
+def _run_tokens(run: AgentRunRecorded) -> int:
+    return run.input_tokens + run.output_tokens + run.cache_read_tokens + run.cache_write_tokens
+
+
+def review_deadline(state: InvestigationState, proposal: ProposalRecord) -> datetime:
+    """When proposed agents start by themselves if the researcher has not replied."""
+    return proposal.proposed_time + timedelta(minutes=state.spec.constraints.agent_review_minutes)
+
+
+def agent_id_for(state: InvestigationState, hypothesis_id: str) -> str:
+    """The id a new agent for the hypothesis gets: agent-<hypothesis>, numbered if one was retired."""
+    base = f"agent-{hypothesis_id}"[:120]
+    taken = set(state.agents)
+    if base not in taken:
+        return base
+    return next(f"{base}-{n}" for n in range(2, len(taken) + 3) if f"{base}-{n}" not in taken)
+
+
+def evidence_owner(state: InvestigationState, evidence: EvidenceObject) -> str | None:
+    """The hypothesis whose agent produced the evidence, if an agent did."""
+    if evidence.analysis_id is not None:
+        return state.analyses[evidence.analysis_id].hypothesis_id
+    reader = evidence.interpreted_by
+    if reader is not None and reader.id in state.agents:
+        return state.agents[reader.id].hypothesis_id
+    return None
 
 
 def reusable_calculation(state: InvestigationState, task_hash: str) -> str | None:
@@ -370,6 +466,15 @@ def _hypothesis(state: InvestigationState, hypothesis_id: str) -> HypothesisReco
         raise RuleViolation(f"unknown hypothesis {hypothesis_id}") from None
 
 
+def _require_own(state: InvestigationState, actor: Actor, hypothesis_id: str) -> None:
+    """A hypothesis agent acts only on its own hypothesis, and only while it is active."""
+    if actor.kind is not ActorKind.HYPOTHESIS_AGENT:
+        return
+    agent = state.agents.get(actor.id)
+    if agent is None or not agent.active or agent.hypothesis_id != hypothesis_id:
+        raise RuleViolation(f"{actor.id} is not the active agent of {hypothesis_id}")
+
+
 def _calculation(state: InvestigationState, calculation_id: str) -> CalculationRecord:
     try:
         return state.calculations[calculation_id]
@@ -410,6 +515,9 @@ def _on_intervention(state: InvestigationState, event: RecordedEvent, p: UserInt
     state.interventions[p.intervention_id] = InterventionRecord(
         p.intervention_id, p.text, p.authorizations, event.actor.id, event.stream_version
     )
+    proposal = state.pending_proposal
+    if proposal is not None and not p.authorizations:
+        proposal.feedback_ids.append(p.intervention_id)
 
 
 def _on_plan_revised(state: InvestigationState, event: RecordedEvent, p: PlanRevised) -> None:
@@ -442,6 +550,7 @@ def _on_hypothesis_proposed(state: InvestigationState, event: RecordedEvent, p: 
 
 def _on_hypothesis_status(state: InvestigationState, event: RecordedEvent, p: HypothesisStatusChanged) -> None:
     hyp = _hypothesis(state, p.hypothesis_id)
+    _require_own(state, event.actor, p.hypothesis_id)
     resuming = hyp.status in HYPOTHESIS_MACHINE.suspend
     status, resume_to = HYPOTHESIS_MACHINE.advance(hyp.status, p.status, hyp.resume_to)
     for calc_id in p.awaiting_calculation_ids:
@@ -459,6 +568,7 @@ def _on_hypothesis_status(state: InvestigationState, event: RecordedEvent, p: Hy
 
 def _on_prediction(state: InvestigationState, event: RecordedEvent, p: PredictionRegistered) -> None:
     hyp = _hypothesis(state, p.hypothesis_id)
+    _require_own(state, event.actor, p.hypothesis_id)
     if hyp.status in _CLOSED_HYPOTHESIS:
         raise RuleViolation(f"hypothesis {p.hypothesis_id} is {hyp.status}")
     if p.prediction_id in state.predictions:
@@ -486,6 +596,7 @@ def _on_calculation_requested(state: InvestigationState, event: RecordedEvent, p
     if state.status is not InvestigationStatus.INVESTIGATING:
         raise RuleViolation(f"calculations can only be requested while INVESTIGATING, not {state.status}")
     hyp = _hypothesis(state, p.hypothesis_id)
+    _require_own(state, event.actor, p.hypothesis_id)
     _require_can_add_test(state, hyp)
     if p.calculation_id in state.calculations:
         raise RuleViolation(f"calculation {p.calculation_id} already exists")
@@ -502,6 +613,7 @@ def _on_calculation_requested(state: InvestigationState, event: RecordedEvent, p
 def _on_calculation_linked(state: InvestigationState, event: RecordedEvent, p: CalculationLinked) -> None:
     calc = _calculation(state, p.calculation_id)
     hyp = _hypothesis(state, p.hypothesis_id)
+    _require_own(state, event.actor, p.hypothesis_id)
     _require_can_add_test(state, hyp)
     if p.hypothesis_id in calc.hypothesis_ids:
         raise RuleViolation(f"calculation {p.calculation_id} is already linked to {p.hypothesis_id}")
@@ -597,6 +709,9 @@ def _on_analysis(state: InvestigationState, event: RecordedEvent, p: AnalysisRec
         raise RuleViolation(f"analysis {p.analysis_id} already recorded")
     for staged in p.run.inputs:
         calc = _calculation(state, staged.calculation_id)
+        if p.hypothesis_id not in calc.hypothesis_ids:
+            raise RuleViolation(f"calculation {calc.calculation_id} is not linked to {p.hypothesis_id}; an analysis "
+                                "uses only its own hypothesis's runs")
         if calc.run_check is None:
             raise RuleViolation(f"the run of {calc.calculation_id} has not been checked; nothing to analyse yet")
         known = {**calc.examination.files, **calc.run_check.outputs}
@@ -615,6 +730,21 @@ def _require_healthy_for_validation(ev: EvidenceObject, calcs: list[CalculationR
             raise RuleViolation(f"cannot validate output of a job that ended {calc.scheduler_state}")
         if not calc.run_check.healthy:
             raise RuleViolation(f"cannot validate results of {calc.calculation_id}: its run failed checks")
+
+
+def _require_reader_owns(state: InvestigationState, ev: EvidenceObject, linked: list[CalculationRecord]) -> None:
+    """An agent's reading or analysis result concerns its own hypothesis's runs."""
+    reader = ev.interpreted_by
+    if reader is None or reader.kind is not ActorKind.HYPOTHESIS_AGENT:
+        return
+    agent = state.agents.get(reader.id)
+    if agent is None or not agent.active:
+        raise RuleViolation(f"{reader.id} is not an active agent")
+    if ev.analysis_id is not None:
+        if state.analyses[ev.analysis_id].hypothesis_id != agent.hypothesis_id:
+            raise RuleViolation(f"analysis {ev.analysis_id} was not run for {agent.hypothesis_id}")
+    elif any(agent.hypothesis_id not in calc.hypothesis_ids for calc in linked):
+        raise RuleViolation(f"{reader.id} reads only calculations linked to {agent.hypothesis_id}")
 
 
 def _on_evidence(state: InvestigationState, event: RecordedEvent, p: EvidenceRecorded) -> None:
@@ -649,6 +779,7 @@ def _on_evidence(state: InvestigationState, event: RecordedEvent, p: EvidenceRec
             raise RuleViolation(f"analysis evidence must carry exactly the checks the script reported for "
                                 f"{result.name}")
         linked = [state.calculations[c] for c in ev.calculation_ids]
+    _require_reader_owns(state, ev, linked)
     _require_healthy_for_validation(ev, linked)
     state.evidence[p.evidence_id] = EvidenceRecord(p.evidence_id, ev, event.stream_version, event.round)
     for calc in linked:
@@ -698,9 +829,19 @@ def _on_agent_task(state: InvestigationState, event: RecordedEvent, p: AgentTask
     _require_open(state)
     if p.task_id in state.tasks:
         raise RuleViolation(f"task {p.task_id} already exists")
-    _hypothesis(state, p.hypothesis_id)
-    state.tasks[p.task_id] = AgentTaskRecord(p.task_id, p.role, p.hypothesis_id, p.instruction, event.actor.id,
-                                             event.stream_version)
+    if p.role == "chief_scientist":
+        if event.actor.kind is not ActorKind.SYSTEM:
+            raise RuleViolation("only the dispatcher queues the Chief Scientist's reviews")
+    else:
+        _hypothesis(state, p.hypothesis_id)
+    if p.agent_id is not None:
+        agent = state.agents.get(p.agent_id)
+        if agent is None or not agent.active:
+            raise RuleViolation(f"no active agent {p.agent_id}")
+        if agent.hypothesis_id != p.hypothesis_id:
+            raise RuleViolation(f"{p.agent_id} works on {agent.hypothesis_id}, not {p.hypothesis_id}")
+    state.tasks[p.task_id] = AgentTaskRecord(p.task_id, p.role, p.hypothesis_id, p.agent_id, p.instruction,
+                                             event.actor.id, event.stream_version)
 
 
 def _on_agent_run(state: InvestigationState, event: RecordedEvent, p: AgentRunRecorded) -> None:
@@ -712,8 +853,74 @@ def _on_agent_run(state: InvestigationState, event: RecordedEvent, p: AgentRunRe
             raise RuleViolation(f"task {p.task_id} was already carried out")
         if task.role != p.role:
             raise RuleViolation(f"task {p.task_id} is for a {task.role}, not a {p.role}")
+        if task.agent_id is not None and event.actor.id != task.agent_id:
+            raise RuleViolation(f"task {p.task_id} is for {task.agent_id}, not {event.actor.id}")
+        if task.dropped_at is not None:
+            raise RuleViolation(f"task {p.task_id} was dropped when its agent was retired")
         task.completed_by = event.stream_version
     state.agent_runs.append(AgentRunRecord(p.session_id, p.role, event.actor.id, p, event.stream_version, event.round))
+
+
+def _require_can_have_agent(state: InvestigationState, hypothesis_id: str) -> None:
+    hyp = _hypothesis(state, hypothesis_id)
+    if hyp.status in _NOT_YET_ACTIVE or hyp.status in _CLOSED_HYPOTHESIS:
+        raise RuleViolation(f"hypothesis {hypothesis_id} is {hyp.status}; agents work on activated hypotheses")
+    agent = state.active_agent(hypothesis_id)
+    if agent is not None:
+        raise RuleViolation(f"hypothesis {hypothesis_id} already has an agent, {agent.agent_id}")
+
+
+def _on_agents_proposed(state: InvestigationState, event: RecordedEvent, p: AgentsProposed) -> None:
+    if state.status is not InvestigationStatus.INVESTIGATING:
+        raise RuleViolation(f"agents are proposed while INVESTIGATING, not {state.status}")
+    if p.proposal_id in state.proposals:
+        raise RuleViolation(f"proposal {p.proposal_id} already exists")
+    for spec in p.agents:
+        _require_can_have_agent(state, spec.hypothesis_id)
+    earlier = state.pending_proposal
+    if earlier is not None:
+        earlier.status, earlier.closed_at = ProposalStatus.SUPERSEDED, event.stream_version
+    state.proposals[p.proposal_id] = ProposalRecord(p.proposal_id, p.agents, p.rationale, event.actor.id,
+                                                    event.stream_version, event.occurred_at, event.round)
+
+
+def _on_agents_started(state: InvestigationState, event: RecordedEvent, p: AgentsStarted) -> None:
+    proposal = state.proposals.get(p.proposal_id)
+    if proposal is None or proposal.status is not ProposalStatus.PENDING:
+        raise RuleViolation(f"proposal {p.proposal_id} is not waiting to start")
+    if state.status is not InvestigationStatus.INVESTIGATING:
+        raise RuleViolation(f"agents start while INVESTIGATING, not {state.status}")
+    if event.actor.kind is ActorKind.USER:
+        _require_authorization(state, p.authorization_id, PermissionAction.START_AGENTS, p.proposal_id)
+    else:
+        if p.authorization_id is not None:
+            raise RuleViolation("only the researcher's own command starts agents early")
+        if proposal.feedback_ids:
+            raise RuleViolation(f"the researcher replied ({', '.join(proposal.feedback_ids)}); proposal "
+                                f"{p.proposal_id} waits for a revision or their command")
+        if event.occurred_at < review_deadline(state, proposal):
+            raise RuleViolation(f"proposal {p.proposal_id} is still in the researcher's review window")
+    if set(p.agent_ids) != {spec.hypothesis_id for spec in proposal.agents}:
+        raise RuleViolation("agents must start for exactly the proposed hypotheses")
+    ids = list(p.agent_ids.values())
+    if len(set(ids)) != len(ids) or set(ids) & set(state.agents):
+        raise RuleViolation("each new agent needs an id no agent has had")
+    for spec in proposal.agents:
+        _require_can_have_agent(state, spec.hypothesis_id)
+        agent_id = p.agent_ids[spec.hypothesis_id]
+        state.agents[agent_id] = AgentRecord(agent_id, spec.hypothesis_id, spec, p.proposal_id, event.stream_version,
+                                             event.actor, p.authorization_id)
+    proposal.status, proposal.closed_at = ProposalStatus.STARTED, event.stream_version
+
+
+def _on_agent_retired(state: InvestigationState, event: RecordedEvent, p: AgentRetired) -> None:
+    agent = state.agents.get(p.agent_id)
+    if agent is None or not agent.active:
+        raise RuleViolation(f"no active agent {p.agent_id}")
+    agent.retired_at, agent.retire_reason = event.stream_version, p.reason
+    for task in state.pending_tasks:
+        if task.agent_id == p.agent_id:
+            task.dropped_at = event.stream_version
 
 
 _HANDLERS = {
@@ -735,11 +942,14 @@ _HANDLERS = {
     AssessmentRecorded: _on_assessment,
     AgentTaskQueued: _on_agent_task,
     AgentRunRecorded: _on_agent_run,
+    AgentsProposed: _on_agents_proposed,
+    AgentsStarted: _on_agents_started,
+    AgentRetired: _on_agent_retired,
 }
 
 __all__ = [
-    "AnalysisRecord", "AssessmentEntry", "CalculationRecord", "EvidenceRecord", "HypothesisRecord", "InterventionRecord",
-    "InvestigationState", "PlanRecord", "PredictionRecord", "apply", "authorization_for", "calculation_with_inputs",
-    "hypothesis_evidence", "replay",
-    "reusable_calculation",
+    "AgentRecord", "AnalysisRecord", "AssessmentEntry", "CalculationRecord", "EvidenceRecord", "HypothesisRecord", "InterventionRecord",
+    "InvestigationState", "PlanRecord", "PredictionRecord", "ProposalRecord", "ProposalStatus", "agent_id_for", "apply",
+    "authorization_for", "calculation_with_inputs", "evidence_owner", "hypothesis_evidence", "replay",
+    "reusable_calculation", "review_deadline",
 ]

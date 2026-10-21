@@ -1,10 +1,11 @@
 """What the live panel shows, computed from the record without any terminal code.
 
 One row per hypothesis, with four separate statuses that must not be confused: the
-hypothesis's lifecycle, its agent's activity, its calculations' scheduler states, and the
-quality of their evidence, next to the Evidence Judge's assessment. Ages come from event
-times and the dispatcher's own reports; there are no progress percentages, because nothing
-measures progress.
+hypothesis's lifecycle, its agent's role and activity (or the agent proposed for it), its
+calculations' scheduler states, and the quality of their evidence, next to the Evidence
+Judge's assessment. Several agents can be working at once. Ages come from event times and
+the dispatcher's own reports; there are no progress percentages, because nothing measures
+progress.
 """
 
 from collections import Counter
@@ -25,6 +26,7 @@ from sim2real.state.projection import (
     hypothesis_evidence,
 )
 from sim2real.summaries import approval_requests
+from sim2real.swarm import minutes_left
 
 STALE_DISPATCHER_SECONDS = 600
 """A dispatcher silent for longer than this is reported as not running."""
@@ -96,28 +98,47 @@ def _times(events: Sequence[RecordedEvent]) -> dict[int, datetime]:
     return {e.stream_version: e.occurred_at for e in events}
 
 
+def _role(text: str, limit: int = 32) -> str:
+    return text if len(text) <= limit else text[:limit - 1] + "…"
+
+
 def agent_status(state: InvestigationState, hyp: HypothesisRecord, times: dict[int, datetime],
-                 activity: Activity | None, now: datetime) -> str:
+                 activities: Sequence[Activity], now: datetime) -> str:
     hid = hyp.hypothesis_id
-    if activity is not None and (activity.investigation_id, activity.hypothesis_id) == (state.investigation_id, hid):
-        who = "judge" if activity.role == "evidence_judge" else "agent"
-        step = f"; last step {activity.last_step}" if activity.last_step else ""
-        return f"{who} working for {age((now - activity.started_at).total_seconds())}{step}"
+    agent = state.active_agent(hid)
+    mine = [a for a in activities if (a.investigation_id, a.hypothesis_id) == (state.investigation_id, hid)]
+    if not mine and agent is None:
+        proposal = state.pending_proposal
+        spec = next((s for s in proposal.agents if s.hypothesis_id == hid), None) if proposal else None
+        if spec is not None:
+            if proposal.feedback_ids:
+                return f"proposed {_role(spec.role)}; held for your reply"
+            left = minutes_left(state, proposal, now)
+            return f"proposed {_role(spec.role)}; " + (f"starts in {age(left * 60)}" if left > 0 else "starting")
+        retired = [a for a in state.agents.values() if a.hypothesis_id == hid]
+        return "agent retired" if retired else "no agent"
+    name = _role(agent.spec.role) if agent else "agent"
+    for activity in mine:
+        if activity.role == "evidence_judge":
+            return f"judge working for {age((now - activity.started_at).total_seconds())}"
+    if mine:
+        step = f"; last step {mine[0].last_step}" if mine[0].last_step else ""
+        return f"{name}: working for {age((now - mine[0].started_at).total_seconds())}{step}"
     pending = [t for t in state.pending_tasks if t.hypothesis_id == hid]
     if pending:
-        who = "judge" if pending[0].role == "evidence_judge" else "agent"
-        return f"{who} queued {age((now - times[pending[0].queued_at]).total_seconds())} ago"
+        who = "judge" if pending[0].role == "evidence_judge" else name
+        return f"{who}: queued {age((now - times[pending[0].queued_at]).total_seconds())} ago"
     if hyp.status is HypothesisStatus.WAITING_FOR_JOB:
-        return "agent waiting for jobs"
+        return f"{name}: waiting for jobs"
     runs = [r for r in state.agent_runs if r.run.task_id and state.tasks[r.run.task_id].hypothesis_id == hid]
     if runs:
         last = runs[-1]
-        who = "judge" if last.role == "evidence_judge" else "agent"
-        return f"{who} last ran {age((now - times[last.recorded_at]).total_seconds())} ago ({last.run.outcome})"
-    return "no agent yet"
+        who = "judge" if last.role == "evidence_judge" else name
+        return f"{who}: last ran {age((now - times[last.recorded_at]).total_seconds())} ago ({last.run.outcome})"
+    return f"{name}: not run yet"
 
 
-def swarm_rows(state: InvestigationState, events: Sequence[RecordedEvent], activity: Activity | None,
+def swarm_rows(state: InvestigationState, events: Sequence[RecordedEvent], activities: Sequence[Activity],
                now: datetime) -> list[SwarmRow]:
     times = _times(events)
     rows = []
@@ -129,7 +150,7 @@ def swarm_rows(state: InvestigationState, events: Sequence[RecordedEvent], activ
             hypothesis_id=hyp.hypothesis_id,
             lifecycle=hyp.status.value,
             priority=state.plan.priority(hyp.hypothesis_id).value,
-            agent=agent_status(state, hyp, times, activity, now),
+            agent=agent_status(state, hyp, times, activities, now),
             jobs="; ".join(job_status(state, c) for c in calcs) or "none",
             evidence=", ".join(f"{n} {quality}" for quality, n in qualities.items()) or "none",
             assessment=f"{last.assessment.value} ({last.completeness.value.lower()})" if last else "NOT_TESTED",
@@ -137,15 +158,24 @@ def swarm_rows(state: InvestigationState, events: Sequence[RecordedEvent], activ
     return rows
 
 
-def dispatcher_status(heartbeat_age: float | None, activity: Activity | None, now: datetime) -> tuple[str, bool]:
+def dispatcher_status(heartbeat_age: float | None, activities: Sequence[Activity],
+                      now: datetime) -> tuple[str, bool]:
     """A short description of the dispatcher, and whether it needs the researcher's attention."""
     if heartbeat_age is None:
         return "no dispatcher has run: start `sim2real dispatch`", True
     if heartbeat_age > STALE_DISPATCHER_SECONDS:
         return f"dispatcher silent for {age(heartbeat_age)}: is `sim2real dispatch` running?", True
-    if activity is not None:
-        who = "Evidence Judge" if activity.role == "evidence_judge" else f"agent on {activity.hypothesis_id}"
-        return f"dispatcher running the {who}", False
+    if activities:
+        roles = Counter(a.role for a in activities)
+        parts = []
+        if roles["hypothesis_agent"]:
+            n = roles["hypothesis_agent"]
+            parts.append(f"{n} hypothesis agent{'s' if n > 1 else ''}")
+        if roles["evidence_judge"]:
+            parts.append("the Evidence Judge")
+        if roles["chief_scientist"]:
+            parts.append("the Chief Scientist's review")
+        return f"dispatcher running {' and '.join(parts)}", False
     return f"dispatcher seen {age(heartbeat_age)} ago", False
 
 
@@ -162,12 +192,20 @@ def work_summary(state: InvestigationState) -> str:
     return f"{n} hypothes{'is' if n == 1 else 'es'} · jobs: {jobs} · evidence: {evidence}"
 
 
-def status_line(state: InvestigationState) -> str:
+def status_line(state: InvestigationState, now: datetime) -> str:
     budget = state.spec.constraints.model_token_budget
     tokens = f"{state.model_tokens_used:,}" + (f" of {budget:,}" if budget else "")
     waiting = len(approval_requests(state))
+    agents = sum(a.active for a in state.agents.values())
     parts = [state.investigation_id, state.status.value, "setup" if state.round == 0 else f"round {state.round}",
-             f"plan v{state.plan_version}", f"{tokens} tokens"]
+             f"plan v{state.plan_version}", f"{agents} agent{'' if agents == 1 else 's'}", f"{tokens} tokens"]
+    proposal = state.pending_proposal
+    if proposal is not None:
+        n = len(proposal.agents)
+        left = minutes_left(state, proposal, now)
+        when = ("held for your reply" if proposal.feedback_ids else
+                f"start in {age(left * 60)} unless you reply" if left > 0 else "starting")
+        parts.append(f"{n} agent{'s' if n > 1 else ''} proposed: {when} (/agents)")
     if waiting:
         parts.append(f"{waiting} waiting for you (/pending)")
     return " · ".join(parts)

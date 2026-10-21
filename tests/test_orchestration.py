@@ -6,7 +6,7 @@ ScriptedModel and FakeScheduler TEST DOUBLES on a SYNTHETIC site; no model or jo
 import fcntl
 import subprocess
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 from sites import aims_output, co_on_cu111, declared, geometry_text
@@ -53,18 +53,33 @@ class Clients:
         return []
 
 
-def make_system(tmp_path, site):
-    workspace = Workspace.open(tmp_path / "data")
+class Clock:
+    """The time for the record, the chat and the dispatcher alike; tests move it on (TEST DOUBLE)."""
+
+    def __init__(self, now: datetime = NOW):
+        self.now = now
+
+    def __call__(self) -> datetime:
+        return self.now
+
+    def advance(self, **delta) -> None:
+        self.now += timedelta(**delta)
+
+
+def make_system(tmp_path, site, *, reviews: bool = False, max_agents: int = 4):
+    """The whole system on TEST DOUBLES; the Chief Scientist's background reviews only if ``reviews``."""
+    clock = Clock()
+    workspace = Workspace.open(tmp_path / "data", clock=clock)
     profiles = ProfileStore(tmp_path / "config" / "profiles")
     profiles.save(site)
     profiles.approve(site.name, "researcher", NOW)
     scheduler = FakeScheduler()
     clients = Clients()
-    chat = ChatSession(workspace, profiles, clients, backend=scheduler, clock=lambda: NOW)
+    chat = ChatSession(workspace, profiles, clients, backend=scheduler, clock=clock)
     dispatcher = Dispatcher(workspace, profiles, clients, backend=scheduler, deny=[tmp_path / "config"],
-                            clock=lambda: NOW)
+                            clock=clock, chief_reviews=reviews, max_agents=max_agents)
     return {"workspace": workspace, "profiles": profiles, "scheduler": scheduler, "clients": clients, "chat": chat,
-            "dispatcher": dispatcher, "site": site}
+            "dispatcher": dispatcher, "site": site, "clock": clock}
 
 
 @pytest.fixture
@@ -76,7 +91,11 @@ def call(name, **arguments):
     return ToolCall(id=f"{name}-{len(arguments)}-{abs(hash(str(arguments))) % 10_000}", name=name, arguments=arguments)
 
 
+ROLE = "exchange-correlation specialist"
+
+
 def open_and_delegate(site, budget=1_000_000):
+    """The Chief opens the investigation, proposes and activates a hypothesis, and proposes its agent."""
     return reply(
         call("open_investigation", investigation_id=INV, title="CO/Cu(111) adsorption site (synthetic test)",
              question="Why does the computed site preference differ from the observed one?",
@@ -98,8 +117,18 @@ def open_and_delegate(site, budget=1_000_000):
              falsifiers=["Correcting frontier orbitals leaves the site ordering unchanged."]),
         call("set_hypothesis_status", hypothesis_id=HYP, status="SCREENED", reason="testable"),
         call("set_hypothesis_status", hypothesis_id=HYP, status="ACTIVE", reason="cheap first test"),
-        call("delegate", hypothesis_id=HYP, instruction="Compute a PBE baseline total energy for CO atop."),
+        call("propose_agents", rationale="one cheap baseline first",
+             agents=[{"hypothesis_id": HYP, "role": ROLE,
+                      "brief": "Compute a PBE baseline total energy for CO atop."}]),
     )
+
+
+def open_and_start(system, budget=1_000_000, answer="ok"):
+    """The researcher describes the problem, the Chief opens the investigation, the researcher starts its agent."""
+    system["clients"].add("chief_scientist", open_and_delegate(system["site"], budget), reply(TextPart(text=answer)))
+    said = system["chat"].handle("Investigate CO on Cu(111).")
+    assert system["chat"].handle("/approve agents").startswith(f"Started agent-{HYP} on {HYP}")
+    return said
 
 
 def latest_calc(workspace):
@@ -159,14 +188,21 @@ def test_full_loop(system):
     workspace, chat, dispatcher, clients = system["workspace"], system["chat"], system["dispatcher"], system["clients"]
     scheduler = system["scheduler"]
 
-    # The researcher describes the problem; the Chief opens the investigation and delegates.
-    clients.add("chief_scientist", open_and_delegate(system["site"]), reply(TextPart(text="Opened and delegated.")))
-    assert chat.handle("PBE puts CO in the fcc hollow on Cu(111); experiments see atop.") == "Opened and delegated."
+    # The researcher describes the problem; the Chief opens the investigation and proposes an agent.
+    clients.add("chief_scientist", open_and_delegate(system["site"]), reply(TextPart(text="Opened; agent proposed.")))
+    assert chat.handle("PBE puts CO in the fcc hollow on Cu(111); experiments see atop.") == "Opened; agent proposed."
     state = workspace.ledger.load(INV)
     assert chat.investigation_id == INV and state.status is InvestigationStatus.INVESTIGATING
     assert state.interventions["msg-1"].text.startswith("PBE puts CO")
     assert state.interventions["msg-1"].actor_id == chat.user.id
-    assert [r.role for r in state.agent_runs] == ["chief_scientist"] and len(state.pending_tasks) == 1
+    assert [r.role for r in state.agent_runs] == ["chief_scientist"] and state.pending_tasks == []
+    assert any("/approve agents" in n.text and "unless you reply" in n.text for n in chat.notices())
+
+    # The researcher starts the proposed agent at once instead of waiting out the review window.
+    assert chat.handle("/approve agents") == (f"Started agent-{HYP} on {HYP} (msg-2). The dispatcher runs their "
+                                              "first tasks.")
+    (task,) = workspace.ledger.load(INV).pending_tasks
+    assert task.agent_id == f"agent-{HYP}" and "PBE baseline" in task.instruction
 
     # The dispatcher runs the hypothesis agent; nothing is submitted without authorization.
     clients.add("hypothesis_agent", *agent_requests(system))
@@ -176,8 +212,8 @@ def test_full_loop(system):
     calc = latest_calc(workspace)
     assert workspace.ledger.load(INV).calculations[calc].state is CalculationState.VALIDATED_INPUT
     assert scheduler.submissions == [] and heartbeat_age(workspace, NOW) == 0
-    notices = chat.notices()
-    assert any("Requested the PBE baseline" in n for n in notices)
+    notices = [n.text for n in chat.notices()]
+    assert any(f"agent-{HYP} ({ROLE})" in n and "Requested the PBE baseline" in n for n in notices)
     assert any(f"/approve submit {calc}" in n for n in notices)
 
     # The researcher authorizes; the dispatcher submits; the job finishes.
@@ -213,7 +249,7 @@ def test_full_loop(system):
     assert state.hypotheses[HYP].assessment is Assessment.INCONCLUSIVE
     assert state.pending_tasks == []
     assert {r.role for r in state.agent_runs} == {"chief_scientist", "hypothesis_agent", "evidence_judge"}
-    assert state.interventions["msg-2"].authorizations[0].target_ids == (calc,)
+    assert state.interventions["msg-3"].authorizations[0].target_ids == (calc,)
     dossier_view = clients.models["evidence_judge"].calls[1].messages[-1].parts[0].content
     assert "Prediction pred-1" in dossier_view and "check citations_verified: passed" in dossier_view
     assert replay(workspace.store.read_stream(INV)) == state
@@ -230,8 +266,7 @@ def test_full_loop(system):
 def test_commands_need_an_open_investigation_and_known_calculations(system):
     chat = system["chat"]
     assert "No investigation is open" in chat.handle("/status")
-    system["clients"].add("chief_scientist", open_and_delegate(system["site"]), reply(TextPart(text="ok")))
-    chat.handle("Investigate CO on Cu(111).")
+    open_and_start(system)
     assert INV in chat.handle("/status")
     assert "No calculation calc_x" in chat.handle("/approve submit calc_x")
     assert "Unknown or incomplete command" in chat.handle("/approve")
@@ -240,17 +275,16 @@ def test_commands_need_an_open_investigation_and_known_calculations(system):
 
 def test_on_hold_hypotheses_are_not_submitted(system):
     workspace, chat, dispatcher, clients = system["workspace"], system["chat"], system["dispatcher"], system["clients"]
-    clients.add("chief_scientist", open_and_delegate(system["site"]), reply(TextPart(text="ok")))
-    chat.handle("Investigate CO on Cu(111).")
+    open_and_start(system)
     clients.add("hypothesis_agent", *agent_requests(system))
     dispatcher.tick()
     calc = latest_calc(workspace)
     chat.handle(f"/approve submit {calc}")
     clients.add("chief_scientist", reply(call("revise_plan", reason="researcher paused XC work",
-                                              intervention_id="msg-3", priorities={HYP: "on_hold"})),
+                                              intervention_id="msg-4", priorities={HYP: "on_hold"})),
                 reply(TextPart(text="XC work is on hold.")))
     chat.handle("Hold the XC work for now.")
-    assert workspace.ledger.load(INV).plans[-1].intervention_id == "msg-3"
+    assert workspace.ledger.load(INV).plans[-1].intervention_id == "msg-4"
     assert not any("submitted" in n for n in dispatcher.tick())
     assert system["scheduler"].submissions == []
 
@@ -263,8 +297,7 @@ def test_on_hold_hypotheses_are_not_submitted(system):
 def test_spent_token_budget_leaves_queued_work_waiting(system):
     workspace, chat, dispatcher, clients = system["workspace"], system["chat"], system["dispatcher"], system["clients"]
     # Each scripted reply reports 15 tokens; the Chief's two replies spend the whole budget of 30.
-    clients.add("chief_scientist", open_and_delegate(system["site"], budget=30), reply(TextPart(text="ok")))
-    chat.handle("Investigate CO on Cu(111).")
+    open_and_start(system, budget=30)
     state = workspace.ledger.load(INV)
     assert state.model_tokens_remaining == 0 and len(state.pending_tasks) == 1
     notes = dispatcher.tick()
@@ -274,8 +307,7 @@ def test_spent_token_budget_leaves_queued_work_waiting(system):
 
 def test_the_dispatcher_checks_every_finished_run(system):
     workspace, chat, dispatcher, clients = system["workspace"], system["chat"], system["dispatcher"], system["clients"]
-    clients.add("chief_scientist", open_and_delegate(system["site"]), reply(TextPart(text="ok")))
-    chat.handle("Investigate CO on Cu(111).")
+    open_and_start(system)
     clients.add("hypothesis_agent", *agent_requests(system))
     dispatcher.tick()
     calc = latest_calc(workspace)
@@ -310,8 +342,7 @@ def test_a_second_dispatcher_waits_for_the_first(system):
 
 def test_only_the_researcher_authorizes(system):
     chat, clients = system["chat"], system["clients"]
-    clients.add("chief_scientist", open_and_delegate(system["site"]), reply(TextPart(text="ok")))
-    chat.handle("Investigate CO on Cu(111).")
+    open_and_start(system)
     context = ChiefContext(ledger=system["workspace"].ledger, profiles=system["profiles"], registry_for=lambda n: None,
                            actor=CHIEF)
     names = {tool.name for tool in chief_tools(context)}
@@ -344,7 +375,7 @@ def test_cli_start_and_dispatch(system, monkeypatch, capsys, tmp_path):
     monkeypatch.setattr(cli, "_profiles", lambda: system["profiles"])
     monkeypatch.setattr(cli, "_model_clients", lambda: clients)
     clients.add("chief_scientist", open_and_delegate(system["site"]), reply(TextPart(text="Opened and delegated.")))
-    lines = iter(["Investigate CO on Cu(111).", "/status", "/quit"])
+    lines = iter(["Investigate CO on Cu(111).", "/approve agents", "/status", "/quit"])
     monkeypatch.setattr("builtins.input", lambda prompt: next(lines))
     assert cli.main(["start"]) == 0
     out = capsys.readouterr().out
@@ -354,7 +385,7 @@ def test_cli_start_and_dispatch(system, monkeypatch, capsys, tmp_path):
     cli.main(["investigations"])
     assert f"{INV}: INVESTIGATING; 1 hypotheses" in capsys.readouterr().out
     clients.add("hypothesis_agent", *agent_requests(system))
-    monkeypatch.setattr(cli, "_make_dispatcher", lambda: system["dispatcher"])
+    monkeypatch.setattr(cli, "_make_dispatcher", lambda agents=4: system["dispatcher"])
     assert cli.main(["dispatch", "--once"]) == 0
     assert "hypothesis_agent ran" in capsys.readouterr().out
 
@@ -372,8 +403,7 @@ def test_cli_start_and_dispatch(system, monkeypatch, capsys, tmp_path):
 
 def test_dispatcher_describes_the_agent_run_in_progress(system):
     workspace, chat, dispatcher, clients = system["workspace"], system["chat"], system["dispatcher"], system["clients"]
-    clients.add("chief_scientist", open_and_delegate(system["site"]), reply(TextPart(text="ok")))
-    chat.handle("Investigate CO on Cu(111).")
+    open_and_start(system)
     seen = []
 
     def look(_request):
@@ -382,28 +412,27 @@ def test_dispatcher_describes_the_agent_run_in_progress(system):
 
     clients.add("hypothesis_agent", reply(call("investigation_overview")), look)
     dispatcher.tick()
-    (activity,) = seen
+    ((activity,),) = seen
     assert (activity.investigation_id, activity.hypothesis_id, activity.role) == (INV, HYP, "hypothesis_agent")
+    assert activity.agent_id == f"agent-{HYP}"
     assert activity.last_step == "investigation_overview" and activity.started_at == NOW
-    assert current_activity(workspace) is None and heartbeat_age(workspace, NOW) == 0
+    assert current_activity(workspace) == [] and heartbeat_age(workspace, NOW) == 0
 
 
 def test_calculations_can_be_named_by_a_unique_start_of_their_id(system):
     workspace, chat, dispatcher, clients = system["workspace"], system["chat"], system["dispatcher"], system["clients"]
-    clients.add("chief_scientist", open_and_delegate(system["site"]), reply(TextPart(text="ok")))
-    chat.handle("Investigate CO on Cu(111).")
+    open_and_start(system)
     clients.add("hypothesis_agent", *agent_requests(system))
     dispatcher.tick()
     calc = latest_calc(workspace)
     assert chat.handle(f"/approve submit {calc[5:8]}") == f"No calculation {calc[5:8]} in this investigation."
     assert "authorized" in chat.handle(f"/approve submit {calc[:12]}")
-    assert workspace.ledger.load(INV).interventions["msg-2"].authorizations[0].target_ids == (calc,)
+    assert workspace.ledger.load(INV).interventions["msg-3"].authorizations[0].target_ids == (calc,)
 
 
 def test_reports_that_arrive_during_a_chief_turn_are_still_shown(system):
     chat, dispatcher, clients = system["chat"], system["dispatcher"], system["clients"]
-    clients.add("chief_scientist", open_and_delegate(system["site"]), reply(TextPart(text="ok")))
-    chat.handle("Investigate CO on Cu(111).")
+    open_and_start(system)
     clients.add("hypothesis_agent", *agent_requests(system))
 
     def answer_while_the_dispatcher_works(_request):
@@ -412,7 +441,7 @@ def test_reports_that_arrive_during_a_chief_turn_are_still_shown(system):
 
     clients.add("chief_scientist", answer_while_the_dispatcher_works)
     assert chat.handle("Any news?") == "Noted."
-    notices = chat.notices()
+    notices = [n.text for n in chat.notices()]
     assert any("Requested the PBE baseline" in n for n in notices)
     assert sum("[waiting for you]" in n for n in notices) == 1
     assert chat.notices() == []  # each report and each request for approval is shown once

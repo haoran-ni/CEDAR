@@ -18,8 +18,8 @@ This file is the **primary repository-wide implementation contract**. Read the s
 
 1. **Investigate simulation–experiment discrepancies.** Given simulation outputs, experimental measurements, uncertainties, sample/measurement conditions, and a research question, identify the *actual quantities being compared*. Diagnose definition mismatches before attributing residual differences to physics.
 2. **Generate multiple causal explanations.** Construct a set of competing or compatible, physically motivated, *falsifiable* hypotheses. Do not assume that one explanation must win or that additive contributions are identifiable.
-3. **Instantiate a dynamic hypothesis swarm.** Allocate investigation agents by hypothesis; their count, specialization, tools, and lifetimes depend on the question and budget. No predefined XC/temperature/coverage swarm is mandatory.
-4. **Run independent, parallel investigations.** Agents propose predictions and tests, gather evidence, challenge their own claims, and return structured reports; deliberate cross-examination can follow initial independent assessment.
+3. **Instantiate a dynamic hypothesis swarm.** Allocate investigation agents by hypothesis; their count, specialization, tools, and lifetimes depend on the question and budget. No predefined XC/temperature/coverage swarm is mandatory. The Chief Scientist decides which agents to create, at most one per hypothesis, and the role each plays; the researcher sees the proposal and can reply before the agents start, and if they do not reply within the review window (10 minutes) the agents start.
+4. **Run independent, parallel investigations.** Agents propose predictions and tests, gather evidence, challenge their own claims, and return structured reports. They work at the same time and cannot see each other's work. The Chief Scientist collects and analyzes their results; deliberate cross-examination goes through it.
 5. **Examine everything agents write before it runs.** Agents may write DFT inputs and job scripts themselves, or ask protocol tools to generate them. Nothing runs unexamined: deterministic protocol tools check every input file and job script against the declared task and the protocol's policy before submission, and anything the tools cannot verify requires explicit user approval. Agents may also read raw output files directly to interpret results, and write their own analysis scripts to compute any quantity from them. A value printed in an output must cite the file and lines it came from; a computed value must come from an analysis script that the system ran on hashed copies of the outputs, on the login node under guards (it can never start programs, so never DFT), and recorded with its inputs. Either becomes validated evidence only after protocol tools have checked the run's health and verified the citation or recorded the analysis. Analysis scripts must be correct and safe; independent review of them by other agents is a planned second layer.
 6. **Support durable asynchronous computation.** Hypothesis agents should relinquish their runtime after submitting long-running jobs. An independent monitor and event dispatcher resume work when jobs finish; an open chat or terminal is NOT required for jobs to progress.
 7. **Keep a continuously accessible Chief Scientist conversation.** The Chief Scientist plans, supervises, explains, accepts real-time user instructions, and coordinates research. It does not personally execute DFT, phonons, MLIP, shell commands, or other scientific calculations.
@@ -58,6 +58,7 @@ Responsibilities:
 - Inspect research state and explain which hypotheses have been generated, which jobs are pending/running/completed/failed, which evidence has passed validation, and what remains unresolved.
 - Create/revise the high-level research plan; coordinate hypothesis generation, screening, priority, dependency graphs, budgets, checkpoints, approvals, and phase transitions.
 - Delegate to specialist agents or orchestration tools. Propose and handle new, paused, combined, discarded, or revived hypotheses in response to evidence or user direction.
+- Propose the hypothesis agents and their roles for the researcher's review; collect, compare and analyze what they report.
 - Consult Evidence Judge for scientific synthesis and Research Recorder for traceable history.
 - Accept user intervention without resetting unrelated work, e.g., “pause new coverage tests, prioritize XC” while active calculations remain unless explicitly cancelled.
 
@@ -71,7 +72,7 @@ Before allocating agents:
 2. Produce distinct candidate mechanisms with physical rationale.
 3. For each, specify predicted discriminating observations, possible falsifiers, known dependencies, required data/protocols, and costs.
 4. Merge duplicates; recognize interacting mechanisms; prioritize feasible and informative tasks.
-5. Instantiate as many hypothesis-specific agents as warranted—not a fixed roster, and not necessarily one agent per low-value hypothesis.
+5. Instantiate as many hypothesis-specific agents as warranted—not a fixed roster: at most one agent per hypothesis, and not necessarily one for a low-value hypothesis. The Chief Scientist proposes them; the researcher reviews the proposal, and any reply holds it until the Chief Scientist revises it.
 
 Specializations (XC, thermal, coverage, surface-defect, numerics, kinetics, quasiparticle, excitonic, vibrational, spectroscopy, etc.) are **examples**, not permanently resident workers. A generic typed `HypothesisAgent` may be configured dynamically with a hypothesis, scope, allowed tools, budget, and constraints. New interactions may merit additional agents after evidence appears.
 
@@ -87,7 +88,7 @@ For each investigation cycle:
 6. **Challenge:** identify counterevidence, alternative hypotheses, confounders and failure of method applicability.
 7. **Report:** emit a typed, evidence-linked report with uncertainty, conclusion status, limitations, and next recommendations.
 
-Agents initially investigate independently; after their first reports, a structured critique/debate round may expose confounders, contradictions, or mechanisms that interact. All useful updates persist. Agents must not simply repeat their prior textual conclusions as evidence.
+Agents investigate independently and cannot see each other's work. The Chief Scientist collects their reports and compares them across hypotheses; it exposes confounders, contradictions, or mechanisms that interact, and passes on to an agent another's finding when its test needs it. A structured critique round, if added, also goes through the Chief Scientist. All useful updates persist. Agents must not simply repeat their prior textual conclusions as evidence.
 
 ### 3.4 Evidence Judge / synthesis service
 

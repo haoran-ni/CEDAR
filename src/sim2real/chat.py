@@ -1,9 +1,14 @@
 """The conversation with the Chief Scientist, independent of any terminal interface.
 
 Every researcher message is recorded verbatim as a user intervention once an investigation
-is open (messages sent before it opens are recorded right after). Slash commands are
-handled here, not by a model: authorizations to submit, approve inputs or cancel can only
-come from the researcher's own command.
+is open (messages sent before it opens are recorded right after). A message sent while
+proposed agents wait for review holds them until the Chief Scientist proposes again. Slash
+commands are handled here, not by a model: authorizations to submit, approve inputs,
+cancel or start agents early can only come from the researcher's own command.
+
+The Chief Scientist also reviews the agents' reports in the background, in a conversation
+of its own; what it concluded is shown here, and passed to it at the start of its next
+turn in this conversation.
 
 Commands may run while the Chief Scientist is still working on an earlier message (the
 terminal interface does this); every record they make is built from the state at the
@@ -28,13 +33,15 @@ from sim2real.hpc.profile import ProfileStore
 from sim2real.hpc.slurm import SchedulerBackend
 from sim2real.models.types import ToolCall
 from sim2real.notebook import round_file, update_notebook
-from sim2real.state.projection import InvestigationState
+from sim2real.state.projection import AgentRunRecord, InvestigationState
 from sim2real.summaries import approval_requests, investigation_summary, pending_approvals
+from sim2real.swarm import CHIEF, agent_label, agents_summary, start_drafts
 from sim2real.workspace import ModelClients, Workspace, profile_for, registry_for, services_for
 
-CHIEF = Actor(kind=ActorKind.CHIEF_SCIENTIST, id="chief-scientist")
 HELP = """Commands:
   /status                      the investigation's state
+  /agents                      the hypothesis agents, and any the Chief Scientist proposes
+  /approve agents              start the proposed agents now instead of after the review window
   /pending                     what waits for your approval
   /approve submit <calc>       allow a calculation with approved inputs to be submitted
   /approve inputs <calc>       allow inputs the examiner could not verify
@@ -43,7 +50,21 @@ HELP = """Commands:
   /report                      update the research notebook and show where it is
   /help                        this list
   /quit                        leave (queued work and jobs continue with the dispatcher)
-Anything else goes to the Chief Scientist."""
+Anything else goes to the Chief Scientist. A message sent while agents are proposed holds them
+until the Chief Scientist proposes again."""
+
+
+@dataclass(frozen=True)
+class Notice:
+    """Something that happened while the researcher was not looking."""
+
+    text: str
+    review: bool = False
+    """The Chief Scientist's background review, shown as its message."""
+
+
+def _is_review(run: AgentRunRecord) -> bool:
+    return run.role == "chief_scientist" and run.run.task_id is not None
 
 
 @dataclass
@@ -60,6 +81,7 @@ class ChatSession:
     _unrecorded_runs: list[RunResult] = field(default_factory=list)
     _seen_runs: int = 0
     _shown_approvals: set[str] = field(default_factory=set)
+    _shown_starts: set[str] = field(default_factory=set)
     chief_session: str = ""
 
     def __post_init__(self) -> None:
@@ -69,9 +91,11 @@ class ChatSession:
             # or the Chief's last reply.
             self._seen_runs = max(
                 [i.recorded_at for i in state.interventions.values()]
-                + [r.recorded_at for r in state.agent_runs if r.role == "chief_scientist"], default=0)
-            chief_runs = [r for r in state.agent_runs if r.role == "chief_scientist"]
-            self.chief_session = chief_runs[-1].session_id if chief_runs else f"{self.investigation_id}.chief"
+                + [r.recorded_at for r in state.agent_runs if r.role == "chief_scientist" and not _is_review(r)],
+                default=0)
+            chats = [r for r in state.agent_runs if r.role == "chief_scientist" and not _is_review(r)]
+            self.chief_session = chats[-1].session_id if chats else f"{self.investigation_id}.chief"
+            self._shown_starts = set(state.agents)
         else:
             self.chief_session = f"chief-{self.clock():%Y%m%d%H%M%S}"
 
@@ -100,6 +124,10 @@ class ChatSession:
         state = self.workspace.ledger.load(self.investigation_id)
         if name == "/status":
             return investigation_summary(state)
+        if name == "/agents":
+            return agents_summary(state, self.clock())
+        if name == "/approve" and args == ["agents"]:
+            return self._start_agents(line)
         if name == "/pending":
             return "\n".join(pending_approvals(state)) or "Nothing waits for your approval."
         if name == "/report":
@@ -141,6 +169,29 @@ class ChatSession:
             return f"Inputs of {calculation_id} approved ({intervention}). They still need /approve submit to run."
         return f"Submission of {calculation_id} authorized ({intervention}). The dispatcher submits it on its next tick."
 
+    def _start_agents(self, line: str) -> str:
+        found = []
+
+        def build(state: InvestigationState) -> list[EventDraft]:
+            proposal = state.pending_proposal
+            if proposal is None:
+                return []
+            message = self._message_draft(state, line, (Authorization(action=PermissionAction.START_AGENTS,
+                                                                      target_ids=(proposal.proposal_id,)),))
+            found[:] = [message.payload.intervention_id]
+            return [message, *start_drafts(state, proposal, self.user, message.payload.intervention_id)]
+
+        try:
+            result = self.workspace.ledger.record_with(self.investigation_id, build)
+        except RuleViolation as exc:
+            return f"The proposed agents could not start: {exc}"
+        if not found:
+            return "No agents are waiting to start."
+        (message_id,) = found
+        started = result.events[1].payload.agent_ids
+        return (f"Started {', '.join(f'{a} on {h}' for h, a in started.items())} ({message_id}). The dispatcher runs "
+                "their first tasks.")
+
     def _cancel(self, given: str, reason: str, line: str) -> str:
         state = self.workspace.ledger.load(self.investigation_id)
         calculation_id, problem = self._find_calculation(state, given)
@@ -160,13 +211,13 @@ class ChatSession:
     def _ask_chief(self, text: str, observer: Callable[[ToolCall, ToolOutcome], None] | None = None) -> str:
         if self.investigation_id is not None:
             message_id = self._record_message(text)
-            instruction = f"[researcher, recorded as {message_id}] {text}"
+            instruction = self._reviews_since_last_turn() + f"[researcher, recorded as {message_id}] {text}"
         else:
             self._unrecorded_messages.append(text)
             instruction = f"[researcher] {text}"
         context = ChiefContext(ledger=self.workspace.ledger, profiles=self.profiles, actor=CHIEF,
                                registry_for=lambda name: registry_for(self.profiles.load_approved(name)),
-                               investigation_id=self.investigation_id, on_open=self._opened)
+                               investigation_id=self.investigation_id, on_open=self._opened, clock=self.clock)
         settings = self.clients.settings("chief_scientist")
         runner = AgentRunner(self.clients.client("chief_scientist"), settings, self.workspace.transcripts,
                              secrets=self.clients.secrets())
@@ -184,6 +235,15 @@ class ChatSession:
             reply += f"\n[the Chief Scientist stopped: {result.outcome}{': ' + result.error if result.error else ''}]"
         return reply.strip()
 
+    def _reviews_since_last_turn(self) -> str:
+        """The Chief Scientist's background reviews this conversation has not seen (the last three), so it answers
+        knowing them."""
+        state = self.workspace.ledger.load(self.investigation_id)
+        last = max((r.recorded_at for r in state.agent_runs if r.session_id == self.chief_session), default=0)
+        reviews = [r for r in state.agent_runs if _is_review(r) and r.recorded_at > last and r.run.report][-3:]
+        return "".join(f"[record: your background review of the agents' reports, run {r.run.outcome}, concluded]\n"
+                       f"{r.run.report.strip()}\n\n" for r in reviews)
+
     def _opened(self, investigation_id: str) -> list[str]:
         """Record the messages sent before the investigation existed, in order, as soon as it does."""
         self.investigation_id = investigation_id
@@ -191,34 +251,52 @@ class ChatSession:
         self._unrecorded_messages.clear()
         return recorded
 
+    def _message_draft(self, state: InvestigationState, text: str,
+                       authorizations: tuple[Authorization, ...] = ()) -> EventDraft:
+        # Numbered from the state the event is appended to, so concurrent writers never collide.
+        message_id = f"msg-{1 + sum(1 for i in state.interventions if i.startswith('msg-'))}"
+        return EventDraft(actor=self.user, payload=UserInterventionRecorded(
+            intervention_id=message_id, text=text, authorizations=authorizations))
+
     def _record_message(self, text: str, authorizations: tuple[Authorization, ...] = ()) -> str:
         message_id = []
 
         def build(state: InvestigationState) -> list[EventDraft]:
-            # Numbered from the state the event is appended to, so concurrent writers never collide.
-            message_id[:] = [f"msg-{1 + sum(1 for i in state.interventions if i.startswith('msg-'))}"]
-            return [EventDraft(actor=self.user, payload=UserInterventionRecorded(
-                intervention_id=message_id[0], text=text, authorizations=authorizations))]
+            draft = self._message_draft(state, text, authorizations)
+            message_id[:] = [draft.payload.intervention_id]
+            return [draft]
 
         self.workspace.ledger.record_with(self.investigation_id, build)
         return message_id[0]
 
     # -- what happened meanwhile ----------------------------------------------------------------
 
-    def notices(self) -> list[str]:
-        """Agent reports that arrived since the researcher last looked, and each request for
-        approval the first time it is seen."""
+    def notices(self) -> list[Notice]:
+        """What arrived since the researcher last looked: agent reports, the Chief Scientist's reviews,
+        agents that started, and each request for approval the first time it is seen."""
         if self.investigation_id is None:
             return []
         state = self.workspace.ledger.load(self.investigation_id)
-        fresh = [r for r in state.agent_runs if r.recorded_at > self._seen_runs and r.role != "chief_scientist"]
+        fresh = [r for r in state.agent_runs if r.recorded_at > self._seen_runs
+                 and (r.role != "chief_scientist" or _is_review(r))]
         self._seen_runs = state.version
-        lines = []
+        notices = []
+        for agent in state.agents.values():  # the researcher's own /approve agents already said who started
+            if agent.agent_id not in self._shown_starts and agent.authorization_id is None:
+                notices.append(Notice(f"[agent started after the review window, with no reply] {agent_label(agent)} "
+                                      f"on {agent.hypothesis_id}"))
+            self._shown_starts.add(agent.agent_id)
         for run in fresh:
+            if _is_review(run):
+                notices.append(Notice((run.run.report or f"(the review ended {run.run.outcome} without a "
+                                                         "message)").strip(), review=True))
+                continue
+            agent = state.agents.get(run.actor_id)
+            who = f"{agent_label(agent)}" if agent else f"{run.role} {run.actor_id}"
             report = (run.run.report or "(no report)").strip().splitlines()[0][:300]
-            lines.append(f"[{run.role} {run.actor_id}: {run.run.outcome}] {report}")
+            notices.append(Notice(f"[{who}: {run.run.outcome}] {report}"))
         for command, note in approval_requests(state):
-            if command not in self._shown_approvals:
-                self._shown_approvals.add(command)
-                lines.append(f"[waiting for you] {command}  ({note})")
-        return lines
+            if f"{command} {note}" not in self._shown_approvals:
+                self._shown_approvals.add(f"{command} {note}")
+                notices.append(Notice(f"[waiting for you] {command}  ({note})"))
+        return notices

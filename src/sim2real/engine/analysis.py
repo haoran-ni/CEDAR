@@ -20,6 +20,7 @@ misuse; they are not a security boundary against code written to evade them.
 """
 
 import ast
+import contextlib
 import json
 import math
 import os
@@ -29,6 +30,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -166,7 +168,8 @@ def _remove_tree(path: Path) -> None:
 class AnalysisRunner:
     def __init__(self, ledger: ResearchLedger, artifacts: ArtifactStore, runs_root: str | Path, work_root: str | Path,
                  *, limits: AnalysisLimits = AnalysisLimits(), read_roots: Sequence[Path] | None = None,
-                 actor: Actor = ANALYSIS_RUNNER) -> None:
+                 actor: Actor = ANALYSIS_RUNNER, slots: threading.Semaphore | None = None) -> None:
+        """``slots``, shared between runners, limits how many scripts run at once on the login node."""
         self._ledger = ledger
         self._artifacts = artifacts
         self._runs_root = Path(runs_root)
@@ -174,6 +177,7 @@ class AnalysisRunner:
         self.limits = limits
         self._read_roots = tuple(read_roots) if read_roots is not None else default_read_roots()
         self._actor = actor
+        self._slots = slots
 
     def run(self, investigation_id: str, hypothesis_id: str, *, purpose: str, script: str,
             inputs: Mapping[str, Sequence[str] | None]) -> AnalysisReport:
@@ -191,6 +195,8 @@ class AnalysisRunner:
             calc = state.calculations.get(calculation_id)
             if calc is None:
                 problems.append(f"unknown calculation {calculation_id}")
+            elif hypothesis_id not in calc.hypothesis_ids:
+                problems.append(f"{calculation_id} is not one of {hypothesis_id}'s calculations")
             elif calc.run_check is None:
                 problems.append(f"the run of {calculation_id} has not been checked yet ({calc.state.value})")
             else:
@@ -208,7 +214,8 @@ class AnalysisRunner:
                 return AnalysisReport(None, None, tuple(problems))
             script_ref = self._artifacts.put_bytes(script.encode(), label=SCRIPT_FILE, media_type="text/x-python")
             (stage / SCRIPT_FILE).write_text(script)
-            outcome, exit_code, seconds = self._execute(stage)
+            with self._slots if self._slots is not None else contextlib.nullcontext():
+                outcome, exit_code, seconds = self._execute(stage)
             if exit_code is not None and exit_code < 0:
                 cause = _SIGNALS.get(-exit_code, f"signal {-exit_code}")
                 problems.append(f"the script was stopped by {cause}")

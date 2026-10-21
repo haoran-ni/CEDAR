@@ -8,6 +8,7 @@ from typing import Annotated, Literal
 
 from pydantic import AwareDatetime, Field, JsonValue, model_validator
 
+from sim2real.contracts.agents import AgentSpec
 from sim2real.contracts.analysis import AnalysisRun
 from sim2real.contracts.base import (
     Actor,
@@ -184,17 +185,72 @@ class AnalysisRecorded(Contract):
     run: AnalysisRun
 
 
-AGENT_TASK_ROLES = ("hypothesis_agent", "evidence_judge")
+class AgentsProposed(Contract):
+    """Hypothesis agents the Chief Scientist proposes; the researcher reviews them before they start.
+
+    A newer proposal replaces one still waiting.
+    """
+
+    type: Literal["agents_proposed"] = "agents_proposed"
+    proposal_id: Identifier
+    agents: tuple[AgentSpec, ...] = Field(min_length=1)
+    rationale: NonEmptyStr
+    """Why these agents, and why the other open hypotheses get none."""
+
+    @model_validator(mode="after")
+    def _one_agent_per_hypothesis(self) -> "AgentsProposed":
+        hypotheses = [a.hypothesis_id for a in self.agents]
+        if len(set(hypotheses)) != len(hypotheses):
+            raise ValueError("a proposal gives each hypothesis at most one agent")
+        return self
+
+
+class AgentsStarted(Contract):
+    """A proposal taken up: by the researcher's command, or because the review window passed without a reply."""
+
+    type: Literal["agents_started"] = "agents_started"
+    proposal_id: Identifier
+    agent_ids: dict[Identifier, Identifier] = Field(min_length=1)
+    """The new agents' ids, by hypothesis."""
+    authorization_id: Identifier | None = None
+    """The researcher's command that started them; None when the review window passed."""
+
+
+class AgentRetired(Contract):
+    """An agent will get no more work; its record and evidence remain."""
+
+    type: Literal["agent_retired"] = "agent_retired"
+    agent_id: Identifier
+    reason: NonEmptyStr
+
+
+AGENT_TASK_ROLES = ("hypothesis_agent", "evidence_judge", "chief_scientist")
 
 
 class AgentTaskQueued(Contract):
-    """Work for an agent, run by the dispatcher outside any conversation."""
+    """Work for an agent, run by the dispatcher outside any conversation.
+
+    A hypothesis agent's task names the agent and its hypothesis; the Evidence Judge's names
+    the hypothesis to assess; the Chief Scientist's (a review of the agents' reports) names
+    neither.
+    """
 
     type: Literal["agent_task_queued"] = "agent_task_queued"
     task_id: Identifier
-    role: Literal["hypothesis_agent", "evidence_judge"]
-    hypothesis_id: Identifier
+    role: Literal["hypothesis_agent", "evidence_judge", "chief_scientist"]
+    hypothesis_id: Identifier | None = None
+    agent_id: Identifier | None = None
     instruction: NonEmptyStr
+
+    @model_validator(mode="after")
+    def _names_what_its_role_needs(self) -> "AgentTaskQueued":
+        needs = {"hypothesis_agent": (True, True), "evidence_judge": (True, False),
+                 "chief_scientist": (False, False)}[self.role]
+        if (self.hypothesis_id is not None, self.agent_id is not None) != needs:
+            raise ValueError(f"a {self.role} task names "
+                             + {(True, True): "its agent and hypothesis", (True, False): "a hypothesis and no agent",
+                                (False, False): "neither a hypothesis nor an agent"}[needs])
+        return self
 
 
 class AgentRunRecorded(Contract):
@@ -255,6 +311,9 @@ EventPayload = Annotated[
     | AnalysisRecorded
     | EvidenceRecorded
     | AssessmentRecorded
+    | AgentsProposed
+    | AgentsStarted
+    | AgentRetired
     | AgentTaskQueued
     | AgentRunRecorded,
     Field(discriminator="type"),

@@ -1,7 +1,9 @@
 """Read-only file tools: list, find, read and search, with line numbers for citations.
 
 Paths must resolve (after following symlinks) inside one of the allowed roots and outside
-every denied directory, such as the one holding API keys. Nothing here writes.
+every denied directory, such as the one holding API keys. Nothing here writes. Roots can
+be given as a function, so an agent's readable directories follow the research record,
+e.g. the run directories of its own hypothesis's calculations.
 """
 
 import fnmatch
@@ -20,9 +22,15 @@ MAX_ENTRIES = 300
 
 
 class FileAccess:
-    def __init__(self, roots: Sequence[str | Path], deny: Sequence[str | Path] = ()) -> None:
-        self.roots = [Path(r).resolve() for r in roots]
+    def __init__(self, roots: Sequence[str | Path] | Callable[[], Sequence[str | Path]],
+                 deny: Sequence[str | Path] = ()) -> None:
+        self._roots = roots
         self.deny = [Path(d).resolve() for d in deny]
+
+    @property
+    def roots(self) -> list[Path]:
+        roots = self._roots() if callable(self._roots) else self._roots
+        return [Path(r).resolve() for r in roots]
 
     def resolve(self, path: str) -> Path:
         candidate = Path(path)
@@ -31,8 +39,9 @@ class FileAccess:
         resolved = candidate.resolve()
         if any(resolved == d or resolved.is_relative_to(d) for d in self.deny):
             raise PermissionError(f"{path} is not readable by agents")
-        if not any(resolved == r or resolved.is_relative_to(r) for r in self.roots):
-            raise PermissionError(f"{path} is outside the readable roots {[str(r) for r in self.roots]}")
+        roots = self.roots
+        if not any(resolved == r or resolved.is_relative_to(r) for r in roots):
+            raise PermissionError(f"{path} is outside the readable roots {[str(r) for r in roots]}")
         return resolved
 
     def text_lines(self, path: str) -> tuple[Path, list[str]]:

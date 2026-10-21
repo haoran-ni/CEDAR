@@ -2,10 +2,14 @@
 
 Every write reloads the investigation from the log, runs the new events through
 ``apply`` (which enforces the research rules), and appends them only if no other writer
-got there first. Events carrying an idempotency key are recorded at most once, so a
-replayed job-completion or a retried request does not produce a second event.
+got there first; otherwise it waits a short random time and tries again, so writers
+working at the same time (agents running in parallel, the dispatcher, the chat) all get
+through. Events carrying an idempotency key are recorded at most once, so a replayed
+job-completion or a retried request does not produce a second event.
 """
 
+import random
+import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
@@ -47,7 +51,7 @@ class ResearchLedger:
         store: SQLiteEventStore,
         *,
         clock: Callable[[], datetime] = utc_now,
-        max_attempts: int = 5,
+        max_attempts: int = 20,
     ) -> None:
         self._store = store
         self._clock = clock
@@ -92,7 +96,7 @@ class ResearchLedger:
         (such as reusing an existing calculation) are made against the state the events
         are validated and appended on.
         """
-        for _ in range(self._max_attempts):
+        for attempt in range(self._max_attempts):
             state = replay(self._store.read_stream(investigation_id))
             drafts = tuple(build(state))
             if not drafts:
@@ -112,6 +116,7 @@ class ResearchLedger:
             try:
                 self._store.append(events, expected_version=expected)
             except ConcurrencyConflict:
+                time.sleep(random.uniform(0, 0.01 * (attempt + 1)))
                 continue
             return RecordResult(tuple(events), state)
         raise ConcurrencyConflict(

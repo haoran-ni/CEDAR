@@ -1,5 +1,6 @@
 """Typed contracts shared by agents, the computing engine and the research record."""
 
+from sim2real.contracts.agents import AgentSpec
 from sim2real.contracts.analysis import AnalysisInput, AnalysisOutcome, AnalysisResult, AnalysisRun
 from sim2real.contracts.base import (
     Actor,
@@ -13,7 +14,10 @@ from sim2real.contracts.base import (
     UncertaintyKind,
 )
 from sim2real.contracts.events import (
+    AgentRetired,
     AgentRunRecorded,
+    AgentsProposed,
+    AgentsStarted,
     AnalysisRecorded,
     AgentTaskQueued,
     AssessmentRecorded,
@@ -86,7 +90,11 @@ from sim2real.contracts.task import (
 )
 
 __all__ = [
+    "AgentRetired",
     "AgentRunRecorded",
+    "AgentSpec",
+    "AgentsProposed",
+    "AgentsStarted",
     "AgentTaskQueued",
     "Actor",
     "ActorKind",

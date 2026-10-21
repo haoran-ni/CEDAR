@@ -5,7 +5,14 @@ so every research rule applies: the agent can write inputs and request calculati
 the examiner judges them, submission needs the researcher's authorization, a reading
 counts only after the validator has checked its citations, and an analysis script runs
 only through the guarded runner, which records it.
+
+An agent sees and acts on its own hypothesis only: its calculations (including identical
+ones it shares with another hypothesis), its analyses and its own readings. What other
+agents found reaches it only through the Chief Scientist's instructions.
 """
+
+from collections.abc import Sequence
+from pathlib import Path
 
 from dataclasses import dataclass
 from typing import Literal
@@ -25,7 +32,7 @@ from sim2real.engine.inputs import ProtocolEngine
 from sim2real.engine.results import ResultValidator
 from sim2real.protocols.base import ProtocolRegistry
 from sim2real.state.ledger import ResearchLedger
-from sim2real.state.projection import CalculationRecord
+from sim2real.state.projection import CalculationRecord, InvestigationState
 from sim2real.store.artifacts import ArtifactStore
 from sim2real.summaries import calculation_summary
 
@@ -149,8 +156,28 @@ class ResultArgs(Contract):
     limitations: list[NonEmptyStr] = []
 
 
-def _calculation_summary(ctx: ResearchContext, calc: CalculationRecord) -> str:
-    return calculation_summary(ctx.ledger.load(ctx.investigation_id), calc)
+def agent_file_access(ledger: ResearchLedger, investigation_id: str, hypothesis_id: str, runs_root: str | Path,
+                      shared: Sequence[str | Path] = (), deny: Sequence[str | Path] = ()) -> FileAccess:
+    """File access for one hypothesis's agent: the run directories of its own calculations, plus ``shared``
+    directories every agent may read (e.g. the code's species defaults)."""
+    def roots() -> list[Path]:
+        state = ledger.load(investigation_id)
+        own = [Path(runs_root) / state.calculations[c].workdir for c in state.hypotheses[hypothesis_id].calculation_ids
+               if state.calculations[c].workdir is not None]
+        return [*own, *shared]
+
+    return FileAccess(roots=roots, deny=deny)
+
+
+def _calculation_summary(ctx: ResearchContext, calc: CalculationRecord, state: InvestigationState | None = None) -> str:
+    return calculation_summary(state or ctx.ledger.load(ctx.investigation_id), calc, viewer=ctx.hypothesis_id)
+
+
+def _own_calculation(ctx: ResearchContext, calculation_id: str) -> tuple[InvestigationState, CalculationRecord]:
+    state = ctx.ledger.load(ctx.investigation_id)
+    if calculation_id not in state.hypotheses[ctx.hypothesis_id].calculation_ids:
+        raise ToolFailure(f"{calculation_id} is not one of your hypothesis's calculations")
+    return state, state.calculations[calculation_id]
 
 
 def _next_step(calc: CalculationRecord) -> str:
@@ -188,7 +215,7 @@ def research_tools(ctx: ResearchContext) -> list[AgentTool]:
             lines.append(f"Prediction {pid}: {p.statement} Expected: {p.expected_outcome}. Falsified if: "
                          f"{p.falsified_if}.")
         for cid in hyp.calculation_ids:
-            lines.append(_calculation_summary(ctx, state.calculations[cid]))
+            lines.append(_calculation_summary(ctx, state.calculations[cid], state))
         if state.spec.constraints.model_token_budget is not None:
             lines.append(f"Model tokens remaining for this investigation: {state.model_tokens_remaining}")
         return "\n".join(lines)
@@ -248,12 +275,10 @@ def research_tools(ctx: ResearchContext) -> list[AgentTool]:
         return ToolOutcome("Waiting. You will be resumed when these calculations have finished.", end_run=True)
 
     def run_outputs(args: CalculationArg) -> str:
-        calc = ctx.ledger.load(ctx.investigation_id).calculations.get(args.calculation_id)
-        if calc is None:
-            raise ToolFailure(f"unknown calculation {args.calculation_id}")
+        state, calc = _own_calculation(ctx, args.calculation_id)
         if calc.workdir is None:
             return f"{args.calculation_id} has no run directory yet ({calc.state.value})."
-        lines = [_calculation_summary(ctx, calc)]
+        lines = [_calculation_summary(ctx, calc, state)]
         if calc.run_check is None:
             lines.append("The run has not been checked yet; readings and analyses wait for the check.")
         else:
@@ -269,6 +294,7 @@ def research_tools(ctx: ResearchContext) -> list[AgentTool]:
         return "\n".join(lines)
 
     def submit_reading(args: ReadingArgs) -> ToolOutcome:
+        _own_calculation(ctx, args.calculation_id)
         reading = OutputReading(
             reader=ctx.actor, value=Quantity(value=args.value, unit=args.unit), summary=args.summary,
             limitations=tuple(args.limitations),
@@ -285,6 +311,8 @@ def research_tools(ctx: ResearchContext) -> list[AgentTool]:
                 f"{ev.observable.name} = {ev.value.value} {ev.value.unit}.")
 
     def run_analysis(args: AnalysisArgs) -> ToolOutcome:
+        for staged in args.inputs:
+            _own_calculation(ctx, staged.calculation_id)
         report = ctx.analysis.run(ctx.investigation_id, ctx.hypothesis_id, purpose=args.purpose, script=args.script,
                                   inputs={i.calculation_id: i.files for i in args.inputs})
         if report.analysis_id is None:
@@ -311,8 +339,8 @@ def research_tools(ctx: ResearchContext) -> list[AgentTool]:
 
     def record_result(args: ResultArgs) -> ToolOutcome:
         analysis = ctx.ledger.load(ctx.investigation_id).analyses.get(args.analysis_id)
-        if analysis is None:
-            raise ToolFailure(f"unknown analysis {args.analysis_id}")
+        if analysis is None or analysis.hypothesis_id != ctx.hypothesis_id:
+            raise ToolFailure(f"{args.analysis_id} is not one of your analyses")
         result = analysis.run.result(args.result_name)
         unit = result.value.unit if result is not None else None
         outcome = ctx.validator.record_analysis_result(

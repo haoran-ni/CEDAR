@@ -1,8 +1,12 @@
 """Wiring: the research data directory, and the services an investigation's profile implies."""
 
+import threading
+from collections.abc import Callable
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 
+from sim2real.agents.toolkits.research import agent_file_access
 from sim2real.agents.toolkits.files import FileAccess
 from sim2real.agents.transcripts import TranscriptStore
 from sim2real.engine import JobManager, JobMonitor, ProtocolEngine, ResultValidator
@@ -27,12 +31,13 @@ class Workspace:
     transcripts: TranscriptStore
 
     @classmethod
-    def open(cls, root: str | Path) -> "Workspace":
+    def open(cls, root: str | Path, *, clock: Callable[[], datetime] | None = None) -> "Workspace":
+        """``clock`` stamps recorded events; tests pass their own."""
         root = Path(root)
         root.mkdir(mode=0o700, parents=True, exist_ok=True)
         store = SQLiteEventStore(root / "events.sqlite")
-        return cls(root, store, ResearchLedger(store), ArtifactStore(root / "artifacts"),
-                   TranscriptStore(root / "transcripts"))
+        ledger = ResearchLedger(store, clock=clock) if clock is not None else ResearchLedger(store)
+        return cls(root, store, ledger, ArtifactStore(root / "artifacts"), TranscriptStore(root / "transcripts"))
 
     def notebook_dir(self, investigation_id: str) -> Path:
         """Where the investigation's research notebook (generated Markdown) lives."""
@@ -50,7 +55,14 @@ class Services:
     monitor: JobMonitor
     validator: ResultValidator
     analysis: AnalysisRunner
-    files: FileAccess
+    shared_roots: list[Path]
+    """Directories every agent may read, such as the codes' species defaults."""
+    deny: list[Path]
+
+    def agent_files(self, workspace: Workspace, investigation_id: str, hypothesis_id: str) -> FileAccess:
+        """What one hypothesis's agent may read: its own calculations' run directories and the shared roots."""
+        return agent_file_access(workspace.ledger, investigation_id, hypothesis_id, self.profile.runs_root,
+                                 self.shared_roots, self.deny)
 
 
 def registry_for(profile: ComputeProfile) -> ProtocolRegistry:
@@ -59,10 +71,10 @@ def registry_for(profile: ComputeProfile) -> ProtocolRegistry:
 
 
 def services_for(workspace: Workspace, profile: ComputeProfile, backend: SchedulerBackend | None = None,
-                 *, deny: list[Path] = ()) -> Services:
+                 *, deny: list[Path] = (), analysis_slots: threading.Semaphore | None = None) -> Services:
+    """``analysis_slots``, shared across investigations, limits analysis scripts running at once."""
     backend = backend or SlurmBackend()
     registry = registry_for(profile)
-    readable = [profile.runs_root, *(p for code in profile.codes.values() for p in code.data_paths.values())]
     return Services(
         profile=profile,
         registry=registry,
@@ -70,8 +82,10 @@ def services_for(workspace: Workspace, profile: ComputeProfile, backend: Schedul
         manager=JobManager(workspace.ledger, backend, profile.runs_root),
         monitor=JobMonitor(workspace.ledger, backend),
         validator=ResultValidator(workspace.ledger, registry, workspace.artifacts, backend, profile.runs_root),
-        analysis=AnalysisRunner(workspace.ledger, workspace.artifacts, profile.runs_root, workspace.root / "analyses"),
-        files=FileAccess(roots=readable, deny=list(deny)),
+        analysis=AnalysisRunner(workspace.ledger, workspace.artifacts, profile.runs_root, workspace.root / "analyses",
+                                slots=analysis_slots),
+        shared_roots=[Path(p) for code in profile.codes.values() for p in code.data_paths.values()],
+        deny=[Path(d) for d in deny],
     )
 
 
@@ -90,15 +104,18 @@ class ModelClients:
     config: ModelConfig
     credentials: CredentialStore
     _clients: dict[str, ModelClient] = field(default_factory=dict)
+    _lock: threading.Lock = field(default_factory=threading.Lock)
 
     def settings(self, role: str) -> ModelSettings:
         return self.config.for_role(role)
 
     def client(self, role: str) -> ModelClient:
+        """One client per provider, shared by agents running at the same time."""
         settings = self.settings(role)
-        if settings.provider not in self._clients:
-            self._clients[settings.provider] = create_client(settings, self.credentials)
-        return self._clients[settings.provider]
+        with self._lock:
+            if settings.provider not in self._clients:
+                self._clients[settings.provider] = create_client(settings, self.credentials)
+            return self._clients[settings.provider]
 
     def secrets(self) -> list[str]:
         return self.credentials.secrets()

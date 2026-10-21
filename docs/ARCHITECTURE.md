@@ -17,7 +17,7 @@ flowchart TB
     PROF --> Q
     PROF --> J
     O --> HG[Hypothesis Generation & Screening]
-    HG --> AF[Dynamic Agent Factory]
+    HG --> AF[Agent proposals: one agent per hypothesis, reviewed by the researcher]
     AF --> H1[Hypothesis Agent 1]
     AF --> H2[Hypothesis Agent 2]
     AF --> Hn[Hypothesis Agent N]
@@ -53,7 +53,7 @@ Chief Scientist and research orchestrator are separate concerns. The LLM supervi
 | TUI client | Chat, control requests, live agent/job state, report browsing | Hold sole authoritative state; launch DFT directly |
 | Conversation API / Chief Scientist | Scientific planning, delegations, user coordination, query state | Run scientific computation or arbitrary remote shell |
 | Orchestrator | Durable plan/task graph, worker scheduling, retries, dependency resolution | Pretend a job is scientifically valid from Slurm status alone |
-| Hypothesis agent | Commit hypotheses/predictions, write or request inputs and job scripts, read raw outputs, write analysis scripts, interpret evidence | Submit anything that has not passed input examination; claim values it can neither cite nor compute with a recorded analysis |
+| Hypothesis agent | Commit hypotheses/predictions, write or request inputs and job scripts, read raw outputs, write analysis scripts, interpret evidence, for its own hypothesis | Submit anything that has not passed input examination; claim values it can neither cite nor compute with a recorded analysis; see or act on another hypothesis's work |
 | Analysis runner | Examine and run agent-written analysis scripts on the login node against hashed copies of run outputs; record each run | Start programs (DFT included), reach the network, read beyond the staged inputs, pass credentials to scripts |
 | Protocol registry | Resolve allowable methods; examine agent-written or generated inputs and job scripts against the declared task; optionally generate inputs; define output checks | Approve content it cannot verify; assert universal physical applicability |
 | Environment setup agent | Work out how to run codes on this system from local files or user answers; propose a compute profile with sources | Activate a profile without user approval; hard-code site settings |
@@ -75,7 +75,8 @@ Chief Scientist and research orchestrator are separate concerns. The LLM supervi
 
 ### B. Asynchronous research channel
 
-- Execute independent agents concurrently until a tool request, deadline, budget decision or hypothesis completion.
+- Execute independent agents concurrently: several at once, never two runs of the same agent, each until it finishes its task, waits for a job or reaches its budget. Submission and job polling go on meanwhile.
+- When every agent given work has reported, the Chief Scientist reviews the reports in the background (fan-in) and decides what follows; its conclusions reach the researcher in the chat.
 - Submission of a long-running job records `WAITING_FOR_JOB` and ends the current agent invocation.
 - External work proceeds without the TUI connected. The monitor observes completion and publishes an event; the dispatcher restores a worker from a checkpoint and relevant evidence.
 - Worker runs can be resumed from any process; shared state is serialized, not held solely in memory.
@@ -145,9 +146,9 @@ When using LangGraph interrupts, be alert to **node replay**: divide submission,
 1. Chief Scientist normalizes the scientific question and flags non-comparable observables before allocating compute budget.
 2. Generator emits *hypothesis specifications*, not prose-only conversations.
 3. Screener merges redundant hypotheses, verifies testability, and prioritizes.
-4. Agent Factory creates separate, restricted instances (common LLM backend is fine) with local context, budget and tools.
+4. The Chief Scientist proposes agents, at most one per hypothesis, each with a role, a first task and optionally a budget. The researcher reviews the proposal: it starts on `/approve agents`, or after a 10-minute review window with no reply; any reply holds it until the Chief Scientist proposes again. Each agent is a separate, restricted instance (common LLM backend is fine) with its own conversation, and its tools reach only its own hypothesis's work.
 5. Independent investigators preregister predictions and request evidence.
-6. Evidence Judge runs an initial synthesis; investigators can cross-examine one another via structured challenges.
+6. Once every agent given work has reported, the Chief Scientist collects the reports, compares them across hypotheses and consults the Evidence Judge. Agents never see each other's work, so cross-examination goes through the Chief Scientist, which passes on the findings a test needs.
 7. New evidence can trigger a joint hypothesis (e.g., XC × coverage), suspension, revived mechanism, or another round.
 8. Supervisor checks next-action budget, user intent, dependencies and approval before issuing tasks.
 
@@ -181,6 +182,7 @@ The UI can subscribe to a local event stream or poll at a restrained interval fo
 ## 8. Trust, permission, and isolation boundaries
 
 - LLM-written inputs and Slurm scripts are allowed, but only after input examination (and user approval where the verdict is `NEEDS_REVIEW`). Nothing LLM- or user-supplied is passed unchecked to subprocess or SSH, and agents never execute commands on the cluster themselves.
+- Each hypothesis agent's tools reach only its own hypothesis: its calculations (shared identical runs included), its analyses, its own readings, and its calculations' run directories. The research record refuses anything an agent records about another hypothesis.
 - LLM-written analysis scripts run on the login node only through the analysis runner: examined first, then run without credentials, under resource limits and an audit hook that keeps them to their staged inputs and refuses programs and sockets. These guards stop mistakes, not deliberate evasion; independent review agents are a planned second layer.
 - Use distinct permissions for `read`, `prepare`, `submit`, `cancel`, `delete`, or expensive compute. Default to limits and explicit authorization for potentially destructive operations.
 - Mark literature and file content as *untrusted external data*, not executable instructions. Tool output must never override task policies or trigger arbitrary commands.

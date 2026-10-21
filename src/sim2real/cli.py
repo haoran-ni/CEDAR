@@ -272,7 +272,7 @@ def _start(args) -> int:
               "investigate. Type /help for commands.")
     while True:
         for notice in session.notices():
-            print(notice)
+            print(f"\nChief Scientist (review of the agents' reports):\n{notice.text}" if notice.review else notice.text)
         try:
             line = input("\nyou> ")
         except EOFError:
@@ -313,19 +313,23 @@ def _report(args) -> int:
     return 0
 
 
-def _make_dispatcher():
+def _make_dispatcher(max_agents: int = 4):
     from sim2real.dispatch import Dispatcher
 
-    return Dispatcher(_workspace(), _profiles(), _model_clients(), deny=[config_dir()])
+    return Dispatcher(_workspace(), _profiles(), _model_clients(), deny=[config_dir()], max_agents=max_agents)
 
 
 def _dispatch(args) -> int:
-    dispatcher = _make_dispatcher()
+    if args.agents < 1:
+        print("--agents must be at least 1", file=sys.stderr)
+        return 2
+    dispatcher = _make_dispatcher(args.agents)
     if args.once:
         for note in dispatcher.tick():
             print(note)
         return 0
-    print(f"Dispatcher running every {args.interval:g} s on {data_dir()}; stop with Ctrl-C.")
+    print(f"Dispatcher running every {args.interval:g} s on {data_dir()}, up to {args.agents} agents at once; stop "
+          "with Ctrl-C.")
     try:
         dispatcher.run_forever(args.interval)
     except KeyboardInterrupt:
@@ -388,6 +392,8 @@ def main(argv: list[str] | None = None) -> int:
     dispatch = commands.add_parser("dispatch", help="submit authorized work, follow jobs and run queued agents")
     dispatch.add_argument("--once", action="store_true", help="do one pass over all investigations and exit")
     dispatch.add_argument("--interval", type=float, default=60.0, help="seconds between passes (default 60)")
+    dispatch.add_argument("--agents", type=int, default=4, metavar="N",
+                          help="agents that may run at the same time (default 4)")
     dispatch.set_defaults(handler=_dispatch)
 
     args = parser.parse_args(argv)

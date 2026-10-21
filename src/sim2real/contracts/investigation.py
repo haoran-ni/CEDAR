@@ -92,6 +92,8 @@ class InvestigationConstraints(Contract):
     """Cancelling a submitted job always requires user authorization, independent of this."""
     model_token_budget: int | None = Field(default=None, gt=0)
     """Tokens the investigation's agents may process in total: input, cached input and output."""
+    agent_review_minutes: int = Field(default=10, ge=0)
+    """How long proposed hypothesis agents wait for the researcher's reply before they start."""
 
 
 class InvestigationSpec(Contract):

@@ -5,10 +5,11 @@ and talks to the Chief Scientist through ``ChatSession``. Closing it interrupts 
 and reopening it shows the same investigation.
 
 Top to bottom: a status line; the live panel, one row per hypothesis, keeping lifecycle,
-agent activity, scheduler state, evidence quality and assessment in separate columns; the
-scrolling conversation; and the input line. The Chief Scientist answers in a background
-thread, so the panel keeps updating and commands keep working while it thinks. Messages
-sent meanwhile wait their turn.
+agent role and activity, scheduler state, evidence quality and assessment in separate
+columns; the scrolling conversation; and the input line. The Chief Scientist answers in a
+background thread, so the panel keeps updating and commands keep working while it thinks.
+Messages sent meanwhile wait their turn. The Chief Scientist's background reviews of the
+agents' reports appear in the conversation as its messages.
 """
 
 from collections import deque
@@ -25,7 +26,7 @@ from textual.containers import VerticalScroll
 from textual.screen import Screen
 from textual.widgets import Collapsible, DataTable, Footer, Input, Markdown, Static, TextArea
 
-from sim2real.chat import HELP, ChatSession
+from sim2real.chat import HELP, ChatSession, Notice
 from sim2real.dashboard import SwarmRow, dispatcher_status, status_line, swarm_rows, work_summary
 from sim2real.dispatch import current_activity, heartbeat_age
 from sim2real.notebook import round_file, update_notebook
@@ -125,7 +126,7 @@ class _Snapshot:
     summary: str
     alarm: bool
     rows: list[SwarmRow] = field(default_factory=list)
-    notices: list[str] = field(default_factory=list)
+    notices: list[Notice] = field(default_factory=list)
     alerts: list[str] = field(default_factory=list)
     round: int = 0
 
@@ -322,8 +323,8 @@ class Sim2RealApp(App):
 
     def _snapshot(self) -> _Snapshot:
         now = self.clock()
-        activity = current_activity(self.workspace)
-        dispatcher, alarm = dispatcher_status(heartbeat_age(self.workspace, now), activity, now)
+        activities = current_activity(self.workspace)
+        dispatcher, alarm = dispatcher_status(heartbeat_age(self.workspace, now), activities, now)
         investigation_id = self.session.investigation_id
         if investigation_id is None:
             return _Snapshot("No investigation yet: describe the discrepancy to the Chief Scientist.", dispatcher,
@@ -335,8 +336,8 @@ class Sim2RealApp(App):
             self._state = replay(self._events)
             self._version = version
         state = self._state
-        return _Snapshot(status_line(state), f"{work_summary(state)} · {dispatcher}", alarm,
-                         swarm_rows(state, self._events, activity, now),
+        return _Snapshot(status_line(state, now), f"{work_summary(state)} · {dispatcher}", alarm,
+                         swarm_rows(state, self._events, activities, now),
                          self.session.notices() if changed else [], self._new_results(state) if changed else [],
                          state.round)
 
@@ -379,7 +380,13 @@ class Sim2RealApp(App):
             if snapshot.rows:
                 table.move_cursor(row=min(cursor, len(snapshot.rows) - 1))
         for notice in snapshot.notices:
-            self.say(notice, "notice")
+            if notice.review:
+                chat = self.query_one("#chat", VerticalScroll)
+                chat.mount(Static("Chief Scientist (review of the agents' reports) ›", classes="speaker"))
+                chat.mount(Markdown(notice.text, open_links=False))
+                chat.scroll_end(animate=False)
+            else:
+                self.say(notice.text, "notice")
         for alert in snapshot.alerts:
             self.notify(alert, title="New result", timeout=10, markup=False)
 

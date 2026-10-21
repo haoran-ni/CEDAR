@@ -14,6 +14,7 @@ from typing import Any
 from pydantic import BaseModel, ValidationError
 
 from sim2real.errors import RuleViolation
+from sim2real.store.event_store import ConcurrencyConflict
 from sim2real.models.types import ToolSpec
 
 
@@ -30,7 +31,9 @@ class ToolFailure(Exception):
 
 
 EXPECTED_FAILURES = (ToolFailure, RuleViolation, PermissionError, FileNotFoundError, NotADirectoryError,
-                     IsADirectoryError, ValueError, KeyError)
+                     IsADirectoryError, ValueError, KeyError, ConcurrencyConflict)
+"""Failures the agent sees as error results; ConcurrencyConflict means the record stayed busy, so trying again
+works."""
 
 
 def plain_schema(schema: dict) -> dict:

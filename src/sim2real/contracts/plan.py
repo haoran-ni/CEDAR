@@ -31,6 +31,8 @@ class PermissionAction(StrEnum):
     CANCEL = "cancel"
     APPROVE_INPUTS = "approve_inputs"
     """Run inputs whose examination ended NEEDS_REVIEW."""
+    START_AGENTS = "start_agents"
+    """Start proposed hypothesis agents before their review window ends."""
 
 
 class Authorization(Contract):

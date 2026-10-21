@@ -27,7 +27,8 @@ Under the data directory (`$SIM2REAL_DATA_DIR`, else `$XDG_DATA_HOME/sim2real`, 
 | `analyses/` | Working directories of analysis scripts while they run; each is removed when its script ends |
 | `transcripts/` | Each agent session's conversation, one JSON line per message (mode 600). Operational memory for resuming agents, not the research record |
 | `notebooks/<investigation>/` | The research notebook |
-| `dispatcher.lock`, `dispatcher.heartbeat` | The dispatcher's lock and last-tick time |
+| `dispatcher.lock`, `dispatcher.heartbeat` | The dispatcher's lock and last-pass time |
+| `activity/` | One file per agent run in progress, for the live panel; removed when the run ends |
 
 Run directories, where jobs actually execute, are under the compute profile's `runs_root`.
 The compute profile itself and the API keys live in the configuration directory, never in
@@ -38,7 +39,7 @@ the data directory.
 Each event is an envelope around one typed payload. The envelope records:
 
 - `event_id`, `investigation_id`, and `stream_version` (contiguous from 1 per investigation)
-- `occurred_at` (UTC) and the `actor`: its kind (user, Chief Scientist, hypothesis agent, Evidence Judge, protocol engine, job manager, job monitor, validator, system) and id
+- `occurred_at` (UTC) and the `actor`: its kind (user, Chief Scientist, hypothesis agent, Evidence Judge, protocol engine, job manager, job monitor, validator, analysis runner, system) and id. A hypothesis agent's id, such as `agent-hyp-xc`, names the one hypothesis it works on
 - `round` and `plan_version` at the time of recording
 - an optional `idempotency_key`, so a retried write is recorded once
 - an optional `causation_id`
@@ -52,7 +53,7 @@ Payloads cover the whole research process:
 | Hypotheses | `hypothesis_proposed`, `hypothesis_status_changed`, `prediction_registered` |
 | Computation | `calculation_requested`, `calculation_linked`, `calculation_inputs_examined`, `calculation_state_changed`, `run_checked` (the run's health checks and stored outputs) |
 | Results | `analysis_recorded` (a script an agent ran: the script, its hashed inputs, output and results), `evidence_recorded`, `assessment_recorded` |
-| Agents | `agent_task_queued`, `agent_run_recorded` (model, tokens, outcome, and the agent's final report) |
+| Agents | `agents_proposed` (by the Chief Scientist: per hypothesis a role and a first task), `agents_started` (by the researcher's command or after the review window), `agent_retired`, `agent_task_queued` (work for an agent, the Judge, or a Chief Scientist review), `agent_run_recorded` (model, tokens, outcome, and the agent's final report) |
 
 Events are never updated or deleted; database triggers refuse both. A correction is a new
 event.
@@ -97,9 +98,9 @@ Pages under `notebooks/<investigation>/`:
 
 | Page | Contents |
 |---|---|
-| `index.md` | Question and target claim; compared quantities and their alignment; the plan and its versions; tables of hypotheses and calculations; links to rounds; what waits for the researcher; model usage |
+| `index.md` | Question and target claim; compared quantities and their alignment; the plan and its versions; tables of hypotheses, agents (with every proposal) and calculations; links to rounds; what waits for the researcher; model usage |
 | `round-NN.md` | One page per round, answering the questions laid out in [`templates/ROUND_REPORT.md`](../templates/ROUND_REPORT.md): what we hypothesized and why, what we predicted, tested and observed, what changed our assessment, what remains unknown, and what is next; then the researcher's messages and the agents' reports |
-| `hypotheses/<id>.md` | One hypothesis: statement, falsifiers, predictions, calculations, analyses, evidence, assessment history, agent reports |
+| `hypotheses/<id>.md` | One hypothesis: statement, falsifiers, its agent, predictions, calculations, analyses, evidence, assessment history, agent reports |
 | `timeline.md` | Every event, one line each, in order |
 
 A **round** is one stretch of investigating. Round 0 is the setup. A new round starts each

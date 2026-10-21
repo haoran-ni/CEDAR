@@ -191,7 +191,7 @@ def test_notebook_pages_and_cited_output_open_in_place(system):
 
     async def script(pilot):
         await settle(pilot)
-        assert "1 VALIDATED" in panel(app)[0][4]
+        assert panel(app)[0][4] == "2 VALIDATED"  # a cited reading and an analysis result
         app.query_one(DataTable).focus()
         await pilot.press("enter")
         await settle(pilot)
@@ -258,7 +258,7 @@ def test_narrow_terminals_start_with_the_panel_hidden_and_a_summary_shown(system
         await settle(pilot)
         assert not app.query_one(DataTable).display
         summary = status(app).splitlines()[1]
-        assert summary.startswith("1 hypothesis · jobs: none active · evidence: 1 VALIDATED")
+        assert summary.startswith("1 hypothesis · jobs: none active · evidence: 2 VALIDATED")
         await pilot.press("f8")
         assert app.query_one(DataTable).display
         await send(pilot, "/panel")

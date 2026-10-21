@@ -17,7 +17,13 @@ from sim2real.contracts.examination import ExaminationVerdict
 from sim2real.contracts.plan import PermissionAction
 from sim2real.contracts.status import CalculationState, HypothesisStatus
 from sim2real.dispatch import Activity
-from sim2real.state.projection import CalculationRecord, HypothesisRecord, InvestigationState, authorization_for
+from sim2real.state.projection import (
+    CalculationRecord,
+    HypothesisRecord,
+    InvestigationState,
+    authorization_for,
+    hypothesis_evidence,
+)
 from sim2real.summaries import approval_requests
 
 STALE_DISPATCHER_SECONDS = 600
@@ -80,7 +86,9 @@ def job_status(state: InvestigationState, calc: CalculationRecord) -> str:
         scheduler = calc.scheduler_state.value if calc.scheduler_state else "SUBMITTED"
         text = f"job {calc.scheduler_job_id} {scheduler}"
         if calc.state in (_C.SCHEDULER_TERMINAL, _C.PARSING):
-            text += ", output not yet read"
+            text += ", run not yet checked"
+        elif calc.run_check is not None and not calc.run_check.healthy:
+            text += ", run failed its checks"
     return f"{short_id(calc.calculation_id)} {text}"
 
 
@@ -115,7 +123,7 @@ def swarm_rows(state: InvestigationState, events: Sequence[RecordedEvent], activ
     rows = []
     for hyp in state.hypotheses.values():
         calcs = [state.calculations[c] for c in hyp.calculation_ids]
-        qualities = Counter(state.evidence[c.evidence_id].evidence.quality.value for c in calcs if c.evidence_id)
+        qualities = Counter(r.evidence.quality.value for r in hypothesis_evidence(state, hyp.hypothesis_id))
         last = hyp.assessments[-1] if hyp.assessments else None
         rows.append(SwarmRow(
             hypothesis_id=hyp.hypothesis_id,
@@ -146,7 +154,7 @@ def work_summary(state: InvestigationState) -> str:
     calcs = list(state.calculations.values())
     counts = [(sum(c.state is _C.RUNNING for c in calcs), "running"),
               (sum(c.state in (_C.SUBMISSION_PENDING, _C.SUBMITTED, _C.QUEUED) for c in calcs), "queued"),
-              (sum(c.state in (_C.SCHEDULER_TERMINAL, _C.PARSING) for c in calcs), "output not yet read")]
+              (sum(c.state in (_C.SCHEDULER_TERMINAL, _C.PARSING) for c in calcs), "not yet checked")]
     jobs = ", ".join(f"{n} {label}" for n, label in counts if n) or "none active"
     qualities = Counter(record.evidence.quality.value for record in state.evidence.values())
     evidence = ", ".join(f"{n} {quality}" for quality, n in qualities.items()) or "none"

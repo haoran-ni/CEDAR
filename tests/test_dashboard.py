@@ -91,7 +91,7 @@ def test_job_status_follows_the_calculation_and_the_scheduler(ledger):
     move(ledger, inv, a, MONITOR, CalculationState.RUNNING)
     assert status(a) == "job 77 RUNNING"
     move(ledger, inv, a, MONITOR, CalculationState.SCHEDULER_TERMINAL, scheduler_state=SchedulerState.COMPLETED)
-    assert status(a) == "job 77 COMPLETED, output not yet read"
+    assert status(a) == "job 77 COMPLETED, run not yet checked"
     move(ledger, inv, a, VALIDATOR, CalculationState.PARSING)
     record_evidence(ledger, inv, a, "ev-a")
     assert status(a) == "job 77 COMPLETED"
@@ -118,7 +118,7 @@ def test_rows_keep_jobs_evidence_and_assessment_apart(ledger):
     state = ledger.load(inv)
     (row,) = swarm_rows(state, [], None, LATER)
     assert row.hypothesis_id == hyp and row.lifecycle == "PLANNING_TEST" and row.priority == "normal"
-    assert row.jobs == f"{short_id(ok)} job 1 COMPLETED; {short_id(failed)} job 2 FAILED"
+    assert row.jobs == f"{short_id(ok)} job 1 COMPLETED; {short_id(failed)} job 2 FAILED, run failed its checks"
     assert row.evidence == "1 VALIDATED, 1 INVALID"
     assert row.assessment == "NOT_TESTED" and row.agent == "no agent yet"
     assert work_summary(state) == "1 hypothesis · jobs: none active · evidence: 1 VALIDATED, 1 INVALID"

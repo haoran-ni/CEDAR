@@ -9,10 +9,12 @@ On a ``RuleViolation`` the state passed to ``apply`` must be discarded.
 
 from dataclasses import dataclass, field
 
+from sim2real.contracts.analysis import SCRIPT_CHECK_PREFIX, AnalysisOutcome, AnalysisRun, as_evidence_check
 from sim2real.contracts.base import ActorKind
 from sim2real.contracts.events import (
     AgentRunRecorded,
     AgentTaskQueued,
+    AnalysisRecorded,
     AssessmentRecorded,
     CalculationInputsExamined,
     CalculationLinked,
@@ -28,6 +30,7 @@ from sim2real.contracts.events import (
     PredictionRegistered,
     RecordedEvent,
     RoundStarted,
+    RunChecked,
     UserInterventionRecorded,
 )
 from sim2real.contracts.evidence import EvidenceKind, EvidenceObject
@@ -73,6 +76,8 @@ EVENT_ACTORS: dict[type, frozenset[ActorKind]] = {
     CalculationLinked: frozenset({_A.CHIEF_SCIENTIST, _A.HYPOTHESIS_AGENT}),
     CalculationInputsExamined: frozenset({_A.PROTOCOL_ENGINE}),
     CalculationStateChanged: frozenset({_A.PROTOCOL_ENGINE, _A.JOB_MANAGER, _A.JOB_MONITOR, _A.VALIDATOR}),
+    RunChecked: frozenset({_A.VALIDATOR}),
+    AnalysisRecorded: frozenset({_A.ANALYSIS_RUNNER}),
     EvidenceRecorded: frozenset({_A.VALIDATOR, _A.HYPOTHESIS_AGENT, _A.USER}),
     AssessmentRecorded: frozenset({_A.EVIDENCE_JUDGE}),
     AgentRunRecorded: frozenset({_A.CHIEF_SCIENTIST, _A.HYPOTHESIS_AGENT, _A.EVIDENCE_JUDGE}),
@@ -99,6 +104,7 @@ EVIDENCE_KIND_ACTORS: dict[EvidenceKind, frozenset[ActorKind]] = {
     EvidenceKind.PUBLISHED_EXPERIMENT: frozenset({_A.HYPOTHESIS_AGENT, _A.USER}),
     EvidenceKind.INFERENCE: frozenset({_A.HYPOTHESIS_AGENT, _A.USER}),
     EvidenceKind.INDIRECT_CONSTRAINT: frozenset({_A.HYPOTHESIS_AGENT, _A.USER}),
+    EvidenceKind.ANALYSIS: frozenset({_A.VALIDATOR}),
 }
 
 _IMPLIED_SCHEDULER_STATE = {_C.QUEUED: SchedulerState.PENDING, _C.RUNNING: SchedulerState.RUNNING}
@@ -173,9 +179,11 @@ class CalculationRecord:
     state: CalculationState = CalculationState.SPECIFIED
     scheduler_state: SchedulerState | None = None
     scheduler_job_id: str | None = None
-    evidence_id: str | None = None
+    evidence_ids: list[str] = field(default_factory=list)
+    """Evidence read from this run directly or computed by analyses that used it."""
     examination: InputExamination | None = None
     workdir: str | None = None
+    run_check: RunChecked | None = None
     history: list[tuple[int, CalculationState]] = field(default_factory=list)
 
 
@@ -183,6 +191,16 @@ class CalculationRecord:
 class EvidenceRecord:
     evidence_id: str
     evidence: EvidenceObject
+    recorded_at: int
+    round: int
+
+
+@dataclass
+class AnalysisRecord:
+    analysis_id: str
+    hypothesis_id: str
+    run: AnalysisRun
+    actor_id: str
     recorded_at: int
     round: int
 
@@ -224,6 +242,7 @@ class InvestigationState:
     predictions: dict[str, PredictionRecord] = field(default_factory=dict)
     calculations: dict[str, CalculationRecord] = field(default_factory=dict)
     evidence: dict[str, EvidenceRecord] = field(default_factory=dict)
+    analyses: dict[str, AnalysisRecord] = field(default_factory=dict)
     agent_runs: list[AgentRunRecord] = field(default_factory=list)
     tasks: dict[str, AgentTaskRecord] = field(default_factory=dict)
 
@@ -283,6 +302,19 @@ def calculation_with_inputs(state: InvestigationState, input_hash: str) -> str |
         if calc.examination is not None and calc.examination.input_hash == input_hash and _is_reusable(calc):
             return calc.calculation_id
     return None
+
+
+def hypothesis_evidence(state: InvestigationState, hypothesis_id: str) -> list[EvidenceRecord]:
+    """Evidence from the hypothesis's calculations and from the analyses it ran, in recording order."""
+    hyp = state.hypotheses[hypothesis_id]
+    calcs = set(hyp.calculation_ids)
+    found = []
+    for record in state.evidence.values():
+        ev = record.evidence
+        mine = ev.analysis_id is not None and state.analyses[ev.analysis_id].hypothesis_id == hypothesis_id
+        if mine or ev.calculation_id in calcs or calcs.intersection(ev.calculation_ids):
+            found.append(record)
+    return found
 
 
 def replay(events: list[RecordedEvent]) -> InvestigationState | None:
@@ -536,8 +568,8 @@ def _on_calculation_state(state: InvestigationState, event: RecordedEvent, p: Ca
         raise RuleViolation(f"{p.state} needs a reason")
     if p.state is _C.CANCELLED and calc.state in _LIVE_AT_SCHEDULER:
         _require_authorization(state, p.authorization_id, PermissionAction.CANCEL, calc.calculation_id)
-    if p.state is _C.QUALITY_ASSESSED and calc.evidence_id is None:
-        raise RuleViolation("QUALITY_ASSESSED requires the calculation's evidence to be recorded first")
+    if p.state is _C.QUALITY_ASSESSED and calc.run_check is None:
+        raise RuleViolation("QUALITY_ASSESSED requires the run check to be recorded first")
 
     calc.state = new_state
     if scheduler_state is not None:
@@ -547,26 +579,80 @@ def _on_calculation_state(state: InvestigationState, event: RecordedEvent, p: Ca
     calc.history.append((event.stream_version, new_state))
 
 
+def _on_run_checked(state: InvestigationState, event: RecordedEvent, p: RunChecked) -> None:
+    calc = _calculation(state, p.calculation_id)
+    if calc.state is not _C.PARSING:
+        raise RuleViolation(f"a run is checked while PARSING; {calc.calculation_id} is {calc.state}")
+    if calc.run_check is not None:
+        raise RuleViolation(f"the run of {calc.calculation_id} was already checked")
+    calc.run_check = p
+
+
+def _on_analysis(state: InvestigationState, event: RecordedEvent, p: AnalysisRecorded) -> None:
+    _require_open(state)
+    hyp = _hypothesis(state, p.hypothesis_id)
+    if hyp.status in _CLOSED_HYPOTHESIS:
+        raise RuleViolation(f"hypothesis {p.hypothesis_id} is {hyp.status}")
+    if p.analysis_id in state.analyses:
+        raise RuleViolation(f"analysis {p.analysis_id} already recorded")
+    for staged in p.run.inputs:
+        calc = _calculation(state, staged.calculation_id)
+        if calc.run_check is None:
+            raise RuleViolation(f"the run of {calc.calculation_id} has not been checked; nothing to analyse yet")
+        known = {**calc.examination.files, **calc.run_check.outputs}
+        changed = [name for name, ref in staged.files.items() if name in known and known[name].sha256 != ref.sha256]
+        if changed:
+            raise RuleViolation(f"staged files of {calc.calculation_id} differ from the checked run: {changed}")
+    state.analyses[p.analysis_id] = AnalysisRecord(p.analysis_id, p.hypothesis_id, p.run, event.actor.id,
+                                                   event.stream_version, event.round)
+
+
+def _require_healthy_for_validation(ev: EvidenceObject, calcs: list[CalculationRecord]) -> None:
+    if ev.quality is not EvidenceQuality.VALIDATED:
+        return
+    for calc in calcs:
+        if calc.scheduler_state is not SchedulerState.COMPLETED:
+            raise RuleViolation(f"cannot validate output of a job that ended {calc.scheduler_state}")
+        if not calc.run_check.healthy:
+            raise RuleViolation(f"cannot validate results of {calc.calculation_id}: its run failed checks")
+
+
 def _on_evidence(state: InvestigationState, event: RecordedEvent, p: EvidenceRecorded) -> None:
     ev = p.evidence
     if event.actor.kind not in EVIDENCE_KIND_ACTORS[ev.kind]:
         raise RuleViolation(f"{event.actor.kind} may not record {ev.kind} evidence")
     if p.evidence_id in state.evidence:
         raise RuleViolation(f"evidence {p.evidence_id} already recorded; evidence is immutable")
-    calc = None
+    linked: list[CalculationRecord] = []
     if ev.calculation_id is not None:
         calc = _calculation(state, ev.calculation_id)
-        if calc.state is not _C.PARSING:
-            raise RuleViolation(f"evidence for {calc.calculation_id} must be recorded while PARSING, not {calc.state}")
-        if calc.evidence_id is not None:
-            raise RuleViolation(f"calculation {calc.calculation_id} already has evidence {calc.evidence_id}")
-        if ev.observable != calc.task.observable:
-            raise RuleViolation("evidence observable differs from the observable the calculation was requested for")
-        if ev.quality is EvidenceQuality.VALIDATED and calc.scheduler_state is not SchedulerState.COMPLETED:
-            raise RuleViolation(f"cannot validate output of a job that ended {calc.scheduler_state}")
+        if calc.run_check is None or calc.state is not _C.QUALITY_ASSESSED:
+            raise RuleViolation(f"evidence for {calc.calculation_id} waits for its run check")
+        linked = [calc]
+    if ev.kind is EvidenceKind.ANALYSIS:
+        analysis = state.analyses.get(ev.analysis_id)
+        if analysis is None:
+            raise RuleViolation(f"unknown analysis {ev.analysis_id}")
+        if analysis.run.outcome is not AnalysisOutcome.COMPLETED:
+            raise RuleViolation(f"analysis {ev.analysis_id} did not complete ({analysis.run.outcome})")
+        if ev.calculation_ids != analysis.run.calculation_ids:
+            raise RuleViolation("analysis evidence must name exactly the calculations the analysis used")
+        result = analysis.run.result(ev.analysis_result)
+        if result is None:
+            raise RuleViolation(f"analysis {ev.analysis_id} reported no result {ev.analysis_result}")
+        if ev.value != result.value:
+            raise RuleViolation(f"the value differs from result {result.name} of analysis {ev.analysis_id}")
+        # Every check the script made on this result travels with it, failed ones included.
+        expected = {as_evidence_check(c) for c in analysis.run.checks_for(result)}
+        carried = {c for c in ev.quality_checks if c.name.startswith(SCRIPT_CHECK_PREFIX)}
+        if carried != expected:
+            raise RuleViolation(f"analysis evidence must carry exactly the checks the script reported for "
+                                f"{result.name}")
+        linked = [state.calculations[c] for c in ev.calculation_ids]
+    _require_healthy_for_validation(ev, linked)
     state.evidence[p.evidence_id] = EvidenceRecord(p.evidence_id, ev, event.stream_version, event.round)
-    if calc is not None:
-        calc.evidence_id = p.evidence_id
+    for calc in linked:
+        calc.evidence_ids.append(p.evidence_id)
 
 
 def _on_assessment(state: InvestigationState, event: RecordedEvent, p: AssessmentRecorded) -> None:
@@ -643,6 +729,8 @@ _HANDLERS = {
     CalculationLinked: _on_calculation_linked,
     CalculationInputsExamined: _on_inputs_examined,
     CalculationStateChanged: _on_calculation_state,
+    RunChecked: _on_run_checked,
+    AnalysisRecorded: _on_analysis,
     EvidenceRecorded: _on_evidence,
     AssessmentRecorded: _on_assessment,
     AgentTaskQueued: _on_agent_task,
@@ -650,8 +738,8 @@ _HANDLERS = {
 }
 
 __all__ = [
-    "AssessmentEntry", "CalculationRecord", "EvidenceRecord", "HypothesisRecord", "InterventionRecord",
+    "AnalysisRecord", "AssessmentEntry", "CalculationRecord", "EvidenceRecord", "HypothesisRecord", "InterventionRecord",
     "InvestigationState", "PlanRecord", "PredictionRecord", "apply", "authorization_for", "calculation_with_inputs",
-    "replay",
+    "hypothesis_evidence", "replay",
     "reusable_calculation",
 ]

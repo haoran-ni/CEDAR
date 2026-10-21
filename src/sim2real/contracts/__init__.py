@@ -1,5 +1,6 @@
 """Typed contracts shared by agents, the computing engine and the research record."""
 
+from sim2real.contracts.analysis import AnalysisInput, AnalysisOutcome, AnalysisResult, AnalysisRun
 from sim2real.contracts.base import (
     Actor,
     ActorKind,
@@ -13,6 +14,7 @@ from sim2real.contracts.base import (
 )
 from sim2real.contracts.events import (
     AgentRunRecorded,
+    AnalysisRecorded,
     AgentTaskQueued,
     AssessmentRecorded,
     CalculationInputsExamined,
@@ -30,6 +32,7 @@ from sim2real.contracts.events import (
     PredictionRegistered,
     RecordedEvent,
     RoundStarted,
+    RunChecked,
     UserInterventionRecorded,
 )
 from sim2real.contracts.evidence import (
@@ -40,6 +43,7 @@ from sim2real.contracts.evidence import (
     OutputCitation,
     OutputReading,
     QualityCheck,
+    RunReading,
 )
 from sim2real.contracts.examination import (
     ExaminationVerdict,
@@ -87,6 +91,11 @@ __all__ = [
     "Actor",
     "ActorKind",
     "AlignmentStatus",
+    "AnalysisInput",
+    "AnalysisOutcome",
+    "AnalysisRecorded",
+    "AnalysisResult",
+    "AnalysisRun",
     "ArtifactRef",
     "Assessment",
     "AssessmentRecorded",
@@ -145,6 +154,8 @@ __all__ = [
     "ResourceBudget",
     "RetrievalPolicy",
     "RoundStarted",
+    "RunChecked",
+    "RunReading",
     "SchedulerState",
     "scientific_input_hash",
     "ScientificTaskSpec",

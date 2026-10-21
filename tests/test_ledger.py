@@ -21,6 +21,11 @@ from factories import (
     investigation_spec,
     move,
     plan,
+    RAW_OUTPUT,
+    analysis_evidence,
+    analysis_run,
+    check_run,
+    record_analysis,
     record_evidence,
     run_to_parsing,
     set_hypothesis_status,
@@ -29,6 +34,8 @@ from factories import (
     task,
 )
 from sim2real.contracts import (
+    AnalysisOutcome,
+    AnalysisRecorded,
     Assessment,
     AssessmentRecorded,
     CalculationRequested,
@@ -55,6 +62,7 @@ from sim2real.contracts import (
 )
 from sim2real.errors import InvalidTransition, RuleViolation
 from sim2real.state import ResearchLedger, replay
+from sim2real.state.projection import hypothesis_evidence
 from sim2real.store import IdempotencyConflict, SQLiteEventStore
 
 
@@ -106,8 +114,9 @@ def test_full_investigation_cycle_replays_to_identical_state(ledger, store, tmp_
     c = state.calculations[calc]
     assert (h.status, h.assessment, h.awaiting_calculation_ids) == (
         HypothesisStatus.ASSESSED, Assessment.SUPPORTED, ())
-    assert (c.state, c.scheduler_state, c.scheduler_job_id, c.evidence_id) == (
-        CalculationState.QUALITY_ASSESSED, SchedulerState.COMPLETED, "1001", "ev-1")
+    assert (c.state, c.scheduler_state, c.scheduler_job_id, c.evidence_ids) == (
+        CalculationState.QUALITY_ASSESSED, SchedulerState.COMPLETED, "1001", ["ev-1"])
+    assert c.run_check is not None and c.run_check.healthy
     assert [s for _, s in c.history] == [
         CalculationState.SPECIFIED, CalculationState.VALIDATED_INPUT, CalculationState.SUBMISSION_PENDING,
         CalculationState.SUBMITTED, CalculationState.RUNNING, CalculationState.SCHEDULER_TERMINAL,
@@ -231,17 +240,38 @@ class TestSchedulerIsNotValidation:
                                 checks=(QualityCheck(name="scf_converged", passed=False),)).state
         assert state.calculations[calc].state is CalculationState.QUALITY_ASSESSED
 
-    def test_assessment_needs_recorded_evidence(self, ledger, inv, hyp):
+    def test_quality_assessment_needs_a_run_check(self, ledger, inv, hyp):
         calc = request(ledger, inv, hyp).calculation_id
         run_to_parsing(ledger, inv, calc)
-        with pytest.raises(RuleViolation, match="evidence to be recorded first"):
+        with pytest.raises(RuleViolation, match="run check to be recorded first"):
             move(ledger, inv, calc, VALIDATOR, CalculationState.QUALITY_ASSESSED)
 
-    def test_evidence_must_describe_the_requested_observable(self, ledger, inv, hyp):
+    def test_a_run_is_checked_once_after_it_ended(self, ledger, inv, hyp):
+        calc = request(ledger, inv, hyp).calculation_id
+        submit(ledger, inv, calc)
+        with pytest.raises(RuleViolation, match="checked while PARSING"):
+            check_run(ledger, inv, calc)
+        move(ledger, inv, calc, MONITOR, CalculationState.RUNNING)
+        move(ledger, inv, calc, MONITOR, CalculationState.SCHEDULER_TERMINAL, scheduler_state=SchedulerState.COMPLETED)
+        move(ledger, inv, calc, VALIDATOR, CalculationState.PARSING)
+        check_run(ledger, inv, calc)
+        with pytest.raises(RuleViolation, match="checked while PARSING|already checked"):
+            check_run(ledger, inv, calc)
+
+    def test_a_run_gives_several_readings_but_an_unhealthy_one_validates_none(self, ledger, inv, hyp):
         calc = request(ledger, inv, hyp).calculation_id
         run_to_parsing(ledger, inv, calc)
-        with pytest.raises(RuleViolation, match="observable"):
-            record_evidence(ledger, inv, calc, observable=PREFERRED_SITE)
+        record_evidence(ledger, inv, calc, "ev-energy")
+        state = record_evidence(ledger, inv, calc, "ev-site", observable=PREFERRED_SITE).state
+        assert state.calculations[calc].evidence_ids == ["ev-energy", "ev-site"]
+
+        other = request(ledger, inv, hyp, xc="PBE0").calculation_id
+        run_to_parsing(ledger, inv, other, job_id="1002")
+        check_run(ledger, inv, other, healthy=False)
+        with pytest.raises(RuleViolation, match="failed checks"):
+            record_evidence(ledger, inv, other, "ev-bad")
+        record_evidence(ledger, inv, other, "ev-bad", quality=EvidenceQuality.INVALID,
+                        checks=(QualityCheck(name="scf_converged", passed=False),))
 
 
 class TestJudgement:
@@ -514,3 +544,83 @@ class TestInputExamination:
         with pytest.raises(RuleViolation, match="hypothesis_agent may not"):
             ledger.record(inv, [draft(AGENT, CalculationInputsExamined(
                 calculation_id=calc, examination=examination(calc), workdir=f"{inv}/{calc}"))])
+
+
+class TestAnalyses:
+    @pytest.fixture
+    def checked(self, ledger, inv, hyp):
+        calc = request(ledger, inv, hyp).calculation_id
+        run_to_parsing(ledger, inv, calc)
+        check_run(ledger, inv, calc)
+        return calc
+
+    def test_only_the_runner_records_analyses_of_checked_runs(self, ledger, inv, hyp, checked):
+        unchecked = request(ledger, inv, hyp, xc="PBE0").calculation_id
+        with pytest.raises(RuleViolation, match="has not been checked"):
+            record_analysis(ledger, inv, hyp, "an-1", unchecked)
+        with pytest.raises(RuleViolation, match="hypothesis_agent may not"):
+            ledger.record(inv, [draft(AGENT, AnalysisRecorded(analysis_id="an-1", hypothesis_id=hyp,
+                                                              run=analysis_run(checked)))])
+        state = record_analysis(ledger, inv, hyp, "an-1", checked).state
+        assert state.analyses["an-1"].run.calculation_ids == (checked,)
+        with pytest.raises(RuleViolation, match="already recorded"):
+            record_analysis(ledger, inv, hyp, "an-1", checked)
+
+    def test_staged_files_must_be_the_stored_ones(self, ledger, inv, hyp, checked):
+        forged = RAW_OUTPUT.model_copy(update={"sha256": "c" * 64})
+        with pytest.raises(RuleViolation, match="differ from the checked run"):
+            record_analysis(ledger, inv, hyp, "an-1", checked, files={"aims.out": forged})
+        # A file the run check did not store (say, a cube file) may be staged by its own hash.
+        record_analysis(ledger, inv, hyp, "an-2", checked, files={"aims.out": RAW_OUTPUT, "dens.cube": forged})
+
+    def test_analysis_evidence_carries_a_reported_result(self, ledger, inv, hyp, checked):
+        record_analysis(ledger, inv, hyp, "an-1", checked)
+        record_analysis(ledger, inv, hyp, "an-failed", checked, outcome=AnalysisOutcome.FAILED)
+
+        def record(evidence, actor=VALIDATOR):
+            return ledger.record(inv, [draft(actor, EvidenceRecorded(evidence_id=f"ev-{len(evidence.summary)}x",
+                                                                     evidence=evidence))])
+
+        with pytest.raises(RuleViolation, match="differs from result gap"):
+            record(analysis_evidence("an-1", checked, value=6.5))
+        with pytest.raises(RuleViolation, match="reported no result homo"):
+            record(analysis_evidence("an-1", checked, result="homo"))
+        with pytest.raises(RuleViolation, match="did not complete"):
+            record(analysis_evidence("an-failed", checked))
+        with pytest.raises(RuleViolation, match="exactly the calculations"):
+            record(analysis_evidence("an-1", checked, "calc-other"))
+        with pytest.raises(RuleViolation, match="hypothesis_agent may not record analysis"):
+            record(analysis_evidence("an-1", checked), actor=AGENT)
+        state = record(analysis_evidence("an-1", checked)).state
+        (evidence_id,) = state.calculations[checked].evidence_ids
+        assert [r.evidence_id for r in hypothesis_evidence(state, hyp)] == [evidence_id]
+
+    def test_analysis_evidence_carries_every_check_the_script_reported(self, ledger, inv, hyp, checked):
+        electrons = QualityCheck(name="electron_count", passed=True, detail="14 electrons")
+        mismatch = QualityCheck(name="matches_printed_gap", passed=False, detail="off by 0.2 eV")
+        record_analysis(ledger, inv, hyp, "an-1", checked, results=(("gap", 7.0, "eV"), ("homo", -9.0, "eV")),
+                        checks=(electrons,), result_checks={"gap": (mismatch,)})
+
+        def record(evidence_id, evidence):
+            return ledger.record(inv, [draft(VALIDATOR, EvidenceRecorded(evidence_id=evidence_id, evidence=evidence))])
+
+        with pytest.raises(RuleViolation, match="exactly the checks the script reported for gap"):
+            record("ev-gap", analysis_evidence("an-1", checked, quality=EvidenceQuality.INCONCLUSIVE,
+                                               script_checks=(electrons,)))  # the failed check left out
+        with pytest.raises(ValueError, match="cannot have failed quality checks"):
+            analysis_evidence("an-1", checked, script_checks=(electrons, mismatch))
+        record("ev-gap", analysis_evidence("an-1", checked, quality=EvidenceQuality.INCONCLUSIVE,
+                                           script_checks=(electrons, mismatch)))
+        # The gap's own failed check does not touch the other result.
+        state = record("ev-homo", analysis_evidence("an-1", checked, result="homo", value=-9.0,
+                                                    script_checks=(electrons,))).state
+        assert state.evidence["ev-homo"].evidence.quality is EvidenceQuality.VALIDATED
+
+    def test_analyses_of_unhealthy_runs_validate_nothing(self, ledger, inv, hyp):
+        calc = request(ledger, inv, hyp).calculation_id
+        run_to_parsing(ledger, inv, calc)
+        check_run(ledger, inv, calc, healthy=False)
+        record_analysis(ledger, inv, hyp, "an-1", calc)
+        with pytest.raises(RuleViolation, match="failed checks"):
+            ledger.record(inv, [draft(VALIDATOR, EvidenceRecorded(evidence_id="ev-x",
+                                                                  evidence=analysis_evidence("an-1", calc)))])

@@ -24,12 +24,19 @@ def calculation_summary(state: InvestigationState, calc: CalculationRecord, *, f
             if f.severity is not FindingSeverity.INFO or f.code == "generated":
                 where = f" ({f.file}{':' + str(f.line) if f.line else ''})" if f.file else ""
                 lines.append(f"  [{f.severity.value}] {f.code}: {f.message}{where}")
-    if calc.evidence_id:
-        evidence = state.evidence[calc.evidence_id].evidence
-        value = f"{evidence.value.value} {evidence.value.unit}" if evidence.value else "no value"
+    if calc.run_check is not None:
+        failed = [c for c in calc.run_check.checks if not c.passed]
+        lines.append("  run check: " + ("healthy" if not failed else
+                                        "FAILED " + "; ".join(f"{c.name} ({c.detail or 'no detail'})" for c in failed)))
+        lines += [f"  protocol read {r.name} = {r.value.value!r} {r.value.unit} at {r.file} line {r.line_start}: "
+                  f"{r.quote}" for r in calc.run_check.readings]
+    for evidence_id in calc.evidence_ids:
+        evidence = state.evidence[evidence_id].evidence
+        value = f"{evidence.value.value!r} {evidence.value.unit}" if evidence.value else "no value"
         failed = [c.name for c in evidence.quality_checks if not c.passed]
-        lines.append(f"  evidence {calc.evidence_id}: {evidence.quality.value}, {value}"
-                     + (f"; failed checks: {', '.join(failed)}" if failed else ""))
+        origin = f" (analysis {evidence.analysis_id})" if evidence.analysis_id else ""
+        lines.append(f"  evidence {evidence_id}{origin}: {evidence.quality.value}, {evidence.observable.name} = "
+                     f"{value}" + (f"; failed checks: {', '.join(failed)}" if failed else ""))
     return "\n".join(lines)
 
 

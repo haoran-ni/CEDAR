@@ -1,0 +1,89 @@
+"""Runs one analysis script under guards; started by ``AnalysisRunner`` as ``python -I -B <this file>``.
+
+Before the script starts, this sets CPU, memory and file-size limits and installs an audit
+hook that refuses to read anything but the working directory and the read-only roots it is
+given (the Python installation), to change anything outside the working directory, to start
+processes or to open sockets. Audit hooks cannot be removed once installed, but they are not
+a security boundary against code written to evade them; they stop mistakes and naive misuse.
+
+Standard library only: this file runs in the child process before anything else.
+"""
+
+import json
+import os
+import resource
+import runpy
+import sys
+
+ROOT = os.path.realpath(os.environ["S2R_ANALYSIS_ROOT"])
+READ_ROOTS = tuple(os.path.realpath(p) for p in os.environ.get("S2R_READ_ROOTS", "").split(os.pathsep) if p)
+LIMITS = json.loads(os.environ.get("S2R_LIMITS", "{}"))
+
+REFUSED_EVENTS = frozenset({
+    "subprocess.Popen", "os.system", "os.exec", "os.posix_spawn", "os.spawn", "os.fork", "os.forkpty",
+    "os.kill", "os.killpg", "pty.spawn", "socket.__new__", "socket.connect", "socket.bind", "webbrowser.open",
+})
+CHANGE_EVENTS = frozenset({
+    "os.remove", "os.rename", "os.rmdir", "os.mkdir", "os.chmod", "os.chown", "os.link", "os.symlink",
+    "os.truncate", "os.utime", "shutil.rmtree", "shutil.move", "shutil.copytree",
+})
+LIST_EVENTS = frozenset({"os.listdir", "os.scandir", "glob.glob"})
+_WRITE_FLAGS = os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_APPEND | os.O_TRUNC
+
+
+def _inside(path: str, base: str) -> bool:
+    return path == base or path.startswith(base + os.sep)
+
+
+def _real(path) -> str:
+    return os.path.realpath(os.fsdecode(path))
+
+
+def _readable(path: str) -> bool:
+    return _inside(path, ROOT) or any(_inside(path, root) for root in READ_ROOTS)
+
+
+def _hook(event: str, args: tuple) -> None:
+    if event in REFUSED_EVENTS:
+        raise PermissionError(f"analysis scripts may not use {event}: they cannot start programs or use the network")
+    if event == "open":
+        path, mode, flags = args
+        if path is None or isinstance(path, int):
+            return
+        target = _real(path)
+        writing = bool(mode and any(c in mode for c in "wax+")) or bool((flags or 0) & _WRITE_FLAGS)
+        if _inside(target, ROOT) or (not writing and _readable(target)):
+            return
+        what = "write" if writing else "read"
+        raise PermissionError(f"analysis scripts may not {what} {target}: read the staged inputs under inputs/ "
+                              "and write only in the working directory")
+    if event in CHANGE_EVENTS:
+        for arg in args:
+            if isinstance(arg, (str, bytes, os.PathLike)) and not _inside(_real(arg), ROOT):
+                raise PermissionError(f"analysis scripts may not change {_real(arg)}")
+    elif event in LIST_EVENTS:
+        arg = args[0] if args and args[0] is not None else "."
+        if not isinstance(arg, int) and not _readable(_real(arg)):
+            raise PermissionError(f"analysis scripts may not list {_real(arg)}")
+
+
+def _limit(kind: int, value) -> None:
+    if value is None:
+        return
+    _, hard = resource.getrlimit(kind)
+    value = int(value) if hard == resource.RLIM_INFINITY else min(int(value), hard)
+    resource.setrlimit(kind, (value, value))
+
+
+def main() -> None:
+    _limit(resource.RLIMIT_CPU, LIMITS.get("cpu_seconds"))
+    _limit(resource.RLIMIT_AS, LIMITS.get("memory_bytes"))
+    _limit(resource.RLIMIT_FSIZE, LIMITS.get("file_bytes"))
+    _limit(resource.RLIMIT_CORE, 0)
+    os.chdir(ROOT)
+    sys.addaudithook(_hook)
+    runpy.run_path(os.path.join(ROOT, "analysis.py"), run_name="__main__")
+
+
+if __name__ == "__main__":
+    main()

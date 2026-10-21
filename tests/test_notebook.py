@@ -11,12 +11,15 @@ from factories import (
     JUDGE,
     SITE_ENERGY,
     USER,
+    VALIDATOR,
     add_hypothesis,
+    analysis_evidence,
     draft,
     examine,
     investigation_spec,
     move,
     plan,
+    record_analysis,
     record_evidence,
     run_to_parsing,
     start_investigation,
@@ -31,6 +34,7 @@ from sim2real.contracts import (
     CalculationState,
     Completeness,
     EvidenceQuality,
+    EvidenceRecorded,
     InvestigationStatus,
     InvestigationStatusChanged,
     PlanRevised,
@@ -67,6 +71,9 @@ def build(ledger) -> dict:
         falsified_if="the run fails its checks", calculation_ids=(good,))))])
     run_to_parsing(ledger, inv, good, job_id="1001")
     record_evidence(ledger, inv, good, "ev-1")
+    record_analysis(ledger, inv, hyp, "an-1", good)
+    ledger.record(inv, [draft(VALIDATOR, EvidenceRecorded(evidence_id="ev-gap",
+                                                          evidence=analysis_evidence("an-1", good)))])
     bad = ledger.request_calculation(inv, AGENT, hyp, task(xc="PBE0"), "hybrid comparison").calculation_id
     run_to_parsing(ledger, inv, bad, job_id="1002", scheduler_state=SchedulerState.FAILED)
     record_evidence(ledger, inv, bad, "ev-2", quality=EvidenceQuality.INVALID,
@@ -138,6 +145,12 @@ def test_round_page_answers_from_the_record(pages):
     assert "[aims.out line 10](../../artifacts/objects/aa/" + "a" * 64 + "#L10)" in observed
     assert f"**{ids['bad']}**: the job ended FAILED" in observed
     assert "Check failed: scf_converged: no converged SCF cycle" in observed
+    assert f"- **{ids['good']}**: run checked, healthy" in observed
+    assert f"- **{ids['bad']}**: run checked, failed scf_converged" in observed
+    assert ("- **an-1**, a script written for [hyp-xc](hypotheses/hyp-xc.md): “synthetic analysis” **completed**"
+            in observed)
+    assert "  - Result gap = 7.0 eV" in observed and "[Script](../../artifacts/objects/bb/" in observed
+    assert f"- **ev-gap** from analysis an-1 of {ids['good']} for [hyp-xc](hypotheses/hyp-xc.md)" in observed
 
     assessed = section(page, "What changed our assessment?")
     assert "NOT_TESTED → **INCONCLUSIVE** (partial), by Evidence Judge, citing ev-1" in assessed
@@ -158,13 +171,16 @@ def test_index_and_hypothesis_pages(pages):
     ids, rendered, events = pages
     index = rendered["index.md"]
     rows = [line for line in index.splitlines() if line.startswith(f"| {ids['bad']}")]
-    assert rows and rows[0].endswith("| 1002 | FAILED | ev-2: INVALID, 0.1 eV |")
+    assert rows and rows[0].endswith(
+        "| 1002 | FAILED | failed scf_converged | ev-2: INVALID, site energy difference = 0.1 eV |")
     assert "- [Round 1](round-01.md): events #5–" in index
     assert "Discrepancy: not defined; observable alignment is UNASSESSED" in index
     hypothesis = rendered["hypotheses/hyp-xc.md"]
     assert "status PLANNING_TEST · assessment INCONCLUSIVE · priority on_hold" in hypothesis
     assert "[aims.out line 10](../../../artifacts/objects/aa/" in hypothesis
     assert "Round 1, event #" in section(hypothesis, "Assessments")
+    assert section(hypothesis, "Analyses").startswith("- **an-1**")
+    assert "**ev-gap** from analysis an-1" in section(hypothesis, "Evidence")
     assert f"Generated from events #1–#{len(events)};" in index
     timeline = [line for line in rendered["timeline.md"].splitlines() if line.startswith("- #")]
     assert [line.split(" · ")[0] for line in timeline] == [f"- #{e.stream_version}" for e in events]

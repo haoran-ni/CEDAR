@@ -7,25 +7,27 @@ from sites import aims_output, co_on_cu111, declared, geometry_text
 from sim2real.contracts import (
     ExaminationVerdict,
     FindingSeverity,
+    Observable,
     ProtocolRef,
     SchedulerState,
     ScientificTaskSpec,
     verdict_for,
 )
 from sim2real.contracts.status import EvidenceQuality
-from sim2real.protocols import TOTAL_ENERGY, ZERO_BROADENING_ENERGY, FhiAimsTotalEnergy
+from sim2real.protocols import FhiAimsRun
 
-PROTOCOL = ProtocolRef(name="fhiaims.total_energy", version="0.1")
+PROTOCOL = ProtocolRef(name="fhiaims.run", version="0.1")
+WORK_FUNCTION = Observable(name="work function", definition="vacuum level minus Fermi level", unit="eV")
 
 
-def task(observable=TOTAL_ENERGY, **overrides) -> ScientificTaskSpec:
-    return ScientificTaskSpec(protocol=PROTOCOL, observable=observable, estimand="total energy of CO/Cu(111) atop",
+def task(observable=WORK_FUNCTION, protocol=PROTOCOL, **overrides) -> ScientificTaskSpec:
+    return ScientificTaskSpec(protocol=protocol, observable=observable, estimand="work function of CO/Cu(111) atop",
                               system_label="CO/Cu(111) atop (synthetic test)", **declared(**overrides))
 
 
 @pytest.fixture
 def protocol(site):
-    return FhiAimsTotalEnergy(site)
+    return FhiAimsRun(site)
 
 
 @pytest.fixture
@@ -187,17 +189,13 @@ def test_budget_limits_the_job_script(protocol, slab_geometry):
     assert "over_budget" in codes(protocol.examine(spec, hungry), FindingSeverity.ERROR)
 
 
-def test_unsupported_observable_is_rejected(protocol, slab_geometry):
-    from sim2real.contracts import Observable
-
-    other = Observable(name="work function", definition="vacuum level minus Fermi level", unit="eV")
-    assert "unsupported_observable" in codes(protocol.examine(task(observable=other), {"geometry.in": slab_geometry}),
-                                             FindingSeverity.ERROR)
+def test_the_agent_declares_the_observable(protocol):
+    assert "Observable: declare your own" in protocol.describe()
 
 
 def test_profile_without_fhi_aims_cannot_host_the_protocol(site):
     with pytest.raises(ValueError, match="no 'fhi-aims' installation"):
-        FhiAimsTotalEnergy(site.model_copy(update={"codes": {"other": site.codes["fhi-aims"]}}))
+        FhiAimsRun(site.model_copy(update={"codes": {"other": site.codes["fhi-aims"]}}))
 
 
 class TestRunChecks:
@@ -205,17 +203,15 @@ class TestRunChecks:
         outputs = {} if text is None else {"aims.out": text.encode()}
         return protocol.check_run(task(**overrides), outputs, state)
 
-    def test_healthy_run_reads_the_final_energy_with_its_line(self, protocol):
+    def test_healthy_run_reads_the_final_energies_with_their_lines(self, protocol):
         report = self.check(protocol, aims_output(energy=-42.123456789))
         assert all(c.passed for c in report.checks)
-        assert report.reading.value.value == -42.123456789
-        assert "Total energy of the DFT" in report.reading.quote and report.reading.file == "aims.out"
+        total, zero_broadening = report.readings
+        assert (total.name, total.value.value, total.file) == ("total energy", -42.123456789, "aims.out")
+        assert "Total energy of the DFT" in total.quote
+        assert zero_broadening.name == "zero-broadening total energy"
+        assert zero_broadening.value.value == pytest.approx(-42.123843789)
         assert report.method["code_version"] == "test-1.0" and report.method["xc"] == "pbe"
-
-    def test_zero_broadening_observable_reads_its_own_line(self, protocol):
-        report = protocol.check_run(task(observable=ZERO_BROADENING_ENERGY),
-                                    {"aims.out": aims_output(energy=-42.0).encode()}, SchedulerState.COMPLETED)
-        assert report.reading.value.value == pytest.approx(-42.000387)
 
     @pytest.mark.parametrize("text, state, failed", [
         (aims_output(version="other"), SchedulerState.COMPLETED, {"code_version"}),

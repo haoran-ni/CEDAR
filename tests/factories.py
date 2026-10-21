@@ -4,6 +4,11 @@ from sim2real.contracts import (
     CITATIONS_VERIFIED,
     Actor,
     ActorKind,
+    AnalysisInput,
+    AnalysisOutcome,
+    AnalysisRecorded,
+    AnalysisResult,
+    AnalysisRun,
     AlignmentStatus,
     ArtifactRef,
     Authorization,
@@ -36,12 +41,14 @@ from sim2real.contracts import (
     QualityCheck,
     Quantity,
     ResearchPlan,
+    RunChecked,
     SchedulerState,
     ScientificTaskSpec,
     SimulationProvenance,
     UserInterventionRecorded,
     scientific_input_hash,
 )
+from sim2real.contracts.analysis import as_evidence_check
 from sim2real.state import ResearchLedger
 
 USER = Actor(kind=ActorKind.USER, id="researcher")
@@ -52,6 +59,7 @@ ENGINE = Actor(kind=ActorKind.PROTOCOL_ENGINE, id="protocol-engine")
 MANAGER = Actor(kind=ActorKind.JOB_MANAGER, id="job-manager")
 MONITOR = Actor(kind=ActorKind.JOB_MONITOR, id="job-monitor")
 VALIDATOR = Actor(kind=ActorKind.VALIDATOR, id="validator")
+RUNNER = Actor(kind=ActorKind.ANALYSIS_RUNNER, id="analysis-runner")
 
 SITE_ENERGY = Observable(
     name="site energy difference",
@@ -239,11 +247,65 @@ def computed_evidence(calculation_id: str, *, quality: EvidenceQuality = Evidenc
     )
 
 
-def record_evidence(ledger, investigation_id, calculation_id, evidence_id: str = "ev-1", **kwargs):
-    """Record a calculation's evidence and close its quality assessment in one atomic batch."""
+def check_run(ledger, investigation_id, calculation_id, *, healthy: bool = True,
+              failure_quality: EvidenceQuality = EvidenceQuality.INVALID, outputs=None):
+    """Record the validator's check of a run in PARSING, which ends its quality assessment."""
     return ledger.record(investigation_id, [
-        draft(VALIDATOR, EvidenceRecorded(evidence_id=evidence_id,
-                                          evidence=computed_evidence(calculation_id, **kwargs))),
+        draft(VALIDATOR, RunChecked(calculation_id=calculation_id, outputs=outputs or {"aims.out": RAW_OUTPUT},
+                                    checks=(QualityCheck(name="scf_converged", passed=healthy),),
+                                    failure_quality=failure_quality)),
         draft(VALIDATOR, CalculationStateChanged(calculation_id=calculation_id,
                                                  state=CalculationState.QUALITY_ASSESSED)),
     ])
+
+
+def record_evidence(ledger, investigation_id, calculation_id, evidence_id: str = "ev-1", *,
+                    healthy: bool | None = None, **kwargs):
+    """Record a reading of a run as evidence, checking the run first if that has not happened.
+
+    The run counts as healthy when the evidence is VALIDATED, unless ``healthy`` says otherwise.
+    """
+    if ledger.load(investigation_id).calculations[calculation_id].run_check is None:
+        quality = kwargs.get("quality", EvidenceQuality.VALIDATED)
+        check_run(ledger, investigation_id, calculation_id,
+                  healthy=quality is EvidenceQuality.VALIDATED if healthy is None else healthy)
+    return ledger.record(investigation_id, [
+        draft(VALIDATOR, EvidenceRecorded(evidence_id=evidence_id,
+                                          evidence=computed_evidence(calculation_id, **kwargs))),
+    ])
+
+
+SCRIPT = ArtifactRef(path="objects/bb/" + "b" * 64, sha256="b" * 64, size_bytes=10, label="analysis.py")
+
+
+def analysis_run(*calculation_ids: str, results=(("gap", 7.0, "eV"),), checks=(), result_checks=None, files=None,
+                 outcome: AnalysisOutcome = AnalysisOutcome.COMPLETED) -> AnalysisRun:
+    """A synthetic record of an analysis script run on the stored outputs of the given calculations.
+
+    ``checks`` apply to every result; ``result_checks`` maps a result name to its own checks.
+    """
+    completed = outcome is AnalysisOutcome.COMPLETED
+    return AnalysisRun(
+        purpose="synthetic analysis", script=SCRIPT, environment="test",
+        inputs=tuple(AnalysisInput(calculation_id=c, files=files or {"aims.out": RAW_OUTPUT}) for c in calculation_ids),
+        outcome=outcome, exit_code=0 if completed else 1, duration_seconds=0.5,
+        results=tuple(AnalysisResult(name=n, value=Quantity(value=v, unit=u), checks=(result_checks or {}).get(n, ()))
+                      for n, v, u in results) if completed else (),
+        checks=tuple(checks) if completed else ())
+
+
+def record_analysis(ledger, investigation_id, hypothesis_id, analysis_id: str = "an-1", *calculation_ids, **kwargs):
+    return ledger.record(investigation_id, [draft(RUNNER, AnalysisRecorded(
+        analysis_id=analysis_id, hypothesis_id=hypothesis_id, run=analysis_run(*calculation_ids, **kwargs)))])
+
+
+def analysis_evidence(analysis_id: str, *calculation_ids: str, result: str = "gap", value: float = 7.0,
+                      quality: EvidenceQuality = EvidenceQuality.VALIDATED, script_checks=()) -> EvidenceObject:
+    """Evidence for one result of a recorded analysis; ``script_checks`` are the checks it carries."""
+    return EvidenceObject(
+        kind=EvidenceKind.ANALYSIS, summary="Synthetic analysis result", observable=SITE_ENERGY,
+        value=Quantity(value=value, unit="eV"), calculation_ids=calculation_ids, analysis_id=analysis_id,
+        analysis_result=result, quality=quality,
+        quality_checks=(QualityCheck(name="analysis_completed", passed=True),
+                        *(as_evidence_check(c) for c in script_checks)),
+        sources=(SCRIPT,))

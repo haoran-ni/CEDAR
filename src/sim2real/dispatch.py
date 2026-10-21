@@ -3,9 +3,11 @@
 Each tick, for every open investigation:
 1. submit calculations the researcher has authorized (never those of on-hold hypotheses);
 2. poll the scheduler and record job state changes;
-3. wake hypothesis agents whose awaited calculations have all ended;
-4. run queued agent tasks, within the investigation's token budget;
-5. record evidence, from the protocol's own reading, for finished runs no agent reported on.
+3. check the health of every run that ended and store its outputs;
+4. wake hypothesis agents whose awaited calculations have all ended;
+5. run queued agent tasks, within the investigation's token budget.
+
+Evidence comes only from agents' cited readings and recorded analyses, after the run check.
 
 It then regenerates the research notebook of every investigation whose log grew, closed
 ones included.
@@ -129,9 +131,9 @@ class Dispatcher:
         notes = []
         notes += self._submit(investigation_id, services)
         notes += self._poll(investigation_id, services)
+        notes += self._check_runs(investigation_id, services)
         notes += self._wake(investigation_id)
         notes += self._run_tasks(investigation_id, services)
-        notes += self._assess_unreported(investigation_id, services)
         return [f"{investigation_id}: {n}" for n in notes]
 
     def _submit(self, investigation_id: str, services: Services) -> list[str]:
@@ -172,9 +174,11 @@ class Dispatcher:
             if not all(c.state in _ENDED for c in awaited):
                 continue
             summaries = "\n".join(calculation_summary(state, c, findings=False) for c in awaited)
-            instruction = ("Your calculations have ended:\n" + summaries + "\nRead their outputs with the file tools, "
-                           "submit cited readings for the values that matter, and say what they mean for your "
-                           "hypothesis. Then set its status (ASSESSED, or PLANNING_TEST if another test is needed).")
+            instruction = ("Your calculations have ended and their runs were checked:\n" + summaries + "\nLook at "
+                           "the outputs (run_outputs, file tools). Record the values that matter: a value printed in "
+                           "an output with submit_reading, citing its lines; anything that must be computed with "
+                           "run_analysis and then record_result. Say what the results mean for your hypothesis, then "
+                           "set its status (ASSESSED, or PLANNING_TEST if another test is needed).")
             self.workspace.ledger.record(investigation_id, [
                 EventDraft(actor=SYSTEM, payload=HypothesisStatusChanged(
                     hypothesis_id=hyp.hypothesis_id, status=HypothesisStatus.ANALYZING,
@@ -224,13 +228,13 @@ class Dispatcher:
             context = ResearchContext(ledger=self.workspace.ledger, investigation_id=investigation_id,
                                       hypothesis_id=task.hypothesis_id, actor=actor, registry=services.registry,
                                       artifacts=self.workspace.artifacts, engine=services.engine,
-                                      validator=services.validator, files=services.files)
+                                      validator=services.validator, files=services.files, analysis=services.analysis)
             tools = research_tools(context) + file_tools(services.files)
             system, session = HYPOTHESIS_AGENT, f"{investigation_id}.{task.hypothesis_id}"
         else:
             actor = JUDGE
             tools = judge_tools(JudgeContext(ledger=self.workspace.ledger, investigation_id=investigation_id,
-                                             actor=actor))
+                                             actor=actor, artifacts=self.workspace.artifacts))
             system, session = EVIDENCE_JUDGE, f"{investigation_id}.judge"
         activity = {"investigation_id": investigation_id, "task_id": task.task_id, "role": role,
                     "hypothesis_id": task.hypothesis_id, "started_at": self.clock().isoformat()}
@@ -251,22 +255,20 @@ class Dispatcher:
                          settings=settings, result=result, task_id=task.task_id)
         return result.outcome
 
-    def _assess_unreported(self, investigation_id: str, services: Services) -> list[str]:
-        state = self.workspace.ledger.load(investigation_id)
-        busy = {t.hypothesis_id for t in state.pending_tasks} | {
-            h.hypothesis_id for h in state.hypotheses.values() if h.status is HypothesisStatus.WAITING_FOR_JOB}
+    def _check_runs(self, investigation_id: str, services: Services) -> list[str]:
         notes = []
-        for calc in state.calculations.values():
+        for calc in self.workspace.ledger.load(investigation_id).calculations.values():
             if calc.state not in (CalculationState.SCHEDULER_TERMINAL, CalculationState.PARSING):
                 continue
-            if busy.intersection(calc.hypothesis_ids):
+            try:
+                result = services.validator.check_run(investigation_id, calc.calculation_id)
+            except (RuleViolation, OSError) as exc:
+                notes.append(f"could not check the run of {calc.calculation_id}: {exc}")
                 continue
-            outcome = services.validator.assess(investigation_id, calc.calculation_id)
-            if outcome.recorded is not None:
-                record = outcome.recorded.state.evidence[outcome.recorded.state.calculations[calc.calculation_id]
-                                                         .evidence_id]
-                notes.append(f"recorded {record.evidence.quality.value} evidence for {calc.calculation_id} from the "
-                             "protocol's own reading")
+            check = result.state.calculations[calc.calculation_id].run_check
+            failed = [c.name for c in check.checks if not c.passed]
+            notes.append(f"checked the run of {calc.calculation_id}: "
+                         + (f"failed {', '.join(failed)}" if failed else "healthy"))
         return notes
 
 

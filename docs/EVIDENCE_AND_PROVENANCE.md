@@ -23,7 +23,8 @@ Under the data directory (`$SIM2REAL_DATA_DIR`, else `$XDG_DATA_HOME/sim2real`, 
 | Path | Contents |
 |---|---|
 | `events.sqlite` | The event log of every investigation |
-| `artifacts/objects/<aa>/<sha256>` | Stored files: structures, examined inputs and job scripts, raw outputs. Written once, read-only, addressed by content hash |
+| `artifacts/objects/<aa>/<sha256>` | Stored files: structures, examined inputs and job scripts, raw outputs, analysis scripts with what they printed and wrote. Written once, read-only, addressed by content hash |
+| `analyses/` | Working directories of analysis scripts while they run; each is removed when its script ends |
 | `transcripts/` | Each agent session's conversation, one JSON line per message (mode 600). Operational memory for resuming agents, not the research record |
 | `notebooks/<investigation>/` | The research notebook |
 | `dispatcher.lock`, `dispatcher.heartbeat` | The dispatcher's lock and last-tick time |
@@ -49,8 +50,8 @@ Payloads cover the whole research process:
 | Problem | `investigation_created`, `investigation_status_changed`, `observable_alignment_recorded` |
 | Direction | `user_intervention_recorded` (the researcher's words, verbatim, with any authorization), `plan_revised` (with the message that prompted it), `round_started` |
 | Hypotheses | `hypothesis_proposed`, `hypothesis_status_changed`, `prediction_registered` |
-| Computation | `calculation_requested`, `calculation_linked`, `calculation_inputs_examined`, `calculation_state_changed` |
-| Results | `evidence_recorded`, `assessment_recorded` |
+| Computation | `calculation_requested`, `calculation_linked`, `calculation_inputs_examined`, `calculation_state_changed`, `run_checked` (the run's health checks and stored outputs) |
+| Results | `analysis_recorded` (a script an agent ran: the script, its hashed inputs, output and results), `evidence_recorded`, `assessment_recorded` |
 | Agents | `agent_task_queued`, `agent_run_recorded` (model, tokens, outcome, and the agent's final report) |
 
 Events are never updated or deleted; database triggers refuse both. A correction is a new
@@ -60,28 +61,33 @@ event.
 
 An `evidence_recorded` event carries an `EvidenceObject`:
 
-- **kind**: direct computation, archived computation, published experiment, inference, or indirect constraint
+- **kind**: direct computation (a reading of one run), analysis (a result of a recorded analysis script), archived computation, published experiment, inference, or indirect constraint
 - **observable**, with its definition and unit, and the **value** with unit, reference state and uncertainty components
 - **quality**: `VALIDATED`, `PROVISIONAL`, `INCONCLUSIVE` or `INVALID`, with every **quality check** that produced it
-- **sources**: stored artifacts (raw outputs, inputs) or external citations
+- **sources**: stored artifacts (raw outputs, inputs, analysis scripts) or external citations
 - **citations**: for each value read from an output, the stored file, the line range and the quoted text
+- **calculation_id**, or **calculation_ids**, **analysis_id** and **analysis_result**: the run a reading came from, or the analysis, the result of it, and the runs it used
 - **interpreted_by**: the agent whose reading it is, if an agent read it
 - **limitations**, **assumptions**, and **non-comparability** conditions
 - the **method**: the code, protocol and declared settings
 
-A computed value always cites the output lines it came from, and those lines are checked
-verbatim against the stored, hashed file before the evidence is recorded.
+A run gives evidence only after its run check. A value read from an output cites the lines
+it came from, checked verbatim against the stored, hashed file. A value computed by an
+analysis script is taken from the analysis record, which holds the script and every input
+by hash ([`ANALYSIS_SCRIPTS.md`](ANALYSIS_SCRIPTS.md)). Either way the evidence is
+`VALIDATED` only if every run it rests on passed its checks.
 
 ## Tracing a claim
 
 Starting from a statement in a report, for example "hyp-xc is INCONCLUSIVE":
 
 1. The **assessment** names the evidence it cites and gives the judge's rationale.
-2. Each **evidence object** names its calculation, the quality checks, and the cited output lines with the artifact's hash.
-3. The **artifact store** holds the cited output, byte for byte; its hash proves it is the file that was checked.
-4. The **calculation** records the task (observable, estimand, variables varied, controlled and set for accuracy), the examination of its exact input files and job script, the scheduler job id, and the researcher message that authorized submission.
-5. The **hypothesis** records the predictions registered before the outcome, and when.
-6. The **plan** versions and **researcher messages** show who directed the work and why.
+2. Each **evidence object** names its calculation and quality checks, and either the cited output lines with the artifact's hash, or the analysis that computed it.
+3. An **analysis** names the script, every staged input file by hash, what the script printed, and the results and checks it reported.
+4. The **artifact store** holds each of those files, byte for byte; a hash proves a file is the one that was checked or analysed.
+5. The **calculation** records the task (observable, estimand, variables varied, controlled and set for accuracy), the examination of its exact input files and job script, the scheduler job id, the researcher message that authorized submission, and the run check.
+6. The **hypothesis** records the predictions registered before the outcome, and when.
+7. The **plan** versions and **researcher messages** show who directed the work and why.
 
 The notebook pages follow the same chain, with links from evidence to the stored files.
 
@@ -93,7 +99,7 @@ Pages under `notebooks/<investigation>/`:
 |---|---|
 | `index.md` | Question and target claim; compared quantities and their alignment; the plan and its versions; tables of hypotheses and calculations; links to rounds; what waits for the researcher; model usage |
 | `round-NN.md` | One page per round, answering the questions laid out in [`templates/ROUND_REPORT.md`](../templates/ROUND_REPORT.md): what we hypothesized and why, what we predicted, tested and observed, what changed our assessment, what remains unknown, and what is next; then the researcher's messages and the agents' reports |
-| `hypotheses/<id>.md` | One hypothesis: statement, falsifiers, predictions, calculations, evidence, assessment history, agent reports |
+| `hypotheses/<id>.md` | One hypothesis: statement, falsifiers, predictions, calculations, analyses, evidence, assessment history, agent reports |
 | `timeline.md` | Every event, one line each, in order |
 
 A **round** is one stretch of investigating. Round 0 is the setup. A new round starts each

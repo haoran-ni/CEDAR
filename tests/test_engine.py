@@ -16,6 +16,7 @@ from sim2real.contracts import (
     EvidenceQuality,
     ExaminationVerdict,
     FileCitation,
+    Observable,
     OutputReading,
     PermissionAction,
     ProtocolRef,
@@ -204,26 +205,71 @@ class TestMonitoring:
         assert world.calc(cid).state is CalculationState.SUBMITTED
 
 
-class TestResults:
-    def test_agent_reading_becomes_validated_evidence(self, world):
+class TestRunChecks:
+    def test_finished_run_is_checked_once_and_its_outputs_stored(self, world):
         output = aims_output(energy=ENERGY)
         cid = world.request()
         world.run(cid, output=output)
         assert set(world.validator.output_paths(world.inv, cid)) == {"aims.out"}
-        outcome = world.validator.assess(world.inv, cid, reading(output))
-        assert outcome.reading_problems == ()
-        state = outcome.recorded.state
+        state = world.validator.check_run(world.inv, cid).state
         calc = state.calculations[cid]
-        evidence = state.evidence[calc.evidence_id].evidence
-        assert calc.state is CalculationState.QUALITY_ASSESSED
-        assert evidence.quality is EvidenceQuality.VALIDATED
+        assert calc.state is CalculationState.QUALITY_ASSESSED and calc.run_check.healthy and not calc.evidence_ids
+        assert {c.name for c in calc.run_check.checks} >= {
+            "scheduler_completed", "normal_termination", "scf_converged", "code_version", "inputs_unchanged"}
+        assert world.artifacts.read(calc.run_check.outputs["aims.out"]) == output.encode()
+        total = next(r for r in calc.run_check.readings if r.name == "total energy")
+        assert (total.value.value, total.line_start) == (ENERGY, energy_line(output)[0])
+        assert world.validator.check_run(world.inv, cid).deduplicated
+        assert replay(world.store.read_stream(world.inv)) == world.state()
+
+    def test_failed_run_is_checked_with_its_failures_named(self, world):
+        cid = world.request()
+        world.run(cid, output=aims_output(normal_end=False), final=SchedulerState.TIMEOUT)
+        check = world.validator.check_run(world.inv, cid).state.calculations[cid].run_check
+        assert not check.healthy and check.failure_quality is EvidenceQuality.INVALID
+        assert {c.name for c in check.checks if not c.passed} >= {"scheduler_completed", "normal_termination"}
+
+    def test_runs_that_have_not_ended_cannot_be_checked(self, world):
+        cid = world.request()
+        world.engine.examine(world.inv, cid)
+        with pytest.raises(RuleViolation, match="has not ended"):
+            world.validator.check_run(world.inv, cid)
+
+
+TOTAL = Observable(name="total energy", definition="final total energy printed by FHI-aims", unit="eV")
+
+
+class TestReadings:
+    def test_cited_reading_becomes_validated_evidence(self, world):
+        output = aims_output(energy=ENERGY)
+        cid = world.request()
+        world.checked(cid, output=output)
+        outcome = world.validator.record_reading(world.inv, cid, reading(output), TOTAL)
+        assert outcome.problems == ()
+        state = outcome.recorded.state
+        (evidence_id,) = state.calculations[cid].evidence_ids
+        evidence = state.evidence[evidence_id].evidence
+        assert evidence.quality is EvidenceQuality.VALIDATED and evidence.observable == TOTAL
         assert evidence.value.value == ENERGY and evidence.interpreted_by == AGENT
-        assert evidence.citations[0].artifact.label == "aims.out"
         assert world.artifacts.read(evidence.citations[0].artifact) == output.encode()
-        assert {c.name for c in evidence.quality_checks} >= {
-            "scheduler_completed", "normal_termination", "scf_converged", "code_version", "inputs_unchanged",
-            "citations_verified", "agrees_with_protocol_reading"}
+        assert {c.name for c in evidence.quality_checks} == {f"run_healthy:{cid}", "citations_verified"}
         assert replay(world.store.read_stream(world.inv)) == state
+
+    def test_one_run_gives_several_readings(self, world):
+        output = aims_output(energy=ENERGY)
+        cid = world.request()
+        world.checked(cid, output=output)
+        number, line = next((n, l.strip()) for n, l in enumerate(output.splitlines(), start=1)
+                            if "Total energy corrected" in l)
+        corrected = OutputReading(
+            reader=AGENT, value=Quantity(value=float(line.split(":")[1].split()[0]), unit="eV"),
+            summary="corrected energy",
+            citations=(FileCitation(file="aims.out", line_start=number, line_end=number, quote=line),))
+        world.validator.record_reading(world.inv, cid, reading(output), TOTAL)
+        other = Observable(name="corrected total energy", definition="'Total energy corrected' line", unit="eV")
+        state = world.validator.record_reading(world.inv, cid, corrected, other).recorded.state
+        assert [state.evidence[e].evidence.observable.name for e in state.calculations[cid].evidence_ids] == [
+            "total energy", "corrected total energy"]
 
     @pytest.mark.parametrize("bad", [
         {"line_offset": 1},
@@ -233,46 +279,21 @@ class TestResults:
     def test_unverifiable_readings_are_refused_and_nothing_is_recorded(self, world, bad):
         output = aims_output(energy=ENERGY)
         cid = world.request()
-        world.run(cid, output=output)
+        world.checked(cid, output=output)
         before = world.state().version
         value = bad.pop("value", ENERGY)
-        outcome = world.validator.assess(world.inv, cid, reading(output, value, **bad))
-        assert outcome.recorded is None and outcome.reading_problems
+        outcome = world.validator.record_reading(world.inv, cid, reading(output, value, **bad), TOTAL)
+        assert outcome.recorded is None and outcome.problems
         assert world.state().version == before
-        assert world.validator.assess(world.inv, cid, reading(output)).recorded is not None
 
-    def test_reading_a_different_energy_is_inconclusive(self, world):
-        output = aims_output(energy=ENERGY)
+    def test_readings_wait_for_the_run_check_and_follow_its_health(self, world):
+        output = aims_output(energy=ENERGY)  # a complete output, but the scheduler says the job timed out
         cid = world.request()
-        world.run(cid, output=output)
-        number, line = next((n, l.strip()) for n, l in enumerate(output.splitlines(), start=1)
-                            if "Total energy corrected" in l)
-        value = float(line.split(":")[1].split()[0])
-        other = OutputReading(reader=AGENT, value=Quantity(value=value, unit="eV"), summary="corrected energy",
-                              citations=(FileCitation(file="aims.out", line_start=number, line_end=number, quote=line),))
-        evidence = world.validator.assess(world.inv, cid, other).recorded.state.evidence
-        (record,) = evidence.values()
-        assert record.evidence.quality is EvidenceQuality.INCONCLUSIVE
-        assert not next(c for c in record.evidence.quality_checks if c.name == "agrees_with_protocol_reading").passed
-
-    def test_without_an_agent_reading_the_protocol_reads_the_value(self, world):
-        output = aims_output(energy=ENERGY)
-        cid = world.request()
-        world.run(cid, output=output)
-        state = world.validator.assess(world.inv, cid).recorded.state
+        world.run(cid, output=output, final=SchedulerState.TIMEOUT)
+        with pytest.raises(RuleViolation, match="has not been checked"):
+            world.validator.record_reading(world.inv, cid, reading(output), TOTAL)
+        world.validator.check_run(world.inv, cid)
+        state = world.validator.record_reading(world.inv, cid, reading(output), TOTAL).recorded.state
         (record,) = state.evidence.values()
-        assert record.evidence.quality is EvidenceQuality.VALIDATED and record.evidence.interpreted_by is None
-        assert record.evidence.citations[0].line_start == energy_line(output)[0]
-
-    def test_timed_out_run_is_invalid_evidence(self, world):
-        cid = world.request()
-        world.run(cid, output=aims_output(normal_end=False), final=SchedulerState.TIMEOUT)
-        state = world.validator.assess(world.inv, cid).recorded.state
-        (record,) = state.evidence.values()
-        assert record.evidence.quality is EvidenceQuality.INVALID and record.evidence.value is None
-
-    def test_runs_that_have_not_ended_cannot_be_assessed(self, world):
-        cid = world.request()
-        world.engine.examine(world.inv, cid)
-        with pytest.raises(RuleViolation, match="has not ended"):
-            world.validator.assess(world.inv, cid)
+        assert record.evidence.quality is EvidenceQuality.INVALID
+        assert not next(c for c in record.evidence.quality_checks if c.name.startswith("run_healthy")).passed

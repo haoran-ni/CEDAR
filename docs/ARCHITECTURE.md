@@ -28,7 +28,9 @@ flowchart TB
     J --> HPC[HPC: FHI-aims / other registered engines]
     HPC --> MON[Job Monitor & Event Dispatcher]
     HPC -. raw outputs .-> H1 & H2 & Hn
-    MON --> VAL[Run Health Checks & Verification of Agent Readings]
+    H1 & H2 & Hn --> AN[Analysis Runner: agent-written scripts on the login node, guarded]
+    AN --> VAL
+    MON --> VAL[Run Health Checks, Verified Readings & Analysis Results]
     VAL --> EV[(Evidence Store)]
     MON --> DB
     EV --> S[Evidence Judge]
@@ -51,12 +53,13 @@ Chief Scientist and research orchestrator are separate concerns. The LLM supervi
 | TUI client | Chat, control requests, live agent/job state, report browsing | Hold sole authoritative state; launch DFT directly |
 | Conversation API / Chief Scientist | Scientific planning, delegations, user coordination, query state | Run scientific computation or arbitrary remote shell |
 | Orchestrator | Durable plan/task graph, worker scheduling, retries, dependency resolution | Pretend a job is scientifically valid from Slurm status alone |
-| Hypothesis agent | Commit hypotheses/predictions, write or request inputs and job scripts, read raw outputs, interpret evidence | Submit anything that has not passed input examination; claim values it cannot cite |
+| Hypothesis agent | Commit hypotheses/predictions, write or request inputs and job scripts, read raw outputs, write analysis scripts, interpret evidence | Submit anything that has not passed input examination; claim values it can neither cite nor compute with a recorded analysis |
+| Analysis runner | Examine and run agent-written analysis scripts on the login node against hashed copies of run outputs; record each run | Start programs (DFT included), reach the network, read beyond the staged inputs, pass credentials to scripts |
 | Protocol registry | Resolve allowable methods; examine agent-written or generated inputs and job scripts against the declared task; optionally generate inputs; define output checks | Approve content it cannot verify; assert universal physical applicability |
 | Environment setup agent | Work out how to run codes on this system from local files or user answers; propose a compute profile with sources | Activate a profile without user approval; hard-code site settings |
 | Job manager | Create deterministic manifests, submit / track / control authorized jobs through the scheduler adapter | Fabricate scheduler IDs, skip deduplication |
 | Job monitor | Observe scheduler status with permitted polling/callback mechanism | Treat missing `squeue` rows as proof of success |
-| Result validator | Check run health and convergence; verify values agents quote against the cited raw output | Convert nonconverged numbers or unverified readings to validated evidence |
+| Result validator | Check run health and convergence; verify values agents quote against the cited raw output; record analysis results | Convert nonconverged numbers, unverified readings or values no analysis reported into validated evidence |
 | Evidence Judge | Critique/evaluate evidence, interactions and uncertainty | Average agents' confidence guesses or decide by vote |
 | Research recorder | Immutable events, readable round reports and provenance links | Rewrite prior evidence in response to later conclusions |
 
@@ -178,6 +181,7 @@ The UI can subscribe to a local event stream or poll at a restrained interval fo
 ## 8. Trust, permission, and isolation boundaries
 
 - LLM-written inputs and Slurm scripts are allowed, but only after input examination (and user approval where the verdict is `NEEDS_REVIEW`). Nothing LLM- or user-supplied is passed unchecked to subprocess or SSH, and agents never execute commands on the cluster themselves.
+- LLM-written analysis scripts run on the login node only through the analysis runner: examined first, then run without credentials, under resource limits and an audit hook that keeps them to their staged inputs and refuses programs and sockets. These guards stop mistakes, not deliberate evasion; independent review agents are a planned second layer.
 - Use distinct permissions for `read`, `prepare`, `submit`, `cancel`, `delete`, or expensive compute. Default to limits and explicit authorization for potentially destructive operations.
 - Mark literature and file content as *untrusted external data*, not executable instructions. Tool output must never override task policies or trigger arbitrary commands.
 - Persist exact reference data provenance, checksum artifacts when practicable, and make access policies explicit in offline/blind tests.

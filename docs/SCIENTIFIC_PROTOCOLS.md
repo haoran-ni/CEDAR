@@ -3,26 +3,26 @@
 A protocol is the second layer between what agents write and what runs. For one calculation type it can:
 - generate any input files an agent did not write
 - examine the complete set of files against the declared task and its own policy
-- check a finished run's health and read the requested observable
+- check a finished run's health, and read the few values every run of its kind prints
 
-It never runs anything and never changes a file it was given.
+It never runs anything and never changes a file it was given. What to take from a healthy run is the agent's decision: it reads values the code printed, citing the lines, or computes them with an analysis script ([`ANALYSIS_SCRIPTS.md`](ANALYSIS_SCRIPTS.md)).
 
 Protocols contain only knowledge that holds for the code everywhere, such as what each input keyword means and which output lines mark success or failure. Everything about a particular HPC system comes from the user-approved compute profile. Every scientific and numerical setting is declared by the agent in the task.
 
 This document grows with each implemented protocol.
 
-## `fhiaims.total_energy` 0.1
+## `fhiaims.run` 0.1
 
-Total energy of one structure from FHI-aims, at fixed geometry or after relaxation.
+One FHI-aims run of one structure, at fixed geometry or relaxing it.
 
 ### Observables
 
-| Observable | Read from `aims.out` |
+The agent declares what it will take from the run: a name, a precise definition and a unit, for any quantity. The protocol itself reads two values every run prints, and the run check records them with their lines so agents can cite them:
+
+| Reading | From `aims.out` |
 |---|---|
 | `total energy` (eV) | `Total energy of the DFT / Hartree-Fock s.c.f. calculation` in the final output block |
 | `zero-broadening total energy` (eV) | `Final zero-broadening corrected energy` in the final output block; meaningful for metals with occupation broadening |
-
-A task must request one of these exactly.
 
 ### Declared variables
 
@@ -67,6 +67,8 @@ Findings are `ERROR` (reject), `REVIEW` (needs user approval), `WARNING` or `INF
 
 ### Run checks
 
+When a job ends, the validator checks the run and stores `aims.out` and the scheduler's logs:
+
 | Check | Passes when |
 |---|---|
 | `scheduler_completed` | the scheduler reports `COMPLETED` |
@@ -76,15 +78,20 @@ Findings are `ERROR` (reject), `REVIEW` (needs user approval), `WARNING` or `INF
 | `scf_converged` | at least one `Self-consistency cycle converged.` and no `SCF cycle not converged.` or `SELF-CONSISTENCY CYCLE DID NOT CONVERGE` |
 | `geometry_converged` (relaxations only) | `Present geometry is converged.` and no `Aborting optimization` |
 | `inputs_unchanged` | the run directory still holds the examined files |
-| `citations_verified` | every cited quote was found at its lines in the stored output |
-| `agrees_with_protocol_reading` | the agent's value equals the protocol's own reading, when both exist |
 
 These marker strings were checked against the FHI-aims source and real outputs of versions 240507 and 260331.1.
 
-A failed health check makes the evidence `INVALID`. If only `geometry_converged` failed, it is `INCONCLUSIVE` instead. If the agent and the protocol read different values, or nobody read a value, the evidence is `INCONCLUSIVE`. Otherwise it is `VALIDATED`, meaning a converged total energy at the declared settings.
+### Evidence from a run
+
+Every result taken from the run, a cited reading or an analysis result, gets its quality from the run check:
+
+- every check passed and the job `COMPLETED`: `VALIDATED`, meaning the value at the declared settings from a healthy run
+- a check failed: `INVALID`, or `INCONCLUSIVE` if only `geometry_converged` failed
+
+A reading must also have every quote found at its lines of the stored output (`citations_verified`). An analysis result must come from a script that completed, and carries the checks the script made for the run's particular purpose; a failed script check makes it `INCONCLUSIVE` ([`ANALYSIS_SCRIPTS.md`](ANALYSIS_SCRIPTS.md)). It is recorded with the limitation that the script has not been independently reviewed.
 
 ### Limitations
 
-- Numerical convergence of energy differences with respect to k-points, basis, slab thickness and vacuum is not established by a single calculation. It needs a declared convergence comparison.
+- Numerical convergence of the quantities taken from a run, and of differences between runs, with respect to k-points, basis, slab thickness and vacuum is not established by a single calculation. It needs a declared convergence comparison.
 - A species block modified by an agent can run only after user review. The examiner does not judge basis quality.
 - Keyword meanings cover the keywords listed above. Anything else needs review rather than being guessed.

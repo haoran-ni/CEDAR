@@ -111,8 +111,9 @@ def agent_requests(system):
     workspace = system["workspace"]
     return [
         reply(call("set_hypothesis_status", status="PLANNING_TEST", reason="baseline first"),
-              call("request_calculation", protocol_name="fhiaims.total_energy", protocol_version="0.1",
-                   observable_name="total energy", estimand="total energy of CO/Cu(111) atop",
+              call("request_calculation", protocol_name="fhiaims.run", protocol_version="0.1",
+                   observable_name="total energy", observable_definition="final total energy printed by FHI-aims",
+                   observable_unit="eV", estimand="total energy of CO/Cu(111) atop",
                    system_label="CO/Cu(111) atop (synthetic)", structure_text=geometry_text(slab, fixed=bottom),
                    rationale="baseline", **declared())),
         lambda c: reply(call("register_prediction", prediction_id="pred-1", statement="converges",
@@ -124,14 +125,31 @@ def agent_requests(system):
     ]
 
 
+HARTREE_SCRIPT = (
+    "import json, re\nline = next(l for l in open('inputs/{calc}/aims.out') if 'Total energy of the DFT' in l)\n"
+    "ev = float(re.findall(r'[-+]?\\d+\\.\\d+', line)[-1])\nprint('matched:', line.strip())\n"
+    "json.dump({{'results': {{'total_energy_ha': {{'value': ev / 27.211386245988, 'unit': 'Ha'}}}},\n"
+    "           'checks': {{'one_final_energy_line': {{'passed': True, 'detail': line.strip()}}}}}},\n"
+    "          open('results.json', 'w'))\n")
+
+
 def agent_reads(system, output):
+    """The woken agent records a cited reading, computes a value with a script and records it."""
     line = next(i for i, l in enumerate(output.splitlines(), start=1) if "Total energy of the DFT" in l)
     workspace = system["workspace"]
     return [
-        lambda c: reply(call("submit_reading", calculation_id=latest_calc(workspace), value=ENERGY, unit="eV",
-                             summary="baseline total energy",
+        lambda c: reply(call("submit_reading", calculation_id=latest_calc(workspace), observable_name="total energy",
+                             observable_definition="final total energy printed by FHI-aims", value=ENERGY,
+                             unit="eV", summary="baseline total energy",
                              citations=[{"file": "aims.out", "line_start": line, "line_end": line,
                                          "quote": output.splitlines()[line - 1].strip()}])),
+        lambda c: reply(call("run_analysis", purpose="total energy in Hartree",
+                             script=HARTREE_SCRIPT.format(calc=latest_calc(workspace)),
+                             inputs=[{"calculation_id": latest_calc(workspace)}])),
+        lambda c: reply(call("record_result", analysis_id=next(iter(workspace.ledger.load(INV).analyses)),
+                             result_name="total_energy_ha", observable_name="total energy in Hartree",
+                             observable_definition="final total energy converted with CODATA 2018",
+                             summary="printed eV value divided by 27.211386245988")),
         reply(call("set_hypothesis_status", status="ASSESSED", reason="baseline recorded")),
         reply(TextPart(text="Baseline validated; it alone does not test the hypothesis.")),
     ]
@@ -174,8 +192,9 @@ def test_full_loop(system):
     notes = dispatcher.tick()
     assert any("SCHEDULER_TERMINAL" in n for n in notes) and any("woke the agent" in n for n in notes)
     state = workspace.ledger.load(INV)
-    evidence = state.evidence[state.calculations[calc].evidence_id]
-    assert evidence.evidence.quality is EvidenceQuality.VALIDATED
+    evidence, computed = (state.evidence[e] for e in state.calculations[calc].evidence_ids)
+    assert evidence.evidence.quality is EvidenceQuality.VALIDATED and evidence.evidence.citations
+    assert computed.evidence.analysis_id is not None and computed.evidence.quality is EvidenceQuality.VALIDATED
     assert state.hypotheses[HYP].status is HypothesisStatus.ASSESSED
 
     # The Chief asks the Judge; the Judge records a partial assessment.
@@ -202,7 +221,8 @@ def test_full_loop(system):
     # The dispatcher keeps the research notebook in step with the record.
     notebook = workspace.notebook_dir(INV)
     index = (notebook / "index.md").read_text()
-    assert f"| {calc} |" in index and f"| COMPLETED | {evidence.evidence_id}: VALIDATED, {ENERGY!r} eV |" in index
+    assert f"| {calc} |" in index
+    assert f"| COMPLETED | healthy | {evidence.evidence_id}: VALIDATED, total energy = {ENERGY!r} eV; " in index
     assert "NOT_TESTED → **INCONCLUSIVE** (partial)" in (notebook / "round-01.md").read_text()
     assert chat.handle("/report").startswith(f"Research notebook (already up to date): {notebook / 'index.md'}")
 
@@ -252,7 +272,7 @@ def test_spent_token_budget_leaves_queued_work_waiting(system):
     assert len(workspace.ledger.load(INV).pending_tasks) == 1
 
 
-def test_protocol_reads_runs_no_agent_reported_on(system):
+def test_the_dispatcher_checks_every_finished_run(system):
     workspace, chat, dispatcher, clients = system["workspace"], system["chat"], system["dispatcher"], system["clients"]
     clients.add("chief_scientist", open_and_delegate(system["site"]), reply(TextPart(text="ok")))
     chat.handle("Investigate CO on Cu(111).")
@@ -266,10 +286,11 @@ def test_protocol_reads_runs_no_agent_reported_on(system):
     system["scheduler"].set_state(next(iter(system["scheduler"].jobs)), SchedulerState.COMPLETED)
     clients.add("hypothesis_agent", reply(TextPart(text="I will look later.")))
     notes = dispatcher.tick()
-    assert any("from the protocol's own reading" in n for n in notes)
-    evidence = workspace.ledger.load(INV).evidence
-    (record,) = evidence.values()
-    assert record.evidence.interpreted_by is None and record.evidence.value.value == ENERGY
+    assert any(f"checked the run of {calc}: healthy" in n for n in notes)
+    state = workspace.ledger.load(INV)
+    assert state.calculations[calc].run_check.healthy and state.evidence == {}  # evidence comes only from agents
+    woken = clients.models["hypothesis_agent"].calls[-1].messages[-1].text
+    assert "run check: healthy" in woken and "protocol read total energy" in woken
 
 
 def test_a_second_dispatcher_waits_for_the_first(system):

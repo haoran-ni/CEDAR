@@ -16,6 +16,10 @@ from sim2real.contracts.events import AssessmentRecorded, EventDraft
 from sim2real.contracts.status import Assessment, Completeness
 from sim2real.contracts.task import compare_tasks
 from sim2real.state.ledger import ResearchLedger
+from sim2real.state.projection import hypothesis_evidence
+from sim2real.store.artifacts import ArtifactStore
+
+SCRIPT_SHOWN_CHARS = 4000
 
 
 @dataclass
@@ -23,6 +27,8 @@ class JudgeContext:
     ledger: ResearchLedger
     investigation_id: str
     actor: Actor
+    artifacts: ArtifactStore | None = None
+    """Where analysis scripts are stored, so the dossier can show them."""
 
 
 class HypothesisArg(Contract):
@@ -45,6 +51,16 @@ class AssessmentArgs(Contract):
     evidence_ids: list[Identifier] = []
     rationale: NonEmptyStr = Field(description="Why this follows from the cited evidence, in a few sentences.")
     limitations: list[NonEmptyStr] = []
+
+
+def _analysis_lines(run, artifacts: ArtifactStore | None) -> list[str]:
+    lines = [f"  analysis purpose: {run.purpose}; ran with {run.environment}"]
+    lines += [f"  staged from {i.calculation_id}: {', '.join(i.files)}" for i in run.inputs]
+    if artifacts is not None:
+        script = artifacts.read(run.script).decode(errors="replace")
+        shown = script if len(script) <= SCRIPT_SHOWN_CHARS else script[:SCRIPT_SHOWN_CHARS] + "\n…[script truncated]"
+        lines += ["  script:", *(f"    {line}" for line in shown.splitlines())]
+    return lines
 
 
 def judge_tools(ctx: JudgeContext) -> list[AgentTool]:
@@ -73,16 +89,23 @@ def judge_tools(ctx: JudgeContext) -> list[AgentTool]:
                          f"estimand: {task.estimand}; system: {task.system_label}")
             lines.append(f"  interventions {task.interventions}; controls {task.controls}; numerical "
                          f"{task.numerical_settings}")
-            if calc.evidence_id:
-                record = state.evidence[calc.evidence_id]
-                ev = record.evidence
-                value = f"{ev.value.value} {ev.value.unit}" if ev.value else "no value"
-                lines.append(f"  evidence {record.evidence_id} (recorded at event {record.recorded_at}): "
-                             f"{ev.quality.value}, {value}; kind {ev.kind.value}")
-                lines += [f"    check {c.name}: {'passed' if c.passed else 'FAILED'} - {c.detail or ''}"
-                          for c in ev.quality_checks]
-                lines += [f"    limitation: {text}" for text in ev.limitations]
-                lines += [f"    not comparable when: {text}" for text in ev.non_comparability]
+            if calc.run_check is not None:
+                failed = [c.name for c in calc.run_check.checks if not c.passed]
+                lines.append("  run check: " + (f"FAILED {', '.join(failed)}" if failed else "healthy"))
+        for record in hypothesis_evidence(state, hyp.hypothesis_id):
+            ev = record.evidence
+            value = f"{ev.value.value!r} {ev.value.unit}" if ev.value else "no value"
+            source = (f"analysis {ev.analysis_id} of {', '.join(ev.calculation_ids)}" if ev.analysis_id
+                      else f"calculation {ev.calculation_id}" if ev.calculation_id else ev.kind.value)
+            lines.append(f"Evidence {record.evidence_id} (recorded at event {record.recorded_at}) from {source}: "
+                         f"{ev.quality.value}; {ev.observable.name} ({ev.observable.definition}) = {value}")
+            lines.append(f"  summary by {ev.interpreted_by.id if ev.interpreted_by else 'the validator'}: {ev.summary}")
+            lines += [f"  check {c.name}: {'passed' if c.passed else 'FAILED'} - {c.detail or ''}"
+                      for c in ev.quality_checks]
+            lines += [f"  limitation: {text}" for text in ev.limitations]
+            lines += [f"  not comparable when: {text}" for text in ev.non_comparability]
+            if ev.analysis_id is not None:
+                lines += _analysis_lines(state.analyses[ev.analysis_id].run, ctx.artifacts)
         for entry in hyp.assessments:
             lines.append(f"Earlier assessment: {entry.assessment.value} ({entry.completeness.value}), citing "
                          f"{', '.join(entry.evidence_ids) or 'nothing'}: {entry.rationale}")
@@ -93,9 +116,11 @@ def judge_tools(ctx: JudgeContext) -> list[AgentTool]:
         lines = []
         for record in state.evidence.values():
             ev = record.evidence
-            value = f"{ev.value.value} {ev.value.unit}" if ev.value else "no value"
-            lines.append(f"{record.evidence_id}: {ev.quality.value}, {ev.observable.name} = {value}; calculation "
-                         f"{ev.calculation_id or '-'}; {ev.summary}")
+            value = f"{ev.value.value!r} {ev.value.unit}" if ev.value else "no value"
+            source = (f"analysis {ev.analysis_id} of {', '.join(ev.calculation_ids)}" if ev.analysis_id
+                      else f"calculation {ev.calculation_id or '-'}")
+            lines.append(f"{record.evidence_id}: {ev.quality.value}, {ev.observable.name} = {value}; {source}; "
+                         f"{ev.summary}")
         return "\n".join(lines) or "No evidence recorded yet."
 
     def compare(args: CompareArgs) -> str:
@@ -122,8 +147,9 @@ def judge_tools(ctx: JudgeContext) -> list[AgentTool]:
 
     return [
         AgentTool("hypothesis_dossier", "Everything recorded about a hypothesis: statement, falsifiers, "
-                  "predictions with when they were recorded, its calculations with settings, evidence with every "
-                  "quality check and limitation, and earlier assessments.", HypothesisArg, dossier),
+                  "predictions with when they were recorded, its calculations with settings and run checks, evidence "
+                  "with every quality check and limitation (with the script behind each analysis result), and "
+                  "earlier assessments.", HypothesisArg, dossier),
         AgentTool("evidence_index", "List all evidence in the investigation.", NoArgs, evidence_index),
         AgentTool("compare_calculations", "Check whether calculations form a controlled comparison: which "
                   "differences are declared, numerical, or uncontrolled.", CompareArgs, compare),

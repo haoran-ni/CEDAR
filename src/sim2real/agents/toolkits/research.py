@@ -2,8 +2,9 @@
 
 Each tool goes through the ledger or an engine service under the agent's own identity,
 so every research rule applies: the agent can write inputs and request calculations, but
-the examiner judges them, submission needs the researcher's authorization, and a reading
-counts only after the validator has checked its citations.
+the examiner judges them, submission needs the researcher's authorization, a reading
+counts only after the validator has checked its citations, and an analysis script runs
+only through the guarded runner, which records it.
 """
 
 from dataclasses import dataclass
@@ -19,6 +20,7 @@ from sim2real.contracts.evidence import FileCitation, OutputReading
 from sim2real.contracts.hypothesis import Prediction
 from sim2real.contracts.status import CalculationState, HypothesisStatus
 from sim2real.contracts.task import ProtocolRef, ResourceBudget, ScientificTaskSpec
+from sim2real.engine.analysis import RESULTS_FILE, RESULTS_FORMAT, AnalysisRunner
 from sim2real.engine.inputs import ProtocolEngine
 from sim2real.engine.results import ResultValidator
 from sim2real.protocols.base import ProtocolRegistry
@@ -39,6 +41,7 @@ class ResearchContext:
     engine: ProtocolEngine
     validator: ResultValidator
     files: FileAccess
+    analysis: AnalysisRunner
 
 
 class NoArgs(Contract):
@@ -46,7 +49,7 @@ class NoArgs(Contract):
 
 
 class DescribeArgs(Contract):
-    name: str = Field(description="Protocol name, e.g. fhiaims.total_energy")
+    name: str = Field(description="Protocol name, e.g. fhiaims.run")
     version: str
 
 
@@ -69,7 +72,11 @@ class PredictionArgs(Contract):
 class CalculationArgs(Contract):
     protocol_name: str
     protocol_version: str
-    observable_name: str = Field(description="One of the protocol's observables, by name.")
+    observable_name: NonEmptyStr = Field(description="What you will take from this run, e.g. 'total energy' or "
+                                                     "'CO 2pi* Kohn-Sham eigenvalue'.")
+    observable_definition: NonEmptyStr = Field(description="Precisely which quantity, and how it is obtained from "
+                                                           "the run.")
+    observable_unit: str | None = None
     estimand: NonEmptyStr = Field(description="Exactly what the calculation estimates.")
     system_label: NonEmptyStr
     structure_path: str | None = Field(default=None, description="Absolute path of a readable structure file.")
@@ -108,10 +115,37 @@ class CitationArg(Contract):
 
 class ReadingArgs(Contract):
     calculation_id: Identifier
+    observable_name: NonEmptyStr = Field(description="What the value is, e.g. 'total energy'.")
+    observable_definition: NonEmptyStr = Field(description="Precisely which quantity, from which part of the "
+                                                           "output.")
     value: float
     unit: NonEmptyStr
     citations: list[CitationArg] = Field(min_length=1)
     summary: NonEmptyStr
+    limitations: list[NonEmptyStr] = []
+
+
+class AnalysisInputArg(Contract):
+    calculation_id: Identifier
+    files: list[str] = Field(default=[], description="Files of the run directory to stage, by path relative to it. "
+                                                     "Empty: the run's stored outputs and its input files.")
+
+
+class AnalysisArgs(Contract):
+    purpose: NonEmptyStr = Field(description="What the script computes and why, in a sentence.")
+    script: NonEmptyStr = Field(description="Complete Python script. It reads inputs/<calculation_id>/<file>, "
+                                            "prints what it finds, and writes the results and the checks it made to "
+                                            f"{RESULTS_FILE} in the working directory: {RESULTS_FORMAT}. Top-level "
+                                            "checks apply to every result; a result's own checks to it alone.")
+    inputs: list[AnalysisInputArg] = Field(min_length=1)
+
+
+class ResultArgs(Contract):
+    analysis_id: Identifier
+    result_name: Identifier = Field(description=f"A result name from the analysis's {RESULTS_FILE}.")
+    observable_name: NonEmptyStr
+    observable_definition: NonEmptyStr
+    summary: NonEmptyStr = Field(description="What the value is and how the script obtained it.")
     limitations: list[NonEmptyStr] = []
 
 
@@ -184,9 +218,8 @@ def research_tools(ctx: ResearchContext) -> list[AgentTool]:
         protocol = ctx.registry.get(ProtocolRef(name=args.protocol_name, version=args.protocol_version))
         if protocol is None:
             raise ToolFailure(f"no protocol {args.protocol_name} {args.protocol_version}")
-        observable = next((o for o in protocol.observables if o.name == args.observable_name), None)
-        if observable is None:
-            raise ToolFailure(f"{protocol.ref.name} reports {[o.name for o in protocol.observables]}")
+        observable = Observable(name=args.observable_name, definition=args.observable_definition,
+                                unit=args.observable_unit)
         if args.structure_path is not None:
             structure_bytes = ctx.files.resolve(args.structure_path).read_bytes()
         else:
@@ -220,9 +253,20 @@ def research_tools(ctx: ResearchContext) -> list[AgentTool]:
             raise ToolFailure(f"unknown calculation {args.calculation_id}")
         if calc.workdir is None:
             return f"{args.calculation_id} has no run directory yet ({calc.state.value})."
-        paths = ctx.validator.output_paths(ctx.investigation_id, args.calculation_id)
-        listing = "\n".join(f"{p}  ({p.stat().st_size} bytes)" for p in paths.values()) or "no outputs yet"
-        return f"{_calculation_summary(ctx, calc)}\nOutput files:\n{listing}"
+        lines = [_calculation_summary(ctx, calc)]
+        if calc.run_check is None:
+            lines.append("The run has not been checked yet; readings and analyses wait for the check.")
+        else:
+            stored = ", ".join(calc.run_check.outputs) or "none"
+            lines.append(f"Stored outputs (cite these in readings; staged for analyses by default): {stored}")
+        directory = ctx.validator.run_directory(ctx.investigation_id, args.calculation_id)
+        if directory.is_dir():
+            files = sorted(p for p in directory.rglob("*") if p.is_file())
+            lines.append(f"Files in {directory} (stage others for an analysis by their relative path):")
+            lines += [f"  {p.relative_to(directory)}  ({p.stat().st_size} bytes)" for p in files[:200]]
+            if len(files) > 200:
+                lines.append(f"  … {len(files) - 200} more")
+        return "\n".join(lines)
 
     def submit_reading(args: ReadingArgs) -> ToolOutcome:
         reading = OutputReading(
@@ -230,12 +274,59 @@ def research_tools(ctx: ResearchContext) -> list[AgentTool]:
             limitations=tuple(args.limitations),
             citations=tuple(FileCitation(file=c.file, line_start=c.line_start, line_end=c.line_end, quote=c.quote)
                             for c in args.citations))
-        outcome = ctx.validator.assess(ctx.investigation_id, args.calculation_id, reading)
+        observable = Observable(name=args.observable_name, definition=args.observable_definition, unit=args.unit)
+        outcome = ctx.validator.record_reading(ctx.investigation_id, args.calculation_id, reading, observable)
         if outcome.recorded is None:
-            return ToolOutcome("Reading not accepted:\n" + "\n".join(f"- {p}" for p in outcome.reading_problems),
+            return ToolOutcome("Reading not accepted:\n" + "\n".join(f"- {p}" for p in outcome.problems),
                                is_error=True)
-        calc = outcome.recorded.state.calculations[args.calculation_id]
-        return f"Reading verified and recorded.\n{_calculation_summary(ctx, calc)}"
+        (event,) = outcome.recorded.events
+        ev = event.payload.evidence
+        return (f"Reading recorded as evidence {event.payload.evidence_id}: {ev.quality.value}, "
+                f"{ev.observable.name} = {ev.value.value} {ev.value.unit}.")
+
+    def run_analysis(args: AnalysisArgs) -> ToolOutcome:
+        report = ctx.analysis.run(ctx.investigation_id, ctx.hypothesis_id, purpose=args.purpose, script=args.script,
+                                  inputs={i.calculation_id: i.files for i in args.inputs})
+        if report.analysis_id is None:
+            return ToolOutcome("The script did not run:\n" + "\n".join(f"- {p}" for p in report.problems),
+                               is_error=True)
+        run = report.run
+        lines = [f"Analysis {report.analysis_id}: {run.outcome.value} (exit code {run.exit_code}, "
+                 f"{run.duration_seconds:g} s)"]
+        def check_line(c) -> str:
+            return f"    {'passed' if c.passed else 'FAILED'} {c.name}" + (f": {c.detail}" if c.detail else "")
+
+        if run.checks:
+            lines.append("Checks on every result:")
+            lines += [check_line(c) for c in run.checks]
+        if run.results:
+            lines.append("Results (record one with record_result):")
+            for r in run.results:
+                lines.append(f"  {r.name} = {r.value.value!r} {r.value.unit}" + (f"  ({r.description})"
+                                                                                if r.description else ""))
+                lines += [check_line(c) for c in r.checks]
+        lines += [f"Note: {p}" for p in report.problems]
+        lines.append("Output:\n" + (report.shown_output or "(nothing printed)"))
+        return ToolOutcome("\n".join(lines), is_error=run.outcome.value != "completed")
+
+    def record_result(args: ResultArgs) -> ToolOutcome:
+        analysis = ctx.ledger.load(ctx.investigation_id).analyses.get(args.analysis_id)
+        if analysis is None:
+            raise ToolFailure(f"unknown analysis {args.analysis_id}")
+        result = analysis.run.result(args.result_name)
+        unit = result.value.unit if result is not None else None
+        outcome = ctx.validator.record_analysis_result(
+            ctx.investigation_id, args.analysis_id, args.result_name,
+            observable=Observable(name=args.observable_name, definition=args.observable_definition, unit=unit),
+            summary=args.summary, limitations=tuple(args.limitations), reader=ctx.actor)
+        if outcome.recorded is None:
+            return ToolOutcome("Result not recorded:\n" + "\n".join(f"- {p}" for p in outcome.problems),
+                               is_error=True)
+        (event,) = outcome.recorded.events
+        ev = event.payload.evidence
+        failed = [c.name for c in ev.quality_checks if not c.passed]
+        return (f"Recorded as evidence {event.payload.evidence_id}: {ev.quality.value}, {ev.observable.name} = "
+                f"{ev.value.value!r} {ev.value.unit}." + (f" Failed checks: {', '.join(failed)}." if failed else ""))
 
     return [
         AgentTool("investigation_overview", "Show the investigation, your hypothesis, its predictions and every "
@@ -257,9 +348,20 @@ def research_tools(ctx: ResearchContext) -> list[AgentTool]:
                   CalculationArgs, request_calculation),
         AgentTool("wait_for_calculations", "Wait for submitted or approved calculations to finish. This ends your "
                   "current turn; you are resumed when they are done.", WaitArgs, wait_for_calculations),
-        AgentTool("run_outputs", "List a finished calculation's output files (absolute paths) for reading with "
-                  "the file tools.", CalculationArg, run_outputs),
-        AgentTool("submit_reading", "Report a value you read from a run's output, citing the exact lines. It is "
-                  "recorded as evidence only if the citations are found verbatim and the run passed its checks.",
-                  ReadingArgs, submit_reading),
+        AgentTool("run_outputs", "Show a finished calculation's run check, its stored outputs, and every file "
+                  "in its run directory, with absolute paths for reading with the file tools.", CalculationArg,
+                  run_outputs),
+        AgentTool("submit_reading", "Record a value printed in a run's stored output, citing the exact lines; the "
+                  "quoted lines must contain the value and its unit (include a header line if the unit is only "
+                  "there). It is checked against the stored file before it is recorded.", ReadingArgs,
+                  submit_reading),
+        AgentTool("run_analysis", "Run a Python script you wrote on files of checked runs, on the login node, "
+                  "for quantities that are not printed as such (eigenvalue gaps, geometries, averages, "
+                  "differences between runs) or to explore outputs. The script is examined and run under guards: "
+                  "it reads only its staged inputs under inputs/<calculation_id>/, writes only in its working "
+                  "directory, cannot start programs or use the network, and is limited in time and memory. "
+                  "Every run is recorded.", AnalysisArgs, run_analysis),
+        AgentTool("record_result", f"Record one result an analysis wrote to {RESULTS_FILE} as evidence. The value "
+                  "is taken from the analysis record, never typed by you; its quality follows the health of the "
+                  "runs it used.", ResultArgs, record_result),
     ]

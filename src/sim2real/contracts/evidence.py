@@ -28,6 +28,8 @@ class EvidenceKind(StrEnum):
     INFERENCE = "inference"
     """Derived from other information under stated assumptions."""
     INDIRECT_CONSTRAINT = "indirect_constraint"
+    ANALYSIS = "analysis"
+    """Computed by a recorded analysis script from the stored files of checked runs."""
 
 
 COMPUTED_KINDS = frozenset({EvidenceKind.DIRECT_COMPUTATION, EvidenceKind.ARCHIVED_COMPUTATION})
@@ -58,12 +60,30 @@ class OutputCitation(Contract):
         return self
 
 
+class RunReading(Contract):
+    """A value a protocol read from a run's output by itself, with the lines it came from."""
+
+    name: NonEmptyStr
+    value: Quantity
+    file: FileName
+    line_start: int = Field(ge=1)
+    line_end: int = Field(ge=1)
+    quote: NonEmptyStr
+
+
 class EvidenceObject(Contract):
     kind: EvidenceKind
     summary: NonEmptyStr
     observable: Observable
     value: Quantity | None = None
     calculation_id: Identifier | None = None
+    """The run a direct reading was taken from."""
+    calculation_ids: tuple[Identifier, ...] = ()
+    """The runs whose files an analysis used."""
+    analysis_id: Identifier | None = None
+    """The recorded analysis that computed the value."""
+    analysis_result: Identifier | None = None
+    """Which of the analysis's reported results this is."""
     method: dict[str, JsonValue] = {}
     conditions: dict[str, JsonValue] = {}
     quality: EvidenceQuality
@@ -82,6 +102,15 @@ class EvidenceObject(Contract):
     def _consistent(self) -> "EvidenceObject":
         if (self.kind is EvidenceKind.DIRECT_COMPUTATION) != (self.calculation_id is not None):
             raise ValueError("calculation_id is required for, and only allowed on, direct_computation evidence")
+        analysis = self.kind is EvidenceKind.ANALYSIS
+        if (analysis != (self.analysis_id is not None) or analysis != (self.analysis_result is not None)
+                or analysis != bool(self.calculation_ids)):
+            raise ValueError("analysis_id, analysis_result and calculation_ids are required for, and only allowed on, "
+                             "analysis evidence")
+        if analysis and self.value is None:
+            raise ValueError("analysis evidence must carry the value the analysis computed")
+        if analysis and not any(isinstance(s, ArtifactRef) for s in self.sources):
+            raise ValueError("analysis evidence must link the stored script and inputs")
         if self.kind in COMPUTED_KINDS and not any(isinstance(s, ArtifactRef) for s in self.sources):
             raise ValueError("computed evidence must link at least one raw output artifact")
         if self.kind is EvidenceKind.PUBLISHED_EXPERIMENT and not any(

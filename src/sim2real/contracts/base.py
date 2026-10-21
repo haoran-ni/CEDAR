@@ -75,6 +75,7 @@ class ActorKind(StrEnum):
     JOB_MANAGER = "job_manager"
     JOB_MONITOR = "job_monitor"
     VALIDATOR = "validator"
+    ANALYSIS_RUNNER = "analysis_runner"
     SYSTEM = "system"
 
 

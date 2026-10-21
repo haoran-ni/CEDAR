@@ -6,10 +6,11 @@ from pathlib import Path
 from sim2real.agents.toolkits.files import FileAccess
 from sim2real.agents.transcripts import TranscriptStore
 from sim2real.engine import JobManager, JobMonitor, ProtocolEngine, ResultValidator
+from sim2real.engine.analysis import AnalysisRunner
 from sim2real.hpc.profile import ComputeProfile, ProfileStore
 from sim2real.hpc.slurm import SchedulerBackend, SlurmBackend
 from sim2real.models import CredentialStore, ModelClient, ModelConfig, ModelSettings, create_client
-from sim2real.protocols import FhiAimsTotalEnergy, ProtocolRegistry
+from sim2real.protocols import FhiAimsRun, ProtocolRegistry
 from sim2real.state.ledger import ResearchLedger
 from sim2real.state.projection import InvestigationState
 from sim2real.store import ArtifactStore, SQLiteEventStore
@@ -48,11 +49,12 @@ class Services:
     manager: JobManager
     monitor: JobMonitor
     validator: ResultValidator
+    analysis: AnalysisRunner
     files: FileAccess
 
 
 def registry_for(profile: ComputeProfile) -> ProtocolRegistry:
-    protocols = [FhiAimsTotalEnergy(profile)] if "fhi-aims" in profile.codes else []
+    protocols = [FhiAimsRun(profile)] if "fhi-aims" in profile.codes else []
     return ProtocolRegistry(protocols)
 
 
@@ -68,6 +70,7 @@ def services_for(workspace: Workspace, profile: ComputeProfile, backend: Schedul
         manager=JobManager(workspace.ledger, backend, profile.runs_root),
         monitor=JobMonitor(workspace.ledger, backend),
         validator=ResultValidator(workspace.ledger, registry, workspace.artifacts, backend, profile.runs_root),
+        analysis=AnalysisRunner(workspace.ledger, workspace.artifacts, profile.runs_root, workspace.root / "analyses"),
         files=FileAccess(roots=readable, deny=list(deny)),
     )
 

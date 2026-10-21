@@ -6,11 +6,14 @@ produces. Payloads only add information; nothing edits or deletes an earlier rec
 
 from typing import Annotated, Literal
 
-from pydantic import AwareDatetime, Field, model_validator
+from pydantic import AwareDatetime, Field, JsonValue, model_validator
 
+from sim2real.contracts.analysis import AnalysisRun
 from sim2real.contracts.base import (
     Actor,
+    ArtifactRef,
     Contract,
+    FileName,
     Identifier,
     NonEmptyStr,
     RelativePath,
@@ -18,7 +21,7 @@ from sim2real.contracts.base import (
     canonical_json,
     sha256_hex,
 )
-from sim2real.contracts.evidence import EvidenceObject
+from sim2real.contracts.evidence import EvidenceObject, QualityCheck, RunReading
 from sim2real.contracts.examination import InputExamination
 from sim2real.contracts.hypothesis import HypothesisSpec, Prediction
 from sim2real.contracts.investigation import InvestigationSpec, ObservableAlignment
@@ -27,6 +30,7 @@ from sim2real.contracts.status import (
     Assessment,
     CalculationState,
     Completeness,
+    EvidenceQuality,
     HypothesisStatus,
     InvestigationStatus,
     SchedulerState,
@@ -146,6 +150,40 @@ class CalculationStateChanged(Contract):
     """User intervention that authorizes this change, where one is required."""
 
 
+class RunChecked(Contract):
+    """The validator's health check of a finished run, with the run's output files stored."""
+
+    type: Literal["run_checked"] = "run_checked"
+    calculation_id: Identifier
+    outputs: dict[FileName, ArtifactRef] = {}
+    checks: tuple[QualityCheck, ...] = Field(min_length=1)
+    failure_quality: EvidenceQuality
+    """The best quality a result from this run can have when a check failed."""
+    readings: tuple[RunReading, ...] = ()
+    """Values the protocol read by itself, e.g. the final total energy."""
+    limitations: tuple[NonEmptyStr, ...] = ()
+    method: dict[str, JsonValue] = {}
+
+    @model_validator(mode="after")
+    def _failure_is_not_success(self) -> "RunChecked":
+        if self.failure_quality not in (EvidenceQuality.INVALID, EvidenceQuality.INCONCLUSIVE):
+            raise ValueError("a failed run check can make results INVALID or INCONCLUSIVE, nothing better")
+        return self
+
+    @property
+    def healthy(self) -> bool:
+        return all(c.passed for c in self.checks)
+
+
+class AnalysisRecorded(Contract):
+    """An analysis script the runner executed for a hypothesis, and what came of it."""
+
+    type: Literal["analysis_recorded"] = "analysis_recorded"
+    analysis_id: Identifier
+    hypothesis_id: Identifier
+    run: AnalysisRun
+
+
 AGENT_TASK_ROLES = ("hypothesis_agent", "evidence_judge")
 
 
@@ -213,6 +251,8 @@ EventPayload = Annotated[
     | CalculationLinked
     | CalculationInputsExamined
     | CalculationStateChanged
+    | RunChecked
+    | AnalysisRecorded
     | EvidenceRecorded
     | AssessmentRecorded
     | AgentTaskQueued

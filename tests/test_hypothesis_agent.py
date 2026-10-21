@@ -1,7 +1,8 @@
 """A hypothesis agent's full cycle with the ScriptedModel and FakeScheduler TEST DOUBLES.
 
-The scripted model plays the agent: it requests a calculation with a control.in it wrote,
-registers a prediction, waits, then reads the synthetic output and submits a cited reading.
+The scripted model plays the agent: it requests a calculation, registers a prediction,
+waits, then reads the synthetic output, submits a cited reading, runs an analysis script on
+the output and records its result. The analysis script really runs, under its guards.
 """
 
 import re
@@ -16,6 +17,7 @@ from sim2real.agents.prompts import HYPOTHESIS_AGENT
 from sim2real.agents.toolkits import FileAccess, ResearchContext, file_tools, research_tools
 from sim2real.contracts import (
     CalculationState,
+    EvidenceKind,
     EvidenceQuality,
     HypothesisStatus,
     PermissionAction,
@@ -38,7 +40,7 @@ def agent(world, tmp_path):
     access = FileAccess(roots=[world.runs], deny=[tmp_path / "config"])
     ctx = ResearchContext(ledger=world.ledger, investigation_id=world.inv, hypothesis_id=world.hyp, actor=AGENT,
                           registry=world.registry, artifacts=world.artifacts, engine=world.engine,
-                          validator=world.validator, files=access)
+                          validator=world.validator, files=access, analysis=world.analysis)
     return research_tools(ctx) + file_tools(access)
 
 
@@ -53,7 +55,8 @@ def calc_id(call) -> str:
 def request_args(world, control_text=None, **overrides):
     slab, bottom = co_on_cu111()
     decl = declared(**overrides)
-    args = {"protocol_name": "fhiaims.total_energy", "protocol_version": "0.1", "observable_name": "total energy",
+    args = {"protocol_name": "fhiaims.run", "protocol_version": "0.1", "observable_name": "total energy",
+            "observable_definition": "final total energy printed by FHI-aims", "observable_unit": "eV",
             "estimand": "total energy of CO/Cu(111) atop", "system_label": "CO/Cu(111) atop (synthetic)",
             "structure_text": geometry_text(slab, fixed=bottom), "rationale": "baseline total energy", **decl}
     if control_text is not None:
@@ -74,7 +77,7 @@ def test_full_cycle(world, agent, tmp_path):
     # Invocation 1: plan and request.
     first_script = [
         reply(ToolCall(id="t1", name="investigation_overview", arguments={}),
-              ToolCall(id="t2", name="describe_protocol", arguments={"name": "fhiaims.total_energy", "version": "0.1"})),
+              ToolCall(id="t2", name="describe_protocol", arguments={"name": "fhiaims.run", "version": "0.1"})),
         reply(ToolCall(id="t3", name="request_calculation", arguments=request_args(world))),
         lambda call: reply(ToolCall(id="t4", name="register_prediction", arguments={
             "prediction_id": "pred-1", "statement": "The run converges.", "observable_name": "total energy",
@@ -102,28 +105,50 @@ def test_full_cycle(world, agent, tmp_path):
     (world.runs / state.calculations[cid].workdir / "aims.out").write_text(output)
     world.scheduler.set_state(job, SchedulerState.COMPLETED)
     world.monitor.poll(world.inv)
+    world.validator.check_run(world.inv, cid)  # the dispatcher's job when a run ends
 
-    # Invocation 2: read the output and report a cited value.
+    # Invocation 2: read the output, report a cited value, and compute one with a script.
     line = next(i for i, l in enumerate(output.splitlines(), start=1) if "Total energy of the DFT" in l)
     quote = output.splitlines()[line - 1].strip()
+    script = (f"import json, re\nline = next(l for l in open('inputs/{cid}/aims.out') if 'Total energy of the DFT' in l)\n"
+              "ev = float(re.findall(r'[-+]?\\d+\\.\\d+', line)[-1])\nprint('matched:', line.strip())\n"
+              "json.dump({'results': {'total_energy_ha': {'value': ev / 27.211386245988, 'unit': 'Ha'}},\n"
+              "           'checks': {'one_final_energy_line': {'passed': True, 'detail': line.strip()}}},\n"
+              "          open('results.json', 'w'))\n")
     second_script = [
         reply(ToolCall(id="r1", name="run_outputs", arguments={"calculation_id": cid})),
         lambda call: reply(ToolCall(id="r2", name="search_file", arguments={
-            "path": re.search(r"(/\S+/aims\.out)", latest_tool_text(call)).group(1), "pattern": "Total energy of"})),
+            "path": re.search(r"Files in (/\S+) \(", latest_tool_text(call)).group(1) + "/aims.out",
+            "pattern": "Total energy of"})),
         reply(ToolCall(id="r3", name="submit_reading", arguments={
-            "calculation_id": cid, "value": ENERGY, "unit": "eV", "summary": "final total energy",
+            "calculation_id": cid, "observable_name": "total energy",
+            "observable_definition": "final total energy printed by FHI-aims", "value": ENERGY, "unit": "eV",
+            "summary": "final total energy",
             "citations": [{"file": "aims.out", "line_start": line, "line_end": line, "quote": quote}]})),
+        reply(ToolCall(id="r4", name="run_analysis", arguments={
+            "purpose": "final total energy in Hartree", "script": script, "inputs": [{"calculation_id": cid}]})),
+        lambda call: reply(ToolCall(id="r5", name="record_result", arguments={
+            "analysis_id": re.search(r"Analysis (an_[0-9a-f]{32})", latest_tool_text(call)).group(1),
+            "result_name": "total_energy_ha", "observable_name": "total energy in Hartree",
+            "observable_definition": "final total energy converted from eV with CODATA 2018",
+            "summary": "the printed eV value divided by 27.211386245988"})),
         reply(TextPart(text="The baseline total energy is validated.")),
     ]
     result, model = run_agent(world, agent, tmp_path, second_script, "Your calculation finished.")
     assert result.outcome == "finished"
+    assert "run check: healthy" in latest_tool_text(model.calls[1])
     assert f"{line}: " in latest_tool_text(model.calls[2])
+    assert "matched: | Total energy of the DFT" in latest_tool_text(model.calls[4])
+    assert "passed one_final_energy_line" in latest_tool_text(model.calls[4])
     assert model.calls[0].messages[0].text == "Plan a first test."  # resumed from the transcript
 
     state = world.state()
-    evidence = state.evidence[state.calculations[cid].evidence_id].evidence
-    assert evidence.quality is EvidenceQuality.VALIDATED and evidence.value.value == ENERGY
-    assert evidence.interpreted_by == AGENT
+    reading, computed = (state.evidence[e].evidence for e in state.calculations[cid].evidence_ids)
+    assert reading.quality is EvidenceQuality.VALIDATED and reading.value.value == ENERGY
+    assert reading.interpreted_by == AGENT
+    assert computed.kind is EvidenceKind.ANALYSIS and computed.quality is EvidenceQuality.VALIDATED
+    assert computed.value.unit == "Ha" and computed.value.value == pytest.approx(ENERGY / 27.211386245988)
+    assert "script:one_final_energy_line" in {c.name for c in computed.quality_checks}
     runs = state.agent_runs
     assert [r.run.outcome for r in runs] == ["waiting", "finished"]
     assert runs[1].run.report == "The baseline total energy is validated."
@@ -142,15 +167,25 @@ def test_examiner_findings_reach_the_agent(world, agent, tmp_path):
 
 def test_unverifiable_reading_is_refused(world, agent, tmp_path):
     cid = world.request()
-    world.run(cid, output=aims_output(energy=ENERGY))
+    world.checked(cid, output=aims_output(energy=ENERGY))
     script = [reply(ToolCall(id="t1", name="submit_reading", arguments={
-                  "calculation_id": cid, "value": ENERGY, "unit": "eV", "summary": "made up",
+                  "calculation_id": cid, "observable_name": "total energy", "observable_definition": "final",
+                  "value": ENERGY, "unit": "eV", "summary": "made up",
                   "citations": [{"file": "aims.out", "line_start": 1, "line_end": 1, "quote": "not there"}]})),
               reply(TextPart(text="My citation was wrong."))]
     _, model = run_agent(world, agent, tmp_path, script, "Report the energy.")
     result_part = model.calls[1].messages[-1].parts[0]
     assert result_part.is_error and "Reading not accepted" in result_part.content
-    assert world.calc(cid).evidence_id is None
+    assert world.calc(cid).evidence_ids == []
+
+
+def test_requests_define_their_observable(world, agent, tmp_path):
+    undefined = {key: value for key, value in request_args(world).items() if key != "observable_definition"}
+    script = [reply(ToolCall(id="t1", name="request_calculation", arguments=undefined)),
+              reply(TextPart(text="Refused."))]
+    _, model = run_agent(world, agent, tmp_path, script, "Request.")
+    assert "observable_definition" in latest_tool_text(model.calls[1])
+    assert world.state().calculations == {}
 
 
 @pytest.mark.parametrize("budget, shown", [(None, None), (5000, "Model tokens remaining for this investigation: 5000")])
@@ -159,7 +194,7 @@ def test_overview_shows_the_token_budget_when_one_is_set(ledger, store, artifact
     access = FileAccess(roots=[world.runs])
     ctx = ResearchContext(ledger=world.ledger, investigation_id=world.inv, hypothesis_id=world.hyp, actor=AGENT,
                           registry=world.registry, artifacts=world.artifacts, engine=world.engine,
-                          validator=world.validator, files=access)
+                          validator=world.validator, files=access, analysis=world.analysis)
     overview = {t.name: t for t in research_tools(ctx)}["investigation_overview"].invoke({}).content
     assert "Your hypothesis" in overview
     assert (shown in overview) if shown else ("Model tokens remaining" not in overview)

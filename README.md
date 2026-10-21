@@ -28,12 +28,12 @@ The project is being designed as a **general-purpose investigation framework**, 
 - The Chief Scientist opens an investigation and delegates work to hypothesis agents.
 - Agents write FHI-aims inputs, which protocol tools examine.
 - Researcher-authorized jobs run under Slurm.
-- Agents read the outputs, and their cited readings are verified before they become evidence.
+- Agents read the outputs and compute whatever quantities they need with their own analysis scripts, which run under guards on the login node. Cited readings and script results are verified or recorded before they become evidence.
 - The Evidence Judge assesses hypotheses.
 - A research notebook in Markdown, generated from the event log, records each round: what was hypothesized and why, predicted, tested and observed, what changed, what remains unknown and what is next.
 - A full-screen terminal interface keeps a live panel of hypotheses, agents, jobs, evidence and assessments above the conversation, and opens notebook pages and cited output lines in place.
 
-The full path passes automated tests that use stand-ins for the models and the scheduler. On one Slurm cluster, with FHI-aims and Claude models, each step except the Evidence Judge has also run for real, though not yet together in one uninterrupted investigation. The terminal interface has also been used with the real Chief Scientist, on a test investigation.
+The full path passes automated tests that use stand-ins for the models and the scheduler. On one Slurm cluster, with FHI-aims and Claude models, each step except the Evidence Judge has also run for real, though not yet together in one uninterrupted investigation. The terminal interface has also been used with the real Chief Scientist, and a real hypothesis agent has analysed a real FHI-aims output with its own scripts, both on test investigations.
 
 Not yet built:
 - protocols beyond FHI-aims total energies

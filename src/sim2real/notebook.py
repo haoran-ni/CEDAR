@@ -24,9 +24,11 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from sim2real.contracts.base import Actor, ActorKind, ArtifactRef, ExternalSource, Observable, Quantity
+from sim2real.contracts.analysis import AnalysisRun
 from sim2real.contracts.events import (
     AgentRunRecorded,
     AgentTaskQueued,
+    AnalysisRecorded,
     AssessmentRecorded,
     CalculationInputsExamined,
     CalculationLinked,
@@ -42,6 +44,7 @@ from sim2real.contracts.events import (
     PredictionRegistered,
     RecordedEvent,
     RoundStarted,
+    RunChecked,
     UserInterventionRecorded,
 )
 from sim2real.contracts.evidence import EvidenceObject
@@ -56,7 +59,13 @@ from sim2real.contracts.status import (
     HypothesisStatus,
     SchedulerState,
 )
-from sim2real.state.projection import CalculationRecord, HypothesisRecord, InvestigationState, apply
+from sim2real.state.projection import (
+    CalculationRecord,
+    HypothesisRecord,
+    InvestigationState,
+    apply,
+    hypothesis_evidence,
+)
 from sim2real.summaries import approval_requests
 
 if TYPE_CHECKING:
@@ -209,12 +218,21 @@ def _spec_details(spec: HypothesisSpec, indent: str = "") -> list[str]:
     return lines
 
 
+def _run_check(check: RunChecked | None) -> str:
+    if check is None:
+        return "not checked"
+    failed = [c.name for c in check.checks if not c.passed]
+    return f"failed {', '.join(failed)}" if failed else "healthy"
+
+
 def _calc_status(calc: CalculationRecord) -> str:
     text = calc.state.value
     if calc.scheduler_job_id:
         text += f"; job {calc.scheduler_job_id} {calc.scheduler_state.value if calc.scheduler_state else 'submitted'}"
-    if calc.evidence_id:
-        text += f"; evidence {calc.evidence_id}"
+    if calc.run_check is not None:
+        text += f"; run {_run_check(calc.run_check)}"
+    if calc.evidence_ids:
+        text += f"; evidence {', '.join(calc.evidence_ids)}"
     return text
 
 
@@ -255,8 +273,14 @@ def _calculation_lines(calc: CalculationRecord, rationale: str, requester: Actor
 
 
 def _evidence_lines(evidence_id: str, ev: EvidenceObject, state: InvestigationState, here: _Here) -> list[str]:
-    hypotheses = state.calculations[ev.calculation_id].hypothesis_ids if ev.calculation_id else []
-    origin = f"from {ev.calculation_id}" if ev.calculation_id else f"({ev.kind.value.replace('_', ' ')})"
+    if ev.analysis_id is not None:
+        hypotheses = [state.analyses[ev.analysis_id].hypothesis_id]
+        origin = f"from analysis {ev.analysis_id} of {', '.join(ev.calculation_ids)}"
+    elif ev.calculation_id is not None:
+        hypotheses = state.calculations[ev.calculation_id].hypothesis_ids
+        origin = f"from {ev.calculation_id}"
+    else:
+        hypotheses, origin = [], f"({ev.kind.value.replace('_', ' ')})"
     linked = f" for {', '.join(here.hyp(h) for h in hypotheses)}" if hypotheses else ""
     lines = [f"- **{evidence_id}** {origin}{linked}: **{ev.quality.value}**; "
              f"{ev.observable.name} = {_quantity(ev.value)}",
@@ -283,6 +307,27 @@ def _evidence_lines(evidence_id: str, ev: EvidenceObject, state: InvestigationSt
         if isinstance(s, ExternalSource):
             extra = "; ".join(x for x in (s.locator, f"doi {s.doi}" if s.doi else None, s.url) if x)
             lines.append(f"  - Source: {_flat(s.citation)}" + (f" ({extra})" if extra else ""))
+    return lines
+
+
+def _analysis_lines(analysis_id: str, hypothesis_id: str, run: AnalysisRun, here: _Here) -> list[str]:
+    lines = [f"- **{analysis_id}**, a script written for {here.hyp(hypothesis_id)}: {_said(run.purpose)} "
+             f"**{run.outcome.value}** (exit code {run.exit_code}, {run.duration_seconds:g} s)",
+             f"  - {here.artifact(run.script, 'Script')}"
+             + (f", {here.artifact(run.output, 'what it printed')}" if run.output else "")
+             + "".join(f", {here.artifact(ref, name)}" for name, ref in run.products.items())]
+    lines += [f"  - Staged from {i.calculation_id}: {', '.join(i.files)}" for i in run.inputs]
+
+    def check(c, indent: str) -> str:
+        return (f"{indent}- Script check {c.name} {'passed' if c.passed else 'FAILED'}"
+                + (f": {_flat(c.detail)}" if c.detail else ""))
+
+    lines += [check(c, "  ") for c in run.checks]
+    for r in run.results:
+        lines.append(f"  - Result {r.name} = {_quantity(r.value)}" + (f": {_flat(r.description)}" if r.description
+                                                                       else ""))
+        lines += [check(c, "    ") for c in r.checks]
+    lines += [f"  - Note: {_flat(problem)}" for problem in run.problems]
     return lines
 
 
@@ -441,6 +486,15 @@ def _observed(rnd: _Round, state: InvestigationState) -> list[str]:
         p = event.payload
         if isinstance(p, EvidenceRecorded):
             lines += _evidence_lines(p.evidence_id, p.evidence, state, ROOT)
+        elif isinstance(p, RunChecked):
+            failed = [c for c in p.checks if not c.passed]
+            lines.append(f"- **{p.calculation_id}**: run checked, " + (
+                "healthy" if not failed else "failed " + "; ".join(
+                    f"{c.name}" + (f" ({_flat(c.detail)})" if c.detail else "") for c in failed)))
+            lines += [f"  - The protocol read {r.name} = {_quantity(r.value)} at {r.file} line {r.line_start}"
+                      for r in p.readings]
+        elif isinstance(p, AnalysisRecorded):
+            lines += _analysis_lines(p.analysis_id, p.hypothesis_id, p.run, ROOT)
         elif (isinstance(p, CalculationStateChanged) and p.state is CalculationState.SCHEDULER_TERMINAL
               and p.scheduler_state is not SchedulerState.COMPLETED):
             lines.append(f"- **{p.calculation_id}**: the job ended {p.scheduler_state.value}"
@@ -546,7 +600,7 @@ def _hypothesis_page(hyp: HypothesisRecord, state: InvestigationState, events: S
     for pid in hyp.prediction_ids:
         event = events[state.predictions[pid].registered_at - 1]
         predictions += _prediction_lines(event, event.payload, SUB)
-    calculations, evidence = [], []
+    calculations = []
     for cid in hyp.calculation_ids:
         calc = state.calculations[cid]
         request = events[calc.requested_at - 1]
@@ -556,8 +610,10 @@ def _hypothesis_page(hyp: HypothesisRecord, state: InvestigationState, events: S
                     and event.payload.hypothesis_id == hyp.hypothesis_id):
                 rationale, requester = event.payload.rationale, event.actor
         calculations += _calculation_lines(calc, rationale, requester, SUB, "Now")
-        if calc.evidence_id:
-            evidence += _evidence_lines(calc.evidence_id, state.evidence[calc.evidence_id].evidence, state, SUB)
+    evidence = [line for record in hypothesis_evidence(state, hyp.hypothesis_id)
+                for line in _evidence_lines(record.evidence_id, record.evidence, state, SUB)]
+    analyses = [line for record in state.analyses.values() if record.hypothesis_id == hyp.hypothesis_id
+                for line in _analysis_lines(record.analysis_id, record.hypothesis_id, record.run, SUB)]
 
     assessments = []
     for entry in hyp.assessments:
@@ -575,6 +631,7 @@ def _hypothesis_page(hyp: HypothesisRecord, state: InvestigationState, events: S
               _section("Statement", statement),
               _section("Predictions", predictions or ["None registered yet."]),
               _section("Calculations", calculations or ["None requested yet."]),
+              _section("Analyses", analyses or ["None run yet."]),
               _section("Evidence", evidence or ["None recorded yet."]),
               _section("Assessments", assessments or ["Not assessed yet."]),
               _section("Agent reports", [_REPORTS_NOTE, "", *reports] if reports else ["None yet."])]
@@ -639,15 +696,18 @@ def _index_page(state: InvestigationState, events: Sequence[RecordedEvent], roun
 
     calculations = ["Job state comes from the scheduler; evidence quality comes from the validator's checks. A "
                     "completed job is not validated evidence.", "",
-                    "| Calculation | For | Estimand | Inputs | Job | Job state | Evidence |", "|---|---|---|---|---|---|---|"]
+                    "| Calculation | For | Estimand | Inputs | Job | Job state | Run check | Evidence |",
+                    "|---|---|---|---|---|---|---|---|"]
     for c in state.calculations.values():
         inputs = c.examination.verdict.value if c.examination else "not examined"
-        ev = state.evidence[c.evidence_id].evidence if c.evidence_id else None
-        evidence = f"{c.evidence_id}: {ev.quality.value}, {_quantity(ev.value)}" if ev else "none"
+        evidence = "; ".join(f"{eid}: {state.evidence[eid].evidence.quality.value}, "
+                             f"{state.evidence[eid].evidence.observable.name} = "
+                             f"{_quantity(state.evidence[eid].evidence.value)}" for eid in c.evidence_ids) or "none"
+        check = _run_check(c.run_check) if c.run_check is not None else "-"
         calculations.append(
             f"| {c.calculation_id} | {', '.join(ROOT.hyp(h) for h in c.hypothesis_ids)} | {_cell(c.task.estimand)} | "
             f"{inputs} | {c.scheduler_job_id or '-'} | {c.scheduler_state.value if c.scheduler_state else '-'} | "
-            f"{_cell(evidence)} |")
+            f"{_cell(check)} | {_cell(evidence)} |")
     if not state.calculations:
         calculations = ["None yet."]
 
@@ -708,6 +768,11 @@ def _describe(event: RecordedEvent) -> str:
             return f"{p.hypothesis_id} linked to {p.calculation_id}"
         case CalculationInputsExamined():
             return f"{p.calculation_id} inputs examined: {p.examination.verdict.value}"
+        case RunChecked():
+            return f"Run of {p.calculation_id} checked: {_run_check(p)}"
+        case AnalysisRecorded():
+            results = ", ".join(f"{r.name} = {_quantity(r.value)}" for r in p.run.results)
+            return f"{p.analysis_id} for {p.hypothesis_id}: {p.run.outcome.value}" + (f"; {results}" if results else "")
         case CalculationStateChanged():
             extra = "".join(x for x in (
                 f" ({p.scheduler_state.value})" if p.scheduler_state else "",

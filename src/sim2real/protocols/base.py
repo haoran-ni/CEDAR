@@ -1,7 +1,9 @@
 """Protocols: what a calculation type accepts, how its inputs are examined, how its runs are checked.
 
 A protocol never runs anything. It can generate inputs an agent did not write, examine
-the complete set of files that would run, and check a finished run's health.
+the complete set of files that would run, and check a finished run's health. What to take
+from a healthy run is the agent's decision: the agent declares its own observable, and reads
+or computes it from the outputs.
 """
 
 from abc import ABC, abstractmethod
@@ -10,7 +12,7 @@ from dataclasses import dataclass, field
 
 from pydantic import JsonValue
 
-from sim2real.contracts.base import Observable, Quantity
+from sim2real.contracts.base import Quantity
 from sim2real.contracts.evidence import QualityCheck
 from sim2real.contracts.examination import Finding
 from sim2real.contracts.status import EvidenceQuality, SchedulerState
@@ -19,8 +21,9 @@ from sim2real.contracts.task import ProtocolRef, ScientificTaskSpec
 
 @dataclass(frozen=True)
 class Reading:
-    """A value read from a raw output file, with the lines it came from."""
+    """A value the protocol read from a raw output file, with the lines it came from."""
 
+    name: str
     value: Quantity
     file: str
     line_start: int
@@ -33,15 +36,14 @@ class RunReport:
     checks: tuple[QualityCheck, ...]
     failure_quality: EvidenceQuality
     """Quality to assign when any check fails."""
-    reading: Reading | None
-    """The protocol's own reading of the task's observable, if it knows how to read it."""
+    readings: tuple[Reading, ...] = ()
+    """Values the protocol knows how to read from this kind of run, e.g. the final total energy."""
     limitations: tuple[str, ...] = ()
     method: dict[str, JsonValue] = field(default_factory=dict)
 
 
 class Protocol(ABC):
     ref: ProtocolRef
-    observables: tuple[Observable, ...]
     input_files: tuple[str, ...]
     structure_file: str
     execution_files: tuple[str, ...]
@@ -54,8 +56,9 @@ class Protocol(ABC):
     def describe(self) -> str:
         """What an agent needs to know to request this protocol."""
         lines = [f"Protocol {self.ref.name} {self.ref.version}",
-                 "Observables (request one exactly):"]
-        lines += [f"  - {o.name} [{o.unit}]: {o.definition}" for o in self.observables]
+                 "Observable: declare your own (name, definition, unit): what you will take from this run. The "
+                 "protocol checks the run's health; you read values from the outputs, citing the lines, or compute "
+                 "them with an analysis script."]
         lines.append(f"Input files: {', '.join(self.input_files)} (structure file: {self.structure_file}; "
                      f"job script: {', '.join(self.execution_files)}). Files you do not write are generated.")
         lines.append(f"Outputs: {', '.join(self.output_files)}")

@@ -1,4 +1,9 @@
-"""FHI-aims total energy of one structure, at fixed geometry or after relaxation (v0.1).
+"""One FHI-aims run of one structure, at fixed geometry or relaxing it (``fhiaims.run`` 0.1).
+
+The protocol examines the inputs before the run and checks the run's health after it. What
+to take from a healthy run is declared by the agent, who reads it from the outputs or
+computes it with an analysis script; the protocol itself reads the final total energies,
+which every run prints.
 
 Task variables are FHI-aims ``control.in`` keywords, named as in ``control.in``, plus the
 pseudo-variable ``species_defaults``: a level directory (such as ``light``) under the
@@ -114,9 +119,8 @@ def _same_args(expected: tuple[str, ...], actual: tuple[str, ...]) -> bool:
     return True
 
 
-class FhiAimsTotalEnergy(Protocol):
-    ref = ProtocolRef(name="fhiaims.total_energy", version="0.1")
-    observables = (TOTAL_ENERGY, ZERO_BROADENING_ENERGY)
+class FhiAimsRun(Protocol):
+    ref = ProtocolRef(name="fhiaims.run", version="0.1")
     input_files = ("control.in", "geometry.in", "job.sh")
     structure_file = "geometry.in"
     execution_files = ("job.sh",)
@@ -283,10 +287,6 @@ class FhiAimsTotalEnergy(Protocol):
 
     def examine(self, task: ScientificTaskSpec, files: Mapping[str, bytes]) -> list[Finding]:
         findings: list[Finding] = []
-        if task.observable not in self.observables:
-            findings.append(Finding(severity=_E, code="unsupported_observable",
-                                    message=f"this protocol reports {[o.name for o in self.observables]}, "
-                                            f"not {task.observable.name!r}"))
         values, problems = self.resolve(task)
         findings += problems
         for name in self.input_files:
@@ -439,9 +439,9 @@ class FhiAimsTotalEnergy(Protocol):
         values, _ = self.resolve(task)
         relax = self._relaxes(values)
         limitations = (
-            "A single total energy at the declared numerical settings; convergence of energy differences with "
-            "respect to k-points, basis, slab thickness and vacuum must be established by a declared convergence "
-            "comparison.",
+            "One run at the declared numerical settings; convergence of the quantities taken from it (and of "
+            "differences between runs) with respect to k-points, basis, slab thickness and vacuum must be "
+            "established by a declared convergence comparison.",
         )
         method: dict = {"code": "FHI-aims", "protocol": f"{self.ref.name} {self.ref.version}", **values}
         checks = [QualityCheck(name="scheduler_completed", passed=scheduler_state is SchedulerState.COMPLETED,
@@ -449,7 +449,7 @@ class FhiAimsTotalEnergy(Protocol):
         raw = outputs.get("aims.out")
         if raw is None:
             checks.append(QualityCheck(name="output_present", passed=False, detail="aims.out is missing"))
-            return RunReport(tuple(checks), EvidenceQuality.INVALID, None, limitations, method)
+            return RunReport(tuple(checks), EvidenceQuality.INVALID, (), limitations, method)
         out = parse_output(raw.decode(errors="replace"))
         method["code_version"] = out.version_string
         end = out.normal_termination
@@ -469,12 +469,12 @@ class FhiAimsTotalEnergy(Protocol):
                 name="geometry_converged", passed=converged,
                 detail=f"converged at line {out.geometry_converged.line} after {out.relaxation_steps} steps"
                 if converged else f"not converged after {out.relaxation_steps} steps"))
-        energy = {TOTAL_ENERGY: out.final_total_energy,
-                  ZERO_BROADENING_ENERGY: out.final_zero_broadening_energy}.get(task.observable)
-        reading = None
-        if energy is not None:
-            reading = Reading(Quantity(value=energy.value, unit="eV"), "aims.out", energy.line, energy.line,
-                              energy.text.strip())
+        readings = tuple(
+            Reading(observable.name, Quantity(value=energy.value, unit="eV"), "aims.out", energy.line, energy.line,
+                    energy.text.strip())
+            for observable, energy in ((TOTAL_ENERGY, out.final_total_energy),
+                                       (ZERO_BROADENING_ENERGY, out.final_zero_broadening_energy))
+            if energy is not None)
         only_geometry_failed = all(c.passed for c in checks if c.name != "geometry_converged")
         failure = EvidenceQuality.INCONCLUSIVE if relax and only_geometry_failed else EvidenceQuality.INVALID
-        return RunReport(tuple(checks), failure, reading, limitations, method)
+        return RunReport(tuple(checks), failure, readings, limitations, method)

@@ -74,6 +74,8 @@ class ChiefContext:
     """Told the new investigation's id once it is opened; returns the ids under which the researcher's
     earlier messages were recorded."""
     clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc)
+    dispatcher: Callable[[], str] | None = None
+    """Whether a dispatcher, which carries out queued agent work and submissions, is running."""
 
 
 class NoArgs(Contract):
@@ -291,7 +293,11 @@ def chief_tools(ctx: ChiefContext) -> list[AgentTool]:
         return f"Opened investigation {args.investigation_id} (status CREATED). Next: align the observables.{note}"
 
     def investigation_state(_: NoArgs) -> str:
-        return investigation_summary(ctx.ledger.load(current()))
+        summary = investigation_summary(ctx.ledger.load(current()))
+        if ctx.dispatcher is not None:
+            summary += (f"\nDispatcher (the process that carries out queued agent work and submissions; the "
+                        f"researcher starts it with `sim2real dispatch`): {ctx.dispatcher()}")
+        return summary
 
     def set_investigation_status(args: InvestigationStatusArgs) -> str:
         state = ctx.ledger.load(current())

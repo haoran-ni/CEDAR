@@ -45,10 +45,20 @@ class ResearchContext:
     actor: Actor
     registry: ProtocolRegistry
     artifacts: ArtifactStore
-    engine: ProtocolEngine
-    validator: ResultValidator
+    engine: ProtocolEngine | None
+    """None while the investigation has no approved compute profile; so are the validator and the analysis runner."""
+    validator: ResultValidator | None
     files: FileAccess
-    analysis: AnalysisRunner
+    analysis: AnalysisRunner | None
+
+
+NO_COMPUTE = ("this investigation has no approved compute profile, so no calculation can be requested and no run "
+              "read or analysed. You can still plan, register predictions and report; tell the Chief Scientist.")
+
+
+def _require_compute(ctx: ResearchContext) -> None:
+    if ctx.engine is None or ctx.validator is None or ctx.analysis is None:
+        raise ToolFailure(NO_COMPUTE)
 
 
 class NoArgs(Contract):
@@ -156,11 +166,15 @@ class ResultArgs(Contract):
     limitations: list[NonEmptyStr] = []
 
 
-def agent_file_access(ledger: ResearchLedger, investigation_id: str, hypothesis_id: str, runs_root: str | Path,
-                      shared: Sequence[str | Path] = (), deny: Sequence[str | Path] = ()) -> FileAccess:
+def agent_file_access(ledger: ResearchLedger, investigation_id: str, hypothesis_id: str,
+                      runs_root: str | Path | None, shared: Sequence[str | Path] = (),
+                      deny: Sequence[str | Path] = ()) -> FileAccess:
     """File access for one hypothesis's agent: the run directories of its own calculations, plus ``shared``
-    directories every agent may read (e.g. the code's species defaults)."""
+    directories every agent may read (e.g. the code's species defaults). Without a ``runs_root`` (no compute
+    profile) it reads only the shared directories."""
     def roots() -> list[Path]:
+        if runs_root is None:
+            return list(shared)
         state = ledger.load(investigation_id)
         own = [Path(runs_root) / state.calculations[c].workdir for c in state.hypotheses[hypothesis_id].calculation_ids
                if state.calculations[c].workdir is not None]
@@ -242,6 +256,7 @@ def research_tools(ctx: ResearchContext) -> list[AgentTool]:
         return f"Prediction {args.prediction_id} registered; it can no longer be changed."
 
     def request_calculation(args: CalculationArgs) -> str:
+        _require_compute(ctx)
         protocol = ctx.registry.get(ProtocolRef(name=args.protocol_name, version=args.protocol_version))
         if protocol is None:
             raise ToolFailure(f"no protocol {args.protocol_name} {args.protocol_version}")
@@ -276,6 +291,7 @@ def research_tools(ctx: ResearchContext) -> list[AgentTool]:
 
     def run_outputs(args: CalculationArg) -> str:
         state, calc = _own_calculation(ctx, args.calculation_id)
+        _require_compute(ctx)
         if calc.workdir is None:
             return f"{args.calculation_id} has no run directory yet ({calc.state.value})."
         lines = [_calculation_summary(ctx, calc, state)]
@@ -295,6 +311,7 @@ def research_tools(ctx: ResearchContext) -> list[AgentTool]:
 
     def submit_reading(args: ReadingArgs) -> ToolOutcome:
         _own_calculation(ctx, args.calculation_id)
+        _require_compute(ctx)
         reading = OutputReading(
             reader=ctx.actor, value=Quantity(value=args.value, unit=args.unit), summary=args.summary,
             limitations=tuple(args.limitations),
@@ -313,6 +330,7 @@ def research_tools(ctx: ResearchContext) -> list[AgentTool]:
     def run_analysis(args: AnalysisArgs) -> ToolOutcome:
         for staged in args.inputs:
             _own_calculation(ctx, staged.calculation_id)
+        _require_compute(ctx)
         report = ctx.analysis.run(ctx.investigation_id, ctx.hypothesis_id, purpose=args.purpose, script=args.script,
                                   inputs={i.calculation_id: i.files for i in args.inputs})
         if report.analysis_id is None:
@@ -341,6 +359,7 @@ def research_tools(ctx: ResearchContext) -> list[AgentTool]:
         analysis = ctx.ledger.load(ctx.investigation_id).analyses.get(args.analysis_id)
         if analysis is None or analysis.hypothesis_id != ctx.hypothesis_id:
             raise ToolFailure(f"{args.analysis_id} is not one of your analyses")
+        _require_compute(ctx)
         result = analysis.run.result(args.result_name)
         unit = result.value.unit if result is not None else None
         outcome = ctx.validator.record_analysis_result(

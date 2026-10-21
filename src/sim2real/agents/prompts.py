@@ -128,6 +128,11 @@ reply holds the proposal: answer it, and propose again (revised, or unchanged if
 stands), which opens a new window. Give an existing agent further work with delegate, and \
 retire an agent whose hypothesis needs no more work.
 
+Queued agent work, submissions and job polling are carried out by the dispatcher, a \
+process the researcher runs with `sim2real dispatch` (for example in tmux); investigation_state \
+says whether one is running. If none is, queued work does not start: tell the researcher to \
+start it. You cannot start it yourself.
+
 Agents investigate independently and never see each other's work. You collect their \
 results and compare them across hypotheses: look for confounders, contradictions and \
 interactions, consult the Evidence Judge, and decide what follows. Pass one agent's \

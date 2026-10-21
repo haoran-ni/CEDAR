@@ -180,8 +180,10 @@ def dispatcher_status(heartbeat_age: float | None, activities: Sequence[Activity
     return f"dispatcher seen {age(heartbeat_age)} ago", False
 
 
-def subagent_status(state: InvestigationState | None, activities: Sequence[Activity], now: datetime) -> str:
-    """Which sub-agents (hypothesis agents and the Evidence Judge) are working on the investigation right now."""
+def subagent_status(state: InvestigationState | None, activities: Sequence[Activity], now: datetime,
+                    dispatcher_running: bool = True) -> str:
+    """Which sub-agents (hypothesis agents and the Evidence Judge) are working on the investigation right now,
+    and how much of their work is queued; queued work waits for a dispatcher if none is running."""
     mine = [a for a in activities if state is not None and a.investigation_id == state.investigation_id]
     working = []
     for activity in mine:
@@ -192,6 +194,12 @@ def subagent_status(state: InvestigationState | None, activities: Sequence[Activ
         elif activity.role == "evidence_judge":
             working.append(f"Evidence Judge on {activity.hypothesis_id} ({took})")
     text = f"Working sub-agents: {'; '.join(working)}" if working else "No working sub-agents"
+    running = {a.task_id for a in mine}
+    queued = [t for t in state.pending_tasks if t.task_id not in running] if state is not None else []
+    if queued:
+        text += f" · {len(queued)} task{'s' if len(queued) > 1 else ''} queued"
+        if not dispatcher_running:
+            text += ", waiting for a dispatcher: start `sim2real dispatch`"
     if any(a.role == "chief_scientist" for a in mine):
         text += " · the Chief Scientist is reviewing their reports"
     return text

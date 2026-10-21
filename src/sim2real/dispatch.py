@@ -10,6 +10,8 @@ Each pass, for every open investigation:
 7. start queued agent work, within the token budgets.
 
 Evidence comes only from agents' cited readings and recorded analyses, after the run check.
+Steps 1-3 need the investigation's approved compute profile. Without one, agents still run,
+with every tool but those that request calculations or read runs.
 
 Agents run in background threads, so submission and polling go on while they work: several
 agents at once (``max_agents``), but never two runs of the same agent, and never two runs
@@ -42,6 +44,7 @@ from sim2real.agents.prompts import CHIEF_SCIENTIST, EVIDENCE_JUDGE, HYPOTHESIS_
 from sim2real.agents.toolkits import ResearchContext, file_tools, research_tools
 from sim2real.agents.toolkits.chief import ChiefContext, chief_tools
 from sim2real.agents.toolkits.judge import JudgeContext, judge_tools
+from sim2real.agents.toolkits.research import agent_file_access
 from sim2real.contracts.base import Actor, ActorKind, new_id
 from sim2real.contracts.events import AgentTaskQueued, EventDraft, HypothesisStatusChanged
 from sim2real.contracts.plan import PermissionAction, Priority
@@ -51,6 +54,7 @@ from sim2real.errors import RuleViolation
 from sim2real.hpc.profile import ProfileNotApproved, ProfileStore
 from sim2real.hpc.slurm import SchedulerBackend, SchedulerError
 from sim2real.notebook import update_notebook
+from sim2real.protocols.base import ProtocolRegistry
 from sim2real.state.projection import AgentTaskRecord, InvestigationState, authorization_for, review_deadline
 from sim2real.summaries import calculation_summary, task_owner
 from sim2real.swarm import CHIEF, REVIEW_INSTRUCTION, agent_prompt, review_due, review_material, start_drafts
@@ -204,16 +208,18 @@ class Dispatcher:
         state = self.workspace.ledger.load(investigation_id)
         if state.status in INVESTIGATION_MACHINE.terminal:
             return []
+        notes = []
         try:
             services = services_for(self.workspace, profile_for(state, self.profiles), self.backend, deny=self.deny,
                                     analysis_slots=self._analysis_slots)
         except (LookupError, ProfileNotApproved, FileNotFoundError) as exc:
-            return [f"{investigation_id}: waiting for a usable compute profile ({exc})"] if state.calculations \
-                or state.pending_tasks or state.pending_proposal else []
-        notes = []
-        notes += self._submit(investigation_id, services)
-        notes += self._poll(investigation_id, services)
-        notes += self._check_runs(investigation_id, services)
+            services = None  # agents can still plan and report; calculations wait for a usable profile
+            if state.calculations:
+                notes.append(f"calculations wait for a usable compute profile ({exc})")
+        if services is not None:
+            notes += self._submit(investigation_id, services)
+            notes += self._poll(investigation_id, services)
+            notes += self._check_runs(investigation_id, services)
         notes += self._start_proposed(investigation_id)
         notes += self._wake(investigation_id)
         notes += self._queue_review(investigation_id)
@@ -361,7 +367,7 @@ class Dispatcher:
         caps = [c for c in (self.limits.max_tokens, investigation_left, agent_left) if c is not None]
         return RunLimits(max_turns=max_turns, max_tokens=min(caps) if caps else None), None
 
-    def _launch(self, investigation_id: str, services: Services) -> list[str]:
+    def _launch(self, investigation_id: str, services: Services | None) -> list[str]:
         state = self.workspace.ledger.load(investigation_id)
 
         def order(task: AgentTaskRecord) -> tuple:
@@ -388,7 +394,7 @@ class Dispatcher:
             notes.append(f"started {task_owner(task)} on {task.task_id}")
         return notes
 
-    def _execute(self, run: _Run, services: Services, limits: RunLimits) -> None:
+    def _execute(self, run: _Run, services: Services | None, limits: RunLimits) -> None:
         task = run.task
         about = task.hypothesis_id or "the review"
         try:
@@ -408,7 +414,9 @@ class Dispatcher:
                 del self._runs[key]
         return notes
 
-    def run_task(self, investigation_id: str, task: AgentTaskRecord, services: Services, limits: RunLimits) -> str:
+    def run_task(self, investigation_id: str, task: AgentTaskRecord, services: Services | None,
+                 limits: RunLimits) -> str:
+        """Carry out one task; ``services`` is None while the investigation has no usable compute profile."""
         role = task.role
         settings = self.clients.settings(role)
         runner = AgentRunner(self.clients.client(role), settings, self.workspace.transcripts,
@@ -418,11 +426,19 @@ class Dispatcher:
         if role == "hypothesis_agent":
             agent = state.agents[task.agent_id]
             actor = Actor(kind=ActorKind.HYPOTHESIS_AGENT, id=agent.agent_id)
-            files = services.agent_files(self.workspace, investigation_id, agent.hypothesis_id)
-            context = ResearchContext(ledger=self.workspace.ledger, investigation_id=investigation_id,
-                                      hypothesis_id=agent.hypothesis_id, actor=actor, registry=services.registry,
-                                      artifacts=self.workspace.artifacts, engine=services.engine,
-                                      validator=services.validator, files=files, analysis=services.analysis)
+            if services is not None:
+                files = services.agent_files(self.workspace, investigation_id, agent.hypothesis_id)
+                context = ResearchContext(ledger=self.workspace.ledger, investigation_id=investigation_id,
+                                          hypothesis_id=agent.hypothesis_id, actor=actor, registry=services.registry,
+                                          artifacts=self.workspace.artifacts, engine=services.engine,
+                                          validator=services.validator, files=files, analysis=services.analysis)
+            else:
+                files = agent_file_access(self.workspace.ledger, investigation_id, agent.hypothesis_id, None,
+                                          deny=self.deny)
+                context = ResearchContext(ledger=self.workspace.ledger, investigation_id=investigation_id,
+                                          hypothesis_id=agent.hypothesis_id, actor=actor, registry=ProtocolRegistry([]),
+                                          artifacts=self.workspace.artifacts, engine=None, validator=None,
+                                          files=files, analysis=None)
             tools = research_tools(context) + file_tools(files)
             system, session = HYPOTHESIS_AGENT + agent_prompt(agent), f"{investigation_id}.{agent.agent_id}"
         elif role == "evidence_judge":
@@ -434,7 +450,8 @@ class Dispatcher:
             actor = CHIEF
             tools = chief_tools(ChiefContext(
                 ledger=self.workspace.ledger, profiles=self.profiles, actor=CHIEF, investigation_id=investigation_id,
-                registry_for=lambda name: registry_for(self.profiles.load_approved(name)), clock=self.clock))
+                registry_for=lambda name: registry_for(self.profiles.load_approved(name)), clock=self.clock,
+                dispatcher=lambda: "running; it is carrying out this review"))
             system, session = CHIEF_SCIENTIST, f"{investigation_id}.chief-review"
             instruction += "\n\n" + review_material(state, task)
         activity = {"investigation_id": investigation_id, "task_id": task.task_id, "role": role,

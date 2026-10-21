@@ -478,7 +478,7 @@ class Sim2RealApp(App):
         settings = self.session.clients.settings
         if investigation_id is None:
             return _Snapshot("No investigation yet: describe the discrepancy to the Chief Scientist.", dispatcher,
-                             alarm, subagent_status(None, activities, now), model_line(settings, None))
+                             alarm, subagent_status(None, activities, now, not alarm), model_line(settings, None))
         version = self.workspace.store.current_version(investigation_id)
         changed = version != self._version
         if changed:
@@ -487,7 +487,7 @@ class Sim2RealApp(App):
             self._version = version
         state = self._state
         return _Snapshot(status_line(state, now), f"{work_summary(state)} · {dispatcher}", alarm,
-                         subagent_status(state, activities, now), model_line(settings, state),
+                         subagent_status(state, activities, now, not alarm), model_line(settings, state),
                          swarm_rows(state, self._events, activities, now),
                          self.session.notices() if changed else [], self._new_results(state) if changed else [],
                          state.round)

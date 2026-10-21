@@ -32,6 +32,8 @@ from sim2real.errors import RuleViolation
 from sim2real.hpc.profile import ProfileStore
 from sim2real.hpc.slurm import SchedulerBackend
 from sim2real.models.types import ToolCall
+from sim2real.dashboard import dispatcher_status
+from sim2real.dispatch import current_activity, heartbeat_age
 from sim2real.notebook import round_file, update_notebook
 from sim2real.state.projection import AgentRunRecord, InvestigationState
 from sim2real.summaries import approval_requests, investigation_summary, pending_approvals
@@ -243,7 +245,8 @@ class ChatSession:
             instruction = f"[researcher] {text}"
         context = ChiefContext(ledger=self.workspace.ledger, profiles=self.profiles, actor=CHIEF,
                                registry_for=lambda name: registry_for(self.profiles.load_approved(name)),
-                               investigation_id=self.investigation_id, on_open=self._opened, clock=self.clock)
+                               investigation_id=self.investigation_id, on_open=self._opened, clock=self.clock,
+                               dispatcher=self._dispatcher_status)
         settings = self.clients.settings("chief_scientist")
         runner = AgentRunner(self.clients.client("chief_scientist"), settings, self.workspace.transcripts,
                              secrets=self.clients.secrets())
@@ -260,6 +263,11 @@ class ChatSession:
         if result.outcome != "finished":
             reply += f"\n[the Chief Scientist stopped: {result.outcome}{': ' + result.error if result.error else ''}]"
         return reply.strip()
+
+    def _dispatcher_status(self) -> str:
+        now = self.clock()
+        text, _ = dispatcher_status(heartbeat_age(self.workspace, now), current_activity(self.workspace), now)
+        return text
 
     def _reviews_since_last_turn(self) -> str:
         """The Chief Scientist's background reviews this conversation has not seen (the last three), so it answers

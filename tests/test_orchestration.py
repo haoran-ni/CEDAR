@@ -471,3 +471,15 @@ def test_start_opens_the_full_screen_interface_only_where_it_can_work(system, mo
     opened = []
     monkeypatch.setattr(tui, "run_tui", lambda session: opened.append(session))
     assert cli.main(["start"]) == 0 and len(opened) == 1 and opened[0].investigation_id is None
+
+
+def test_the_chief_knows_whether_a_dispatcher_is_running(system):
+    chat, clients, workspace = system["chat"], system["clients"], system["workspace"]
+    open_and_start(system)
+    clients.add("chief_scientist", reply(call("investigation_state")), reply(TextPart(text="Start the dispatcher.")))
+    chat.handle("Why are the agents not working?")
+    seen = clients.models["chief_scientist"].calls[-1].messages[-1].parts[0].content
+    assert seen.endswith("the researcher starts it with `sim2real dispatch`): no dispatcher has run: start "
+                         "`sim2real dispatch`")
+    system["dispatcher"].tick()
+    assert chat._dispatcher_status() == "dispatcher seen 0 s ago"

@@ -54,7 +54,7 @@ from sim2real.contracts import (
 from sim2real.contracts.hypothesis import Prediction
 from sim2real.dispatch import SYSTEM, Dispatcher
 from sim2real.errors import RuleViolation
-from sim2real.models import TextPart
+from sim2real.models import TextPart, ToolCall
 from sim2real.models.scripted import ScriptedModel, reply
 from sim2real.notebook import render_notebook, round_file
 from sim2real.state.projection import ProposalStatus
@@ -99,10 +99,12 @@ class ByAgent:
                 self.busy[agent] -= 1
 
 
-def investigation(system, *hypotheses, budget=None) -> ChatSession:
-    """An investigation on the system's site with activated hypotheses and no agents yet; the researcher's chat."""
+def investigation(system, *hypotheses, budget=None, profile=True) -> ChatSession:
+    """An investigation on the system's site (or none) with activated hypotheses and no agents yet; the researcher's
+    chat."""
     ledger = system["workspace"].ledger
-    start_investigation(ledger, INV, compute_profile=system["site"].name, model_token_budget=budget)
+    start_investigation(ledger, INV, compute_profile=system["site"].name if profile else None,
+                        model_token_budget=budget)
     for hypothesis in hypotheses:
         add_hypothesis(ledger, INV, hypothesis, agent=False)
     return ChatSession(system["workspace"], system["profiles"], system["clients"], investigation_id=INV,
@@ -567,3 +569,23 @@ def test_writers_working_at_the_same_time_all_get_through(ledger):
     assert len(state.interventions) == 60
     assert sorted({i.text for i in state.interventions.values()}) == sorted(
         f"writer {w}, message {n}" for w in range(6) for n in range(10))
+
+
+def test_agents_work_without_a_compute_profile(system):
+    """Planning, predictions and reports need no compute profile; only calculations do."""
+    ledger, dispatcher = system["workspace"].ledger, system["dispatcher"]
+    chat = investigation(system, "hyp-a", "hyp-b", profile=False)
+    propose(ledger, "p-1", "hyp-a", "hyp-b")
+    chat.handle("/approve agents")
+    asked = {"protocol_name": "fhiaims.run", "protocol_version": "0.1", "observable_name": "e",
+             "observable_definition": "e", "estimand": "e", "system_label": "s", "structure_text": "x",
+             "rationale": "r"}
+    router = agents_answer(system, **{
+        "hyp-a": [says("Planned a test.")],
+        "hyp-b": [lambda call: reply(ToolCall(id="c1", name="request_calculation", arguments=asked)),
+                  says("No compute here; I registered nothing.")]})
+    notes = dispatcher.tick()
+    assert sum("hypothesis_agent ran" in n and "finished" in n for n in notes) == 2, notes
+    refused = router.models["agent-hyp-b"].calls[1].messages[-1].parts[0]
+    assert refused.is_error and "no approved compute profile" in refused.content
+    assert not any("compute profile" in n for n in notes)  # nothing to submit, so nothing to complain about

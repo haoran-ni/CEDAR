@@ -250,3 +250,17 @@ def test_the_panel_names_the_models_in_use(ledger):
         cache_read_tokens=0, cache_write_tokens=0, outcome="finished"))])
     assert model_line(lambda role: opus, ledger.load(inv)).endswith(
         "· hypothesis agents: latest run answered by claude-opus-5-5, claude-sonnet-5-5")
+
+
+def test_the_panel_says_when_queued_work_waits_for_a_dispatcher(ledger):
+    inv = start_investigation(ledger)
+    hyp = add_hypothesis(ledger, inv)
+    ledger.record(inv, [draft(USER, AgentTaskQueued(task_id="t-1", role="hypothesis_agent", hypothesis_id=hyp,
+                                                    agent_id=AGENT.id, instruction="test it"))])
+    state = ledger.load(inv)
+    assert subagent_status(state, [], LATER, dispatcher_running=False) == (
+        "No working sub-agents · 1 task queued, waiting for a dispatcher: start `sim2real dispatch`")
+    assert subagent_status(state, [], LATER) == "No working sub-agents · 1 task queued"
+    working = Activity(investigation_id=inv, task_id="t-1", role="hypothesis_agent", hypothesis_id=hyp,
+                       agent_id=AGENT.id, started_at=LATER)
+    assert subagent_status(state, [working], LATER) == f"Working sub-agents: test specialist on {hyp} (0 s)"

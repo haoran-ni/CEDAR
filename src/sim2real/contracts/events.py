@@ -179,6 +179,8 @@ class AgentRunRecorded(Contract):
     outcome: NonEmptyStr
     report: str | None = None
     """The agent's final message: its stated summary and justification, not hidden reasoning."""
+    dropped_reasoning_blocks: int = Field(default=0, ge=0)
+    """Earlier reasoning blocks the provider left out because the conversation changed under them."""
 
 
 class EvidenceRecorded(Contract):

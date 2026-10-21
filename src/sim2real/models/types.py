@@ -83,6 +83,9 @@ class ModelReply(Contract):
     served_model: NonEmptyStr
     """The model that actually answered, which differs from the request after a fallback."""
     refusal_category: str | None = None
+    dropped_reasoning_blocks: int = Field(default=0, ge=0)
+    """Earlier reasoning blocks the provider left out because the conversation they belong to has
+    changed since they were made, e.g. tool definitions updated by a new sim2real version."""
 
 
 class ModelSettings(Contract):

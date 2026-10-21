@@ -163,7 +163,7 @@ def _actor(actor: Actor) -> str:
     return actor.kind.value.replace("_", " ")
 
 
-def _round_file(number: int) -> str:
+def round_file(number: int) -> str:
     return f"round-{number:02d}.md"
 
 
@@ -180,8 +180,9 @@ class _Here:
     def hyp(self, hypothesis_id: str) -> str:
         return f"[{hypothesis_id}]({'./' if self.depth else 'hypotheses/'}{hypothesis_id}.md)"
 
-    def artifact(self, ref: ArtifactRef, text: str) -> str:
-        return f"[{text}]({'../' * (self.depth + 2)}artifacts/{ref.path})"
+    def artifact(self, ref: ArtifactRef, text: str, line: int | None = None) -> str:
+        anchor = f"#L{line}" if line else ""
+        return f"[{text}]({'../' * (self.depth + 2)}artifacts/{ref.path}{anchor})"
 
 
 ROOT, SUB = _Here(0), _Here(1)
@@ -263,7 +264,7 @@ def _evidence_lines(evidence_id: str, ev: EvidenceObject, state: InvestigationSt
              f"{_said(ev.summary)}"]
     for c in ev.citations:
         span = f"line {c.line_start}" if c.line_start == c.line_end else f"lines {c.line_start}–{c.line_end}"
-        where = here.artifact(c.artifact, f"{c.artifact.label or 'output'} {span}")
+        where = here.artifact(c.artifact, f"{c.artifact.label or 'output'} {span}", c.line_start)
         lines.append(f"  - Read from {where}: {_code(_flat(c.quote))}")
     passed = [c.name for c in ev.quality_checks if c.passed]
     if passed:
@@ -300,8 +301,10 @@ def _assessment_lines(hyp: HypothesisRecord, event: RecordedEvent, p: Assessment
 def _run_lines(event: RecordedEvent, p: AgentRunRecorded) -> list[str]:
     model = ", ".join(p.served_models) or p.requested_model
     task = f"task {p.task_id}; " if p.task_id else ""
+    dropped = (f"; {p.dropped_reasoning_blocks} earlier reasoning block{'s' if p.dropped_reasoning_blocks > 1 else ''} "
+               "left out because the conversation changed") if p.dropped_reasoning_blocks else ""
     lines = [f"- **{_actor(event.actor)}** ({p.role.replace('_', ' ')}; {task}{p.outcome}; {p.turns} turns; "
-             f"{model}; {_when(event)}):"]
+             f"{model}; {_when(event)}{dropped}):"]
     return lines + (_quote(p.report, "  ") if p.report and p.report.strip() else ["  (no report)"])
 
 
@@ -480,7 +483,7 @@ def _next(state: InvestigationState, next_start: RecordedEvent | None) -> list[s
     lines = []
     if next_start is not None:
         n = next_start.payload.round
-        lines.append(f"- [{_round_name(n)}]({_round_file(n)}) started next, by {_actor(next_start.actor)}: "
+        lines.append(f"- [{_round_name(n)}]({round_file(n)}) started next, by {_actor(next_start.actor)}: "
                      f"{_said(next_start.payload.reason)}")
     for task in state.pending_tasks:
         lines.append(f"- Queued for the {task.role.replace('_', ' ')} on {ROOT.hyp(task.hypothesis_id)}, by "
@@ -648,7 +651,7 @@ def _index_page(state: InvestigationState, events: Sequence[RecordedEvent], roun
     if not state.calculations:
         calculations = ["None yet."]
 
-    round_links = [f"- [{_round_name(r.number)}]({_round_file(r.number)}): events #{r.events[0].stream_version}–"
+    round_links = [f"- [{_round_name(r.number)}]({round_file(r.number)}): events #{r.events[0].stream_version}–"
                    f"#{r.events[-1].stream_version}, {_when(r.events[0])} to {_when(r.events[-1])}" for r in rounds]
     waiting = [f"- `{command}` ({note})" for command, note in approval_requests(state)] or ["Nothing."]
 
@@ -750,12 +753,12 @@ def render_notebook(events: Sequence[RecordedEvent]) -> dict[str, str]:
     for event in events:
         number = event.payload.round if isinstance(event.payload, RoundStarted) else event.round
         if rounds and rounds[-1].number != number:
-            pages[_round_file(rounds[-1].number)] = _round_page(rounds[-1], state, next_start=event)
+            pages[round_file(rounds[-1].number)] = _round_page(rounds[-1], state, next_start=event)
         if not rounds or rounds[-1].number != number:
             rounds.append(_Round(number))
         rounds[-1].events.append(event)
         state = apply(state, event)
-    pages[_round_file(rounds[-1].number)] = _round_page(rounds[-1], state, next_start=None)
+    pages[round_file(rounds[-1].number)] = _round_page(rounds[-1], state, next_start=None)
     for hyp in state.hypotheses.values():
         pages[f"hypotheses/{hyp.hypothesis_id}.md"] = _hypothesis_page(hyp, state, events)
     pages["timeline.md"] = _timeline_page(state, events)

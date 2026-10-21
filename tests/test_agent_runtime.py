@@ -124,6 +124,12 @@ def test_tool_output_is_redacted(transcripts):
     assert KEY not in outcome.content
 
 
+def test_dropped_reasoning_blocks_add_up_over_a_run(transcripts):
+    first = reply(call("echo", text="x")).model_copy(update={"dropped_reasoning_blocks": 3})
+    result, _ = run(transcripts, [first, reply(TextPart(text="done"))])
+    assert result.dropped_reasoning_blocks == 3
+
+
 def test_final_report_is_redacted_before_it_is_recorded(transcripts):
     result, _ = run(transcripts, [reply(TextPart(text=f"Done; the key was {KEY}."))], secrets=[KEY])
     assert result.final_text.startswith("Done; the key was ") and KEY not in result.final_text

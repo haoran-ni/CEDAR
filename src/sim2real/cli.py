@@ -9,6 +9,7 @@ submits authorized work, follows jobs and runs agents between conversations).
 import argparse
 import getpass
 import json
+import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -238,6 +239,12 @@ def _workspace():
     return Workspace.open(data_dir())
 
 
+def _full_screen(args) -> bool:
+    """Whether to use the full-screen interface: asked for, and a terminal that can show it."""
+    return (not args.plain and sys.stdin.isatty() and sys.stdout.isatty()
+            and os.environ.get("TERM", "") not in ("", "dumb"))
+
+
 def _start(args) -> int:
     from sim2real.chat import ChatSession
     from sim2real.dispatch import heartbeat_age
@@ -247,6 +254,13 @@ def _start(args) -> int:
         print(f"No investigation {args.investigation}. See `sim2real investigations`.", file=sys.stderr)
         return 1
     session = ChatSession(workspace, _profiles(), _model_clients(), investigation_id=args.investigation)
+    if _full_screen(args):
+        from sim2real.tui import run_tui
+
+        run_tui(session)
+        if session.investigation_id:
+            print(f"Resume with: sim2real start {session.investigation_id}")
+        return 0
     age = heartbeat_age(workspace)
     if age is None or age > 600:
         print("Note: no dispatcher has run recently, so queued agent work and jobs will not progress. Start one in "
@@ -363,6 +377,9 @@ def main(argv: list[str] | None = None) -> int:
 
     start = commands.add_parser("start", help="talk with the Chief Scientist (new or existing investigation)")
     start.add_argument("investigation", nargs="?", help="an existing investigation to continue")
+    start.add_argument("--plain", action="store_true",
+                       help="line-by-line chat instead of the full-screen interface (used anyway when the terminal "
+                            "cannot show it)")
     start.set_defaults(handler=_start)
     commands.add_parser("investigations", help="list investigations").set_defaults(handler=_investigations)
     report = commands.add_parser("report", help="write the research notebook (Markdown) from the event log")

@@ -31,11 +31,11 @@ The project is being designed as a **general-purpose investigation framework**, 
 - Agents read the outputs, and their cited readings are verified before they become evidence.
 - The Evidence Judge assesses hypotheses.
 - A research notebook in Markdown, generated from the event log, records each round: what was hypothesized and why, predicted, tested and observed, what changed, what remains unknown and what is next.
+- A full-screen terminal interface keeps a live panel of hypotheses, agents, jobs, evidence and assessments above the conversation, and opens notebook pages and cited output lines in place.
 
-The full path passes automated tests that use stand-ins for the models and the scheduler. On one Slurm cluster, with FHI-aims and Claude models, each step except the Evidence Judge has also run for real, though not yet together in one uninterrupted investigation.
+The full path passes automated tests that use stand-ins for the models and the scheduler. On one Slurm cluster, with FHI-aims and Claude models, each step except the Evidence Judge has also run for real, though not yet together in one uninterrupted investigation. The terminal interface has also been used with the real Chief Scientist, on a test investigation.
 
 Not yet built:
-- the terminal dashboard
 - protocols beyond FHI-aims total energies
 - schedulers other than Slurm
 - model providers other than Anthropic
@@ -57,7 +57,7 @@ sim2real setup --name mycluster         # an agent works out how FHI-aims runs h
 sim2real profile show mycluster
 sim2real profile approve mycluster      # nothing runs on the cluster until you approve a profile
 sim2real dispatch                       # keep running (e.g. in tmux): submits what you authorize, runs agents
-sim2real start                          # talk with the Chief Scientist; /help lists commands
+sim2real start                          # live panel and chat with the Chief Scientist (--plain for line by line); /help lists commands
 sim2real report                         # write the research notebook (the dispatcher also keeps it current)
 ```
 

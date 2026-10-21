@@ -20,4 +20,5 @@ def record_agent_run(ledger: ResearchLedger, investigation_id: str, actor: Actor
         served_models=tuple(result.served_models), turns=result.turns, input_tokens=usage.input_tokens,
         output_tokens=usage.output_tokens, cache_read_tokens=usage.cache_read_tokens,
         cache_write_tokens=usage.cache_write_tokens, outcome=result.outcome, report=report or None,
+        dropped_reasoning_blocks=result.dropped_reasoning_blocks,
     ))])

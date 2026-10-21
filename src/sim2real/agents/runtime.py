@@ -44,6 +44,7 @@ class RunResult:
     usage: Usage = field(default_factory=Usage)
     served_models: list[str] = field(default_factory=list)
     error: str | None = None
+    dropped_reasoning_blocks: int = 0
 
 
 def _add(total: Usage, more: Usage) -> Usage:
@@ -87,6 +88,7 @@ class AgentRunner:
                 return result
             result.turns += 1
             result.usage = _add(result.usage, reply.usage)
+            result.dropped_reasoning_blocks += reply.dropped_reasoning_blocks
             if reply.served_model not in result.served_models:
                 result.served_models.append(reply.served_model)
             self._append(session_id, history, reply.message)

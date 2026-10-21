@@ -21,7 +21,7 @@ from sim2real.contracts import (
     InvestigationStatus,
     SchedulerState,
 )
-from sim2real.dispatch import Dispatcher, heartbeat_age
+from sim2real.dispatch import Dispatcher, current_activity, heartbeat_age
 from sim2real.hpc import ProfileStore
 from sim2real.hpc.fake import FakeScheduler
 from sim2real.models import ModelSettings, TextPart, ToolCall
@@ -53,8 +53,7 @@ class Clients:
         return []
 
 
-@pytest.fixture
-def system(tmp_path, site):
+def make_system(tmp_path, site):
     workspace = Workspace.open(tmp_path / "data")
     profiles = ProfileStore(tmp_path / "config" / "profiles")
     profiles.save(site)
@@ -66,6 +65,11 @@ def system(tmp_path, site):
                             clock=lambda: NOW)
     return {"workspace": workspace, "profiles": profiles, "scheduler": scheduler, "clients": clients, "chat": chat,
             "dispatcher": dispatcher, "site": site}
+
+
+@pytest.fixture
+def system(tmp_path, site):
+    return make_system(tmp_path, site)
 
 
 def call(name, **arguments):
@@ -343,3 +347,77 @@ def test_cli_start_and_dispatch(system, monkeypatch, capsys, tmp_path):
     assert cli.main(["report"]) == 0
     assert f"{INV}: {system['workspace'].notebook_dir(INV) / 'index.md'}" in capsys.readouterr().out
     assert cli.main(["report", "no-such-investigation"]) == 1
+
+
+def test_dispatcher_describes_the_agent_run_in_progress(system):
+    workspace, chat, dispatcher, clients = system["workspace"], system["chat"], system["dispatcher"], system["clients"]
+    clients.add("chief_scientist", open_and_delegate(system["site"]), reply(TextPart(text="ok")))
+    chat.handle("Investigate CO on Cu(111).")
+    seen = []
+
+    def look(_request):
+        seen.append(current_activity(workspace))
+        return reply(TextPart(text="Looked around."))
+
+    clients.add("hypothesis_agent", reply(call("investigation_overview")), look)
+    dispatcher.tick()
+    (activity,) = seen
+    assert (activity.investigation_id, activity.hypothesis_id, activity.role) == (INV, HYP, "hypothesis_agent")
+    assert activity.last_step == "investigation_overview" and activity.started_at == NOW
+    assert current_activity(workspace) is None and heartbeat_age(workspace, NOW) == 0
+
+
+def test_calculations_can_be_named_by_a_unique_start_of_their_id(system):
+    workspace, chat, dispatcher, clients = system["workspace"], system["chat"], system["dispatcher"], system["clients"]
+    clients.add("chief_scientist", open_and_delegate(system["site"]), reply(TextPart(text="ok")))
+    chat.handle("Investigate CO on Cu(111).")
+    clients.add("hypothesis_agent", *agent_requests(system))
+    dispatcher.tick()
+    calc = latest_calc(workspace)
+    assert chat.handle(f"/approve submit {calc[5:8]}") == f"No calculation {calc[5:8]} in this investigation."
+    assert "authorized" in chat.handle(f"/approve submit {calc[:12]}")
+    assert workspace.ledger.load(INV).interventions["msg-2"].authorizations[0].target_ids == (calc,)
+
+
+def test_reports_that_arrive_during_a_chief_turn_are_still_shown(system):
+    chat, dispatcher, clients = system["chat"], system["dispatcher"], system["clients"]
+    clients.add("chief_scientist", open_and_delegate(system["site"]), reply(TextPart(text="ok")))
+    chat.handle("Investigate CO on Cu(111).")
+    clients.add("hypothesis_agent", *agent_requests(system))
+
+    def answer_while_the_dispatcher_works(_request):
+        dispatcher.tick()  # records the agent's report while the Chief is answering
+        return reply(TextPart(text="Noted."))
+
+    clients.add("chief_scientist", answer_while_the_dispatcher_works)
+    assert chat.handle("Any news?") == "Noted."
+    notices = chat.notices()
+    assert any("Requested the PBE baseline" in n for n in notices)
+    assert sum("[waiting for you]" in n for n in notices) == 1
+    assert chat.notices() == []  # each report and each request for approval is shown once
+
+
+def test_start_opens_the_full_screen_interface_only_where_it_can_work(system, monkeypatch, capsys):
+    from argparse import Namespace
+
+    from sim2real import cli
+    from sim2real import tui
+
+    monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    monkeypatch.setenv("TERM", "xterm-256color")
+    assert cli._full_screen(Namespace(plain=False))
+    assert not cli._full_screen(Namespace(plain=True))
+    monkeypatch.setenv("TERM", "dumb")
+    assert not cli._full_screen(Namespace(plain=False))
+    monkeypatch.setattr("sys.stdout.isatty", lambda: False)
+    monkeypatch.setenv("TERM", "xterm-256color")
+    assert not cli._full_screen(Namespace(plain=False))
+
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+    monkeypatch.setenv("SIM2REAL_DATA_DIR", str(system["workspace"].root))
+    monkeypatch.setattr(cli, "_profiles", lambda: system["profiles"])
+    monkeypatch.setattr(cli, "_model_clients", lambda: system["clients"])
+    opened = []
+    monkeypatch.setattr(tui, "run_tui", lambda session: opened.append(session))
+    assert cli.main(["start"]) == 0 and len(opened) == 1 and opened[0].investigation_id is None

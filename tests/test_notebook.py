@@ -135,7 +135,7 @@ def test_round_page_answers_from_the_record(pages):
 
     observed = section(page, "What did we observe?")
     assert "**ev-1**" in observed and "**VALIDATED**; site energy difference = 0.1 eV" in observed
-    assert "[aims.out line 10](../../artifacts/objects/aa/" + "a" * 64 + ")" in observed
+    assert "[aims.out line 10](../../artifacts/objects/aa/" + "a" * 64 + "#L10)" in observed
     assert f"**{ids['bad']}**: the job ended FAILED" in observed
     assert "Check failed: scf_converged: no converged SCF cycle" in observed
 

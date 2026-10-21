@@ -72,19 +72,44 @@ def test_request_parameters():
     assert params["model"] == "claude-opus-5-5" and params["max_tokens"] == 64000
     assert params["system"] == "You are a hypothesis agent."
     assert params["output_config"] == {"effort": "high"}
-    assert params["betas"] == ["server-side-fallback-2026-07-01"] and params["fallbacks"] == "default"
+    assert params["thinking"] == {"type": "adaptive", "block_binding": {"prefix_mismatch_behavior": "drop_block"}}
+    assert params["betas"] == ["thinking-binding-controls-2026-08-01", "server-side-fallback-2026-07-01"]
+    assert params["fallbacks"] == "default"
     assert params["cache_control"] == {"type": "ephemeral"}
     assert params["tools"] == [{"name": "read_output", "description": TOOL.description,
                                 "input_schema": TOOL.input_schema, "eager_input_streaming": True}]
     assert params["messages"] == [{"role": "user", "content": [{"type": "text", "text": "Check the run."}]}]
 
 
-def test_refusal_fallback_can_be_switched_off():
+def test_refusal_fallback_and_thinking_settings_can_be_switched_off():
     client, sdk = client_for(message(TOOL_TURN))
-    settings = SETTINGS.model_copy(update={"options": {"refusal_fallback": False}, "effort": None})
-    client.complete(system="s", messages=[Message(role="user", parts=(TextPart(text="hi"),))], tools=[],
-                    settings=settings)
-    assert {"betas", "fallbacks", "output_config", "tools"}.isdisjoint(sdk.requests[0])
+    hi = [Message(role="user", parts=(TextPart(text="hi"),))]
+    client.complete(system="s", messages=hi, tools=[],
+                    settings=SETTINGS.model_copy(update={"options": {"refusal_fallback": False}}))
+    assert sdk.requests[0]["betas"] == ["thinking-binding-controls-2026-08-01"] and "fallbacks" not in sdk.requests[0]
+    options = {"refusal_fallback": False, "thinking_prefix_mismatch": "off"}
+    client.complete(system="s", messages=hi, tools=[],
+                    settings=SETTINGS.model_copy(update={"options": options, "effort": None}))
+    assert {"betas", "fallbacks", "output_config", "tools", "thinking"}.isdisjoint(sdk.requests[1])
+    client.complete(system="s", messages=hi, tools=[],
+                    settings=SETTINGS.model_copy(update={"options": {"thinking_prefix_mismatch": "error"}}))
+    assert sdk.requests[2]["thinking"]["block_binding"] == {"prefix_mismatch_behavior": "error"}
+    with pytest.raises(ModelError, match="thinking_prefix_mismatch must be one of") as caught:
+        client.complete(system="s", messages=hi, tools=[],
+                        settings=SETTINGS.model_copy(update={"options": {"thinking_prefix_mismatch": "drop"}}))
+    assert not caught.value.retryable
+
+
+def test_dropped_reasoning_blocks_are_counted():
+    dropped = [{"type": "thinking_dropped", "path": f"messages.1.content.{i}", "reason": "prefix_binding_mismatch"}
+               for i in range(2)]
+    client, _ = client_for(message(TOOL_TURN, input_transformations=dropped))
+    reply = client.complete(system="s", tools=[TOOL], settings=SETTINGS,
+                            messages=[Message(role="user", parts=(TextPart(text="go"),))])
+    assert reply.dropped_reasoning_blocks == 2
+    client, _ = client_for(message(TOOL_TURN))
+    assert client.complete(system="s", tools=[TOOL], settings=SETTINGS,
+                           messages=[Message(role="user", parts=(TextPart(text="go"),))]).dropped_reasoning_blocks == 0
 
 
 def test_reply_keeps_native_blocks_and_neutral_parts():

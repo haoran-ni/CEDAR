@@ -5,6 +5,13 @@ timeouts. Tools use eager input streaming, so the runtime validates every tool i
 before running anything. Refusals are retried server-side on Anthropic's recommended
 fallback model unless ``options.refusal_fallback`` is false; the model that actually
 answered is reported as ``served_model``.
+
+Assistant turns are sent back with their reasoning blocks. The API checks that each block
+still belongs to the conversation it was made in (same system prompt, tools and earlier
+messages). A new sim2real version can change tool definitions under a resumed session, so
+``options.thinking_prefix_mismatch`` decides what happens to blocks that fail: "drop_block"
+(the default) leaves them out and reports how many, "error" fails the request, and "off"
+sends no thinking settings at all, for models without adaptive thinking.
 """
 
 from collections.abc import Sequence
@@ -25,6 +32,8 @@ from sim2real.models.types import (
 )
 
 _FALLBACK_BETA = "server-side-fallback-2026-07-01"
+_BINDING_BETA = "thinking-binding-controls-2026-08-01"
+_PREFIX_MISMATCH = ("drop_block", "error", "off")
 _STOPS = {"end_turn": "end_turn", "tool_use": "tool_use", "max_tokens": "max_tokens", "refusal": "refusal"}
 
 
@@ -50,9 +59,19 @@ class AnthropicClient:
                                 "eager_input_streaming": True} for t in tools]
         if settings.effort:
             params["output_config"] = {"effort": settings.effort}
+        betas = []
+        mismatch = settings.options.get("thinking_prefix_mismatch", "drop_block")
+        if mismatch not in _PREFIX_MISMATCH:
+            raise ModelError(f"options.thinking_prefix_mismatch must be one of {', '.join(_PREFIX_MISMATCH)}, "
+                             f"not {mismatch!r}", retryable=False)
+        if mismatch != "off":
+            params["thinking"] = {"type": "adaptive", "block_binding": {"prefix_mismatch_behavior": mismatch}}
+            betas.append(_BINDING_BETA)
         if settings.options.get("refusal_fallback", True):
-            params["betas"] = [_FALLBACK_BETA]
+            betas.append(_FALLBACK_BETA)
             params["fallbacks"] = "default"
+        if betas:
+            params["betas"] = betas
         try:
             with self._client.beta.messages.stream(**params) as stream:
                 response = stream.get_final_message()
@@ -101,6 +120,7 @@ class AnthropicClient:
         native = tuple(block.to_dict() for block in response.content)
         usage = response.usage
         details = response.stop_details
+        transformations = getattr(response, "input_transformations", None) or ()
         return ModelReply(
             message=Message(role="assistant", parts=tuple(parts), provider=self.provider, native=native),
             stop=_STOPS.get(response.stop_reason, "other"),
@@ -110,4 +130,5 @@ class AnthropicClient:
             requested_model=requested_model,
             served_model=response.model,
             refusal_category=getattr(details, "category", None) if response.stop_reason == "refusal" else None,
+            dropped_reasoning_blocks=sum(1 for t in transformations if getattr(t, "type", None) == "thinking_dropped"),
         )

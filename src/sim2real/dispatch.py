@@ -10,13 +10,18 @@ Each tick, for every open investigation:
 It then regenerates the research notebook of every investigation whose log grew, closed
 ones included.
 
-Only one dispatcher works on a data directory at a time (a lock file), and each tick
-leaves a heartbeat so the chat can warn when no dispatcher is running.
+Only one dispatcher works on a data directory at a time (a lock file). It leaves a
+heartbeat at the start and end of each tick and after every agent step, so the chat can
+warn when no dispatcher is running, and while an agent works it describes that run in an
+activity file, so the live panel can show it.
 """
 
 import fcntl
+import json
+import os
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -42,6 +47,27 @@ JUDGE = Actor(kind=ActorKind.EVIDENCE_JUDGE, id="evidence-judge")
 _ENDED = frozenset({CalculationState.SCHEDULER_TERMINAL, CalculationState.PARSING, CalculationState.QUALITY_ASSESSED,
                     CalculationState.REJECTED, CalculationState.CANCELLED})
 HEARTBEAT = "dispatcher.heartbeat"
+ACTIVITY = "dispatcher.activity"
+
+
+@dataclass(frozen=True)
+class Activity:
+    """The agent run the dispatcher is carrying out right now."""
+
+    investigation_id: str
+    task_id: str
+    role: str
+    hypothesis_id: str
+    started_at: datetime
+    last_step: str | None = None
+    """The tool the agent called most recently."""
+    last_step_at: datetime | None = None
+
+
+def _write_atomically(path: Path, text: str) -> None:
+    partial = path.with_name(f".{path.name}.partial")
+    partial.write_text(text)
+    os.replace(partial, path)
 
 
 def hypothesis_actor(hypothesis_id: str) -> Actor:
@@ -70,14 +96,18 @@ class Dispatcher:
             except OSError:
                 return ["another dispatcher is working on this data directory; skipped"]
             try:
+                self._beat()
                 notes = []
                 for investigation_id in self.workspace.store.investigation_ids():
                     notes += self._advance(investigation_id)
                     notes += self._refresh_notebook(investigation_id)
-                (self.workspace.root / HEARTBEAT).write_text(self.clock().isoformat())
+                self._beat()
                 return notes
             finally:
                 fcntl.lockf(lock, fcntl.LOCK_UN)
+
+    def _beat(self) -> None:
+        _write_atomically(self.workspace.root / HEARTBEAT, self.clock().isoformat())
 
     def run_forever(self, interval: float, log: Callable[[str], None] = print) -> None:
         while True:
@@ -202,7 +232,21 @@ class Dispatcher:
             tools = judge_tools(JudgeContext(ledger=self.workspace.ledger, investigation_id=investigation_id,
                                              actor=actor))
             system, session = EVIDENCE_JUDGE, f"{investigation_id}.judge"
-        result = runner.run(session[:128], system=system, tools=tools, instruction=instruction, limits=limits)
+        activity = {"investigation_id": investigation_id, "task_id": task.task_id, "role": role,
+                    "hypothesis_id": task.hypothesis_id, "started_at": self.clock().isoformat()}
+        activity_path = self.workspace.root / ACTIVITY
+
+        def step(call, _outcome) -> None:
+            activity.update(last_step=call.name, last_step_at=self.clock().isoformat())
+            _write_atomically(activity_path, json.dumps(activity))
+            self._beat()
+
+        _write_atomically(activity_path, json.dumps(activity))
+        try:
+            result = runner.run(session[:128], system=system, tools=tools, instruction=instruction, limits=limits,
+                                observer=step)
+        finally:
+            activity_path.unlink(missing_ok=True)
         record_agent_run(self.workspace.ledger, investigation_id, actor, session_id=session[:128], role=role,
                          settings=settings, result=result, task_id=task.task_id)
         return result.outcome
@@ -227,9 +271,22 @@ class Dispatcher:
 
 
 def heartbeat_age(workspace: Workspace, now: datetime | None = None) -> float | None:
-    """Seconds since the last dispatcher tick, or None if no dispatcher has run here."""
+    """Seconds since the dispatcher last showed it was alive, or None if none has run here."""
     path = workspace.root / HEARTBEAT
     if not path.exists():
         return None
     last = datetime.fromisoformat(path.read_text().strip())
     return ((now or datetime.now(timezone.utc)) - last).total_seconds()
+
+
+def current_activity(workspace: Workspace) -> Activity | None:
+    """The agent run in progress, as the dispatcher last described it, or None."""
+    try:
+        data = json.loads((workspace.root / ACTIVITY).read_text())
+        return Activity(
+            investigation_id=data["investigation_id"], task_id=data["task_id"], role=data["role"],
+            hypothesis_id=data["hypothesis_id"], started_at=datetime.fromisoformat(data["started_at"]),
+            last_step=data.get("last_step"),
+            last_step_at=datetime.fromisoformat(data["last_step_at"]) if data.get("last_step_at") else None)
+    except FileNotFoundError:
+        return None

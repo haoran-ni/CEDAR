@@ -216,6 +216,14 @@ class AgentsStarted(Contract):
     """The researcher's command that started them; None when the review window passed."""
 
 
+class ProposalWithdrawn(Contract):
+    """A proposal taken back before it started; its agents never start."""
+
+    type: Literal["proposal_withdrawn"] = "proposal_withdrawn"
+    proposal_id: Identifier
+    reason: NonEmptyStr
+
+
 class AgentRetired(Contract):
     """An agent will get no more work; its record and evidence remain."""
 
@@ -313,6 +321,7 @@ EventPayload = Annotated[
     | AssessmentRecorded
     | AgentsProposed
     | AgentsStarted
+    | ProposalWithdrawn
     | AgentRetired
     | AgentTaskQueued
     | AgentRunRecorded,

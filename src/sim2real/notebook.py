@@ -31,6 +31,7 @@ from sim2real.contracts.events import (
     AgentsProposed,
     AgentsStarted,
     AgentTaskQueued,
+    ProposalWithdrawn,
     AnalysisRecorded,
     AssessmentRecorded,
     CalculationInputsExamined,
@@ -457,6 +458,8 @@ def _why(rnd: _Round, state: InvestigationState) -> list[str]:
                          + ", ".join(f"{a} on {ROOT.hyp(h)}" for h, a in p.agent_ids.items()))
         elif isinstance(p, AgentRetired):
             lines.append(f"- {p.agent_id} retired by {who}: {_said(p.reason)}")
+        elif isinstance(p, ProposalWithdrawn):
+            lines.append(f"- Proposal {p.proposal_id} withdrawn by {who}: {_said(p.reason)}")
     return lines or ["No decisions were recorded this round."]
 
 
@@ -782,7 +785,7 @@ def _index_page(state: InvestigationState, events: Sequence[RecordedEvent], roun
         agents += ["", "Proposals:", ""]
         for proposal in state.proposals.values():
             outcome = {"pending": "waiting for the researcher's review", "started": "started",
-                       "superseded": "replaced by a later proposal"}[proposal.status.value]
+                       "superseded": "replaced by a later proposal", "withdrawn": "withdrawn"}[proposal.status.value]
             replies = f"; researcher replied: {', '.join(proposal.feedback_ids)}" if proposal.feedback_ids else ""
             agents.append(f"- {proposal.proposal_id} (event #{proposal.recorded_at}, {outcome}{replies}): "
                           + ", ".join(f"{_flat(a.role)} on {ROOT.hyp(a.hypothesis_id)}" for a in proposal.agents))
@@ -861,6 +864,8 @@ def _describe(event: RecordedEvent) -> str:
             return f"{p.proposal_id} started {how}: " + ", ".join(p.agent_ids.values())
         case AgentRetired():
             return f"{p.agent_id} retired: {_said(p.reason)}"
+        case ProposalWithdrawn():
+            return f"{p.proposal_id} withdrawn: {_said(p.reason)}"
         case AgentRunRecorded():
             return f"{p.role.replace('_', ' ')} run ended {p.outcome} after {p.turns} turns ({_tokens(p):,} tokens)"
     return p.type

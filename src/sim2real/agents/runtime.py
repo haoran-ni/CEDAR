@@ -2,9 +2,10 @@
 
 One invocation appends the new instruction to the session's transcript, then alternates
 model turns and tool calls until the agent answers without calling a tool, a tool ends
-the run (for example to wait for a job), or a limit is reached. Tools from a turn that
-was cut off (``max_tokens``) or refused are never run; their calls are answered with an
-error so the transcript stays valid for the next invocation.
+the run (for example to wait for a job), a limit is reached, or the caller asks it to stop
+(checked before every model call, where the transcript is complete). Tools from a turn
+that was cut off (``max_tokens``) or refused are never run; their calls are answered with
+an error so the transcript stays valid for the next invocation.
 """
 
 from collections.abc import Callable, Sequence
@@ -25,7 +26,8 @@ from sim2real.models.types import (
 )
 from sim2real.secrets import redact
 
-Outcome = Literal["finished", "waiting", "turn_limit", "token_limit", "truncated", "refused", "model_error"]
+Outcome = Literal["finished", "waiting", "turn_limit", "token_limit", "truncated", "refused", "model_error",
+                  "stopped"]
 
 
 @dataclass(frozen=True)
@@ -66,8 +68,10 @@ class AgentRunner:
 
     def run(self, session_id: str, *, system: str, tools: Sequence[AgentTool], instruction: str,
             limits: RunLimits = RunLimits(),
-            observer: Callable[[ToolCall, ToolOutcome], None] | None = None) -> RunResult:
-        """Run one invocation; ``observer`` sees each tool call and its outcome, e.g. to show progress."""
+            observer: Callable[[ToolCall, ToolOutcome], None] | None = None,
+            should_stop: Callable[[], str | None] | None = None) -> RunResult:
+        """Run one invocation; ``observer`` sees each tool call and its outcome, e.g. to show progress, and
+        ``should_stop`` is asked before every model call, returning why the run must stop, or None."""
         by_name = {tool.name: tool for tool in tools}
         specs = [tool.spec() for tool in tools]
         history = self._transcripts.load(session_id)
@@ -75,6 +79,10 @@ class AgentRunner:
         result = RunResult(outcome="finished")
 
         while True:
+            reason = should_stop() if should_stop is not None else None
+            if reason:
+                result.outcome, result.error = "stopped", f"stopped: {reason}"
+                return result
             if result.turns >= limits.max_turns:
                 result.outcome = "turn_limit"
                 return result

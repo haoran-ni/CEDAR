@@ -11,9 +11,16 @@ Chief Scientist to collect and compare what they reported.
 from datetime import datetime
 
 from sim2real.contracts.base import Actor, ActorKind, new_id
-from sim2real.contracts.events import AgentsStarted, AgentTaskQueued, EventDraft
+from sim2real.contracts.events import (
+    AgentRetired,
+    AgentsStarted,
+    AgentTaskQueued,
+    EventDraft,
+    InvestigationStatusChanged,
+    ProposalWithdrawn,
+)
 from sim2real.contracts.plan import Priority
-from sim2real.contracts.status import InvestigationStatus
+from sim2real.contracts.status import INVESTIGATION_MACHINE, InvestigationStatus
 from sim2real.state.projection import (
     AgentRecord,
     AgentTaskRecord,
@@ -56,6 +63,22 @@ def start_drafts(state: InvestigationState, proposal: ProposalRecord, actor: Act
         drafts.append(EventDraft(actor=actor, payload=AgentTaskQueued(
             task_id=new_id("task"), role="hypothesis_agent", hypothesis_id=spec.hypothesis_id,
             agent_id=ids[spec.hypothesis_id], instruction=f"Your first task, from the Chief Scientist: {spec.brief}")))
+    return drafts
+
+
+def halt_drafts(state: InvestigationState, actor: Actor, reason: str) -> list[EventDraft]:
+    """Withdraw a waiting proposal, retire every agent and pause the investigation; a run in progress stops at its
+    next model call, and nothing new starts until the investigation is resumed."""
+    drafts = []
+    proposal = state.pending_proposal
+    if proposal is not None:
+        drafts.append(EventDraft(actor=actor, payload=ProposalWithdrawn(proposal_id=proposal.proposal_id,
+                                                                        reason=reason)))
+    drafts += [EventDraft(actor=actor, payload=AgentRetired(agent_id=a.agent_id, reason=reason))
+               for a in state.agents.values() if a.active]
+    if state.status not in INVESTIGATION_MACHINE.suspend | INVESTIGATION_MACHINE.terminal:
+        drafts.append(EventDraft(actor=actor, payload=InvestigationStatusChanged(
+            status=InvestigationStatus.PAUSED, reason=reason)))
     return drafts
 
 

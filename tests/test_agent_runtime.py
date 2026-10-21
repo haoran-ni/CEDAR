@@ -180,3 +180,19 @@ def test_cached_input_counts_toward_the_token_limit(transcripts):
     cached = reply(call("echo", text="x")).model_copy(update={"usage": Usage(input_tokens=1, cache_read_tokens=50)})
     result, _ = run(transcripts, [cached, reply(TextPart(text="ok"))], limits=RunLimits(max_tokens=40))
     assert result.outcome == "token_limit" and result.usage.total == 51
+
+
+def test_a_run_stops_before_its_next_model_call_when_asked(transcripts):
+    model = ScriptedModel([reply(call("echo", text="one")), reply(TextPart(text="never asked"))])
+    log, asked = [], []
+
+    def should_stop():
+        asked.append(len(model.calls))
+        return "the researcher halted it" if log else None
+
+    result = AgentRunner(model, SETTINGS, transcripts).run(
+        "s1", system="system prompt", tools=tools(log), instruction="Do it.", should_stop=should_stop)
+    assert (result.outcome, result.error, result.turns) == ("stopped", "stopped: the researcher halted it", 1)
+    assert asked == [0, 1] and len(model.calls) == 1
+    # The transcript ends with the tool's result, so the session can be resumed.
+    assert transcripts.load("s1")[-1].role == "user" and tool_results(transcripts)[-1].content == "echo: one"

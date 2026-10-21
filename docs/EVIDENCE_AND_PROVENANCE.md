@@ -53,7 +53,7 @@ Payloads cover the whole research process:
 | Hypotheses | `hypothesis_proposed`, `hypothesis_status_changed`, `prediction_registered` |
 | Computation | `calculation_requested`, `calculation_linked`, `calculation_inputs_examined`, `calculation_state_changed`, `run_checked` (the run's health checks and stored outputs) |
 | Results | `analysis_recorded` (a script an agent ran: the script, its hashed inputs, output and results), `evidence_recorded`, `assessment_recorded` |
-| Agents | `agents_proposed` (by the Chief Scientist: per hypothesis a role and a first task), `agents_started` (by the researcher's command or after the review window), `agent_retired`, `agent_task_queued` (work for an agent, the Judge, or a Chief Scientist review), `agent_run_recorded` (model, tokens, outcome, and the agent's final report) |
+| Agents | `agents_proposed` (by the Chief Scientist: per hypothesis a role and a first task), `agents_started` (by the researcher's command or after the review window), `proposal_withdrawn`, `agent_retired`, `agent_task_queued` (work for an agent, the Judge, or a Chief Scientist review), `agent_run_recorded` (model, tokens, outcome, and the agent's final report) |
 
 Events are never updated or deleted; database triggers refuse both. A correction is a new
 event.

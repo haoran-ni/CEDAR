@@ -20,6 +20,7 @@ from sim2real.contracts.events import (
     AgentsProposed,
     AgentsStarted,
     AgentTaskQueued,
+    ProposalWithdrawn,
     AnalysisRecorded,
     AssessmentRecorded,
     CalculationInputsExamined,
@@ -91,6 +92,7 @@ EVENT_ACTORS: dict[type, frozenset[ActorKind]] = {
     AgentsProposed: frozenset({_A.CHIEF_SCIENTIST}),
     AgentsStarted: frozenset({_A.USER, _A.SYSTEM}),
     AgentRetired: frozenset({_A.USER, _A.CHIEF_SCIENTIST}),
+    ProposalWithdrawn: frozenset({_A.USER, _A.CHIEF_SCIENTIST}),
 }
 """Who may record each event type. Nobody but the computing services moves a calculation."""
 
@@ -221,6 +223,8 @@ class ProposalStatus(StrEnum):
     STARTED = "started"
     SUPERSEDED = "superseded"
     """A newer proposal replaced it before it started."""
+    WITHDRAWN = "withdrawn"
+    """Taken back before it started, e.g. when the researcher halted the investigation."""
 
 
 @dataclass
@@ -236,7 +240,7 @@ class ProposalRecord:
     feedback_ids: list[str] = field(default_factory=list)
     """Researcher messages recorded while it waited; any one of them stops it starting by itself."""
     closed_at: int | None = None
-    """Stream version at which it started or was superseded."""
+    """Stream version at which it started, was superseded or was withdrawn."""
 
 
 @dataclass
@@ -855,8 +859,7 @@ def _on_agent_run(state: InvestigationState, event: RecordedEvent, p: AgentRunRe
             raise RuleViolation(f"task {p.task_id} is for a {task.role}, not a {p.role}")
         if task.agent_id is not None and event.actor.id != task.agent_id:
             raise RuleViolation(f"task {p.task_id} is for {task.agent_id}, not {event.actor.id}")
-        if task.dropped_at is not None:
-            raise RuleViolation(f"task {p.task_id} was dropped when its agent was retired")
+        # A run already going when its agent was retired is still recorded, so its tokens count.
         task.completed_by = event.stream_version
     state.agent_runs.append(AgentRunRecord(p.session_id, p.role, event.actor.id, p, event.stream_version, event.round))
 
@@ -913,6 +916,13 @@ def _on_agents_started(state: InvestigationState, event: RecordedEvent, p: Agent
     proposal.status, proposal.closed_at = ProposalStatus.STARTED, event.stream_version
 
 
+def _on_proposal_withdrawn(state: InvestigationState, event: RecordedEvent, p: ProposalWithdrawn) -> None:
+    proposal = state.proposals.get(p.proposal_id)
+    if proposal is None or proposal.status is not ProposalStatus.PENDING:
+        raise RuleViolation(f"proposal {p.proposal_id} is not waiting to start")
+    proposal.status, proposal.closed_at = ProposalStatus.WITHDRAWN, event.stream_version
+
+
 def _on_agent_retired(state: InvestigationState, event: RecordedEvent, p: AgentRetired) -> None:
     agent = state.agents.get(p.agent_id)
     if agent is None or not agent.active:
@@ -945,6 +955,7 @@ _HANDLERS = {
     AgentsProposed: _on_agents_proposed,
     AgentsStarted: _on_agents_started,
     AgentRetired: _on_agent_retired,
+    ProposalWithdrawn: _on_proposal_withdrawn,
 }
 
 __all__ = [

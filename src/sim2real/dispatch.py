@@ -17,7 +17,9 @@ Agents run in background threads, so submission and polling go on while they wor
 agents at once (``max_agents``), but never two runs of the same agent, and never two runs
 of the Evidence Judge or of the Chief Scientist's review in one investigation. Hypothesis
 agents run only while their investigation is INVESTIGATING; the Evidence Judge and the
-Chief Scientist's reviews also while it is REVIEWING. Each agent run sets aside the tokens
+Chief Scientist's reviews also while it is REVIEWING. A run in progress stops at its next
+model call once that no longer holds or its agent is retired, as when the researcher halts
+the investigation. Nothing is submitted while an investigation is paused or blocked. Each agent run sets aside the tokens
 it may use, so agents running together cannot overspend a budget.
 
 The dispatcher then regenerates the research notebook of every investigation whose log
@@ -79,6 +81,8 @@ PID = "dispatcher.pid"
 LOG = "dispatcher.log"
 IDLE_MINUTES = 30
 """A dispatcher the chat started stops after this long with nothing to do."""
+_WORKING = frozenset({InvestigationStatus.INVESTIGATING, InvestigationStatus.REVIEWING})
+"""Investigation states in which work goes on: submissions, the Evidence Judge and reviews."""
 _LIVE = frozenset({CalculationState.SUBMISSION_PENDING, CalculationState.SUBMITTED, CalculationState.QUEUED,
                    CalculationState.RUNNING, CalculationState.SCHEDULER_TERMINAL, CalculationState.PARSING})
 
@@ -97,7 +101,7 @@ def needs_dispatcher(state: InvestigationState) -> bool:
     for calc in state.calculations.values():
         if calc.state in _LIVE:
             return True
-        if (calc.state is CalculationState.VALIDATED_INPUT
+        if (calc.state is CalculationState.VALIDATED_INPUT and state.status in _WORKING
                 and not all(state.plan.priority(h) is Priority.ON_HOLD for h in calc.hypothesis_ids)
                 and (not state.spec.constraints.submit_requires_approval
                      or authorization_for(state, PermissionAction.SUBMIT, calc.calculation_id) is not None)):
@@ -289,6 +293,8 @@ class Dispatcher:
         notes = []
         for calc in state.calculations.values():
             if calc.state is CalculationState.VALIDATED_INPUT:
+                if state.status not in _WORKING:
+                    continue
                 if all(state.plan.priority(h) is Priority.ON_HOLD for h in calc.hypothesis_ids):
                     continue
                 if state.spec.constraints.submit_requires_approval and authorization_for(
@@ -394,6 +400,17 @@ class Dispatcher:
     def _key(investigation_id: str, task: AgentTaskRecord) -> str:
         """Runs with the same key never overlap: one per agent, one Judge and one review per investigation."""
         return f"{investigation_id}/{task.agent_id or task.role}"
+
+    def _interruption(self, investigation_id: str, task: AgentTaskRecord) -> str | None:
+        """Why a run in progress must stop now: its agent was retired, or its investigation left the states its
+        role works in."""
+        state = self.workspace.ledger.load(investigation_id)
+        if task.agent_id is not None and not state.agents[task.agent_id].active:
+            return f"{task.agent_id} was retired"
+        allowed = _WORKING if task.role != "hypothesis_agent" else (InvestigationStatus.INVESTIGATING,)
+        if state.status not in allowed:
+            return f"the investigation is {state.status.value}"
+        return None
 
     @staticmethod
     def _runnable(state: InvestigationState, task: AgentTaskRecord) -> bool:
@@ -527,7 +544,7 @@ class Dispatcher:
         _write_atomically(activity_path, json.dumps(activity))
         try:
             result = runner.run(session[:128], system=system, tools=tools, instruction=instruction, limits=limits,
-                                observer=step)
+                                observer=step, should_stop=lambda: self._interruption(investigation_id, task))
         finally:
             activity_path.unlink(missing_ok=True)
         record_agent_run(self.workspace.ledger, investigation_id, actor, session_id=session[:128], role=role,
@@ -581,20 +598,35 @@ def start_background_dispatcher(workspace: Workspace, idle_minutes: float = IDLE
     return process.pid
 
 
-def stop_dispatcher(workspace: Workspace, timeout: float = 600) -> str:
+def stop_dispatcher(workspace: Workspace, timeout: float = 600, force: bool = False) -> str:
     """Ask the dispatcher of this data directory to stop (SIGTERM) and wait until it has, for at most
-    ``timeout`` seconds; it first finishes the agent runs in progress."""
+    ``timeout`` seconds; it first ends the agent runs in progress. With ``force`` it is then killed, losing the
+    token counts of runs still going."""
     if not dispatcher_running(workspace):
         return "No dispatcher is running on this data directory."
     try:
         pid = int((workspace.root / PID).read_text().strip())
     except (FileNotFoundError, ValueError):
         return "A dispatcher holds the lock but left no process id; stop it where it runs (Ctrl-C)."
-    os.kill(pid, signal.SIGTERM)
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return f"The dispatcher's recorded process {pid} no longer exists, yet the lock is held; stop it where it runs."
     deadline = time.monotonic() + timeout
     while dispatcher_running(workspace):
         if time.monotonic() > deadline:
-            return f"Asked the dispatcher (process {pid}) to stop; it is still finishing agent runs."
+            if not force:
+                return f"Asked the dispatcher (process {pid}) to stop; it is still finishing agent runs."
+            os.kill(pid, signal.SIGKILL)
+            for _ in range(100):
+                if not dispatcher_running(workspace):
+                    break
+                time.sleep(0.1)
+            (workspace.root / PID).unlink(missing_ok=True)
+            for path in (workspace.root / ACTIVITY).glob("*.json"):
+                path.unlink(missing_ok=True)
+            return (f"Stopped the dispatcher (process {pid}) by force: its agent runs did not end within "
+                    f"{timeout:g} s, so their last token counts were not recorded.")
         time.sleep(0.2)
     return f"Stopped the dispatcher (process {pid})."
 

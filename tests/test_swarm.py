@@ -700,3 +700,148 @@ def test_a_background_dispatcher_runs_detached_and_stops_on_request(tmp_path):
             os.kill(pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
+
+
+# -- the researcher halts everything --------------------------------------------------------------
+
+def halted_system(system):
+    """The orchestration story up to a submitted job, plus a second hypothesis whose agent is proposed."""
+    from test_orchestration import agent_requests, latest_calc, open_and_start
+
+    open_and_start(system)
+    system["clients"].add("hypothesis_agent", *agent_requests(system))
+    system["dispatcher"].tick()
+    calc = latest_calc(system["workspace"])
+    system["chat"].handle(f"/approve submit {calc}")
+    system["dispatcher"].tick()
+    return calc
+
+
+def test_halt_cancels_the_jobs_retires_the_agents_and_pauses(system, monkeypatch):
+    from test_orchestration import HYP, INV as OPEN
+
+    import sim2real.chat
+    from sim2real.contracts import CalculationState
+    from sim2real.dispatch import needs_dispatcher
+    from sim2real.state.projection import ProposalStatus
+
+    stops = []
+    monkeypatch.setattr(sim2real.chat, "stop_dispatcher", lambda ws, timeout, force: stops.append(force) or
+                        "Stopped the dispatcher (process 4242).")
+    ledger, chat, scheduler = system["workspace"].ledger, system["chat"], system["scheduler"]
+    calc = halted_system(system)
+    job = ledger.load(OPEN).calculations[calc].scheduler_job_id
+    assert scheduler.jobs[job]["state"] is not SchedulerState.CANCELLED
+    add_hypothesis(ledger, OPEN, "hyp-coverage", agent=False)
+    ledger.record(OPEN, [draft(CHIEF, AgentsProposed(proposal_id="p-coverage", rationale="test", agents=(
+        AgentSpec(hypothesis_id="hyp-coverage", role="coverage specialist", brief="vary coverage"),)))])
+
+    reply_text = chat.handle("/halt the test went wrong")
+    message = next(m for m in reversed(ledger.load(OPEN).interventions.values()))
+    assert message.text == "/halt the test went wrong"
+    assert reply_text.splitlines() == [
+        f"{OPEN}: halted ({message.intervention_id}).",
+        f"  - cancelled 1 job: {calc} (job {job})",
+        f"  - retired agent-{HYP}; a run in progress stops at its next model call",
+        "  - withdrew the proposal p-coverage",
+        "  - paused: nothing new starts until you ask the Chief Scientist to resume it",
+        "Stopped the dispatcher (process 4242)."]
+    state = ledger.load(OPEN)
+    assert scheduler.jobs[job]["state"] is SchedulerState.CANCELLED
+    assert state.calculations[calc].state is CalculationState.CANCELLED
+    assert message.authorizations[0].target_ids == (calc,)
+    assert not any(a.active for a in state.agents.values()) and state.pending_tasks == []
+    assert state.proposals["p-coverage"].status is ProposalStatus.WITHDRAWN
+    assert state.status is InvestigationStatus.PAUSED and not needs_dispatcher(state)
+    assert stops == [True]
+    reason = f"halted by the researcher ({message.intervention_id}): the test went wrong"
+    assert state.agents[f"agent-{HYP}"].retire_reason == reason
+    assert f"p-coverage withdrawn: “{reason}”" in render_notebook(system["workspace"].store.read_stream(OPEN))[
+        "timeline.md"]
+
+
+def test_a_paused_investigation_submits_nothing(system):
+    from test_orchestration import agent_requests, latest_calc, open_and_start
+    from test_orchestration import INV as OPEN
+
+    open_and_start(system)
+    system["clients"].add("hypothesis_agent", *agent_requests(system))
+    system["dispatcher"].tick()
+    calc = latest_calc(system["workspace"])
+    system["chat"].handle(f"/approve submit {calc}")
+    system["workspace"].ledger.record(OPEN, [draft(CHIEF, InvestigationStatusChanged(
+        status=InvestigationStatus.PAUSED, reason="test"))])
+    assert not any("submitted" in n for n in system["dispatcher"].tick())
+    assert system["scheduler"].submissions == []
+    from sim2real.dispatch import needs_dispatcher
+    assert not needs_dispatcher(system["workspace"].ledger.load(OPEN))  # authorized, but nothing to do while paused
+
+
+def test_halt_leaves_other_investigations_alone_and_halt_all_stops_everything(system, monkeypatch):
+    from test_orchestration import INV as OPEN
+
+    import sim2real.chat
+
+    stops = []
+    monkeypatch.setattr(sim2real.chat, "stop_dispatcher", lambda ws, timeout, force: stops.append(force) or
+                        "Stopped the dispatcher (process 4242).")
+    ledger, chat = system["workspace"].ledger, system["chat"]
+    halted_system(system)
+    investigation(system, "hyp-a")  # another investigation, whose proposal needs the dispatcher
+    propose(ledger, "p-1", "hyp-a")
+
+    assert chat.handle("/halt").splitlines()[-1] == f"The background dispatcher keeps running for {INV}."
+    assert stops == [] and ledger.load(INV).status is InvestigationStatus.INVESTIGATING
+    assert "already" not in chat.handle("/halt all")
+    assert ledger.load(INV).status is InvestigationStatus.PAUSED and stops == [True]
+    assert ledger.load(INV).proposals["p-1"].status.value == "withdrawn"
+    assert ledger.load(OPEN).status is InvestigationStatus.PAUSED  # still paused, not halted twice
+
+
+def test_halt_stops_an_agent_run_in_progress_at_its_next_model_call(system, monkeypatch):
+    import sim2real.chat
+
+    monkeypatch.setattr(sim2real.chat, "stop_dispatcher", lambda ws, timeout, force: "Stopped.")
+    ledger, dispatcher = system["workspace"].ledger, system["dispatcher"]
+    chat = investigation(system, "hyp-a")
+    propose(ledger, "p-1", "hyp-a")
+    chat.handle("/approve agents")
+
+    def halt_while_thinking(_call):
+        chat.handle("/halt")  # the researcher, while the agent is in a model call
+        return reply(ToolCall(id="c1", name="investigation_overview", arguments={}))
+
+    router = agents_answer(system, **{"hyp-a": [halt_while_thinking, says("never asked")]})
+    notes = dispatcher.tick()
+    assert any("ran" in n and "stopped" in n for n in notes), notes
+    (run,) = [r for r in ledger.load(INV).agent_runs if r.role == "hypothesis_agent"]
+    assert run.run.outcome == "stopped" and run.run.report == "stopped: agent-hyp-a was retired"
+    assert len(router.models["agent-hyp-a"].calls) == 1 and run.run.turns == 1  # its tokens still count
+
+
+def test_a_dispatcher_that_will_not_stop_is_killed_when_forced(tmp_path):
+    import signal
+    import subprocess
+    import sys
+
+    from sim2real.dispatch import dispatcher_running, stop_dispatcher
+    from sim2real.workspace import Workspace
+
+    workspace = Workspace.open(tmp_path / "stubborn")
+    (workspace.root / "activity").mkdir()
+    (workspace.root / "activity" / "t-1.json").write_text("{}")
+    stubborn = subprocess.Popen(
+        [sys.executable, "-c", "import fcntl, os, signal, sys, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+         "f = open(sys.argv[1] + '/dispatcher.lock', 'a'); fcntl.lockf(f, fcntl.LOCK_EX); "
+         "open(sys.argv[1] + '/dispatcher.pid', 'w').write(str(os.getpid())); print('ready', flush=True); "
+         "time.sleep(60)", str(workspace.root)], stdout=subprocess.PIPE, text=True)
+    try:
+        assert stubborn.stdout.readline().strip() == "ready"
+        assert stop_dispatcher(workspace, timeout=0.5) == (
+            f"Asked the dispatcher (process {stubborn.pid}) to stop; it is still finishing agent runs.")
+        assert stop_dispatcher(workspace, timeout=0.5, force=True).startswith(
+            f"Stopped the dispatcher (process {stubborn.pid}) by force")
+        assert stubborn.wait(10) == -signal.SIGKILL and not dispatcher_running(workspace)
+        assert not (workspace.root / "dispatcher.pid").exists() and not list((workspace.root / "activity").iterdir())
+    finally:
+        stubborn.kill()

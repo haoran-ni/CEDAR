@@ -33,9 +33,11 @@ from sim2real.agents.toolkits.chief import ChiefContext, chief_tools
 from sim2real.contracts.base import Actor, ActorKind
 from sim2real.contracts.events import EventDraft, UserInterventionRecorded
 from sim2real.contracts.plan import Authorization, PermissionAction
+from sim2real.contracts.status import INVESTIGATION_MACHINE, CalculationState
 from sim2real.errors import RuleViolation
 from sim2real.hpc.profile import ProfileStore
-from sim2real.hpc.slurm import SchedulerBackend
+from sim2real.hpc.profile import ProfileNotApproved
+from sim2real.hpc.slurm import SchedulerBackend, SchedulerError
 from sim2real.models.types import ToolCall
 from sim2real.dashboard import dispatcher_status
 from sim2real.dispatch import (
@@ -46,11 +48,12 @@ from sim2real.dispatch import (
     heartbeat_age,
     needs_dispatcher,
     start_background_dispatcher,
+    stop_dispatcher,
 )
 from sim2real.notebook import round_file, update_notebook
 from sim2real.state.projection import AgentRunRecord, InvestigationState
 from sim2real.summaries import approval_requests, investigation_summary, pending_approvals
-from sim2real.swarm import CHIEF, agent_label, agents_summary, start_drafts
+from sim2real.swarm import CHIEF, agent_label, agents_summary, halt_drafts, start_drafts
 from sim2real.workspace import ModelClients, Workspace, profile_for, registry_for, services_for
 
 @dataclass(frozen=True)
@@ -77,6 +80,9 @@ COMMANDS = (
     Command("/approve inputs <calc>", "allow inputs the examiner could not verify"),
     Command("/cancel <calc> <reason>", "cancel a calculation, stopping its job if it has one"),
     Command("/report", "update the research notebook and show where it is"),
+    Command("/halt <reason>", "stop this investigation now: cancel its jobs, retire its agents, pause it (reason "
+                              "optional)"),
+    Command("/halt all <reason>", "the same for every investigation, and stop the background dispatcher"),
     Command("/help", "this list"),
     Command("/quit", "leave (queued work and jobs continue with the dispatcher)"),
     Command("/exit", "leave, like /quit"),
@@ -90,6 +96,10 @@ def command_lines(commands: tuple[Command, ...]) -> str:
 
 RESTART_SECONDS = 60
 """The least time between two dispatchers this chat starts."""
+HALT_WAIT_SECONDS = 60
+"""How long /halt lets agent runs end before it kills the dispatcher."""
+_AT_SCHEDULER = frozenset({CalculationState.SUBMISSION_PENDING, CalculationState.SUBMITTED, CalculationState.QUEUED,
+                           CalculationState.RUNNING})
 
 HELP = f"""Commands:
 {command_lines(COMMANDS)}
@@ -184,6 +194,10 @@ class ChatSession:
         name, args = words[0], words[1:]
         if name == "/help":
             return HELP
+        if name == "/halt" and args[:1] == ["all"]:
+            open_ones = [i for i in self.workspace.store.investigation_ids()
+                         if self.workspace.ledger.load(i).status not in INVESTIGATION_MACHINE.terminal]
+            return self._halt(open_ones, " ".join(args[1:]), line, everything=True)
         if self.investigation_id is None:
             return "No investigation is open yet. Describe the discrepancy and the Chief Scientist will open one."
         state = self.workspace.ledger.load(self.investigation_id)
@@ -204,6 +218,8 @@ class ChatSession:
             return self._authorize(action, args[1], line)
         if name == "/cancel" and len(args) >= 2:
             return self._cancel(args[0], " ".join(args[1:]), line)
+        if name == "/halt":
+            return self._halt([self.investigation_id], " ".join(args), line)
         return f"Unknown or incomplete command: {line}\n{HELP}"
 
     @staticmethod
@@ -256,6 +272,67 @@ class ChatSession:
         started = result.events[1].payload.agent_ids
         return (f"Started {', '.join(f'{a} on {h}' for h, a in started.items())} ({message_id}). The dispatcher runs "
                 "their first tasks.")
+
+    def _halt(self, investigation_ids: list[str], reason: str, line: str, everything: bool = False) -> str:
+        """Stop the investigations at once: cancel their jobs, withdraw their proposals, retire their agents,
+        pause them; then stop the background dispatcher unless another investigation still needs it."""
+        lines = [self._halt_one(i, reason, line) for i in investigation_ids] or ["No open investigation to halt."]
+        others = [i for i in self.workspace.store.investigation_ids()
+                  if i not in investigation_ids and needs_dispatcher(self.workspace.ledger.load(i))]
+        if others and not everything:
+            lines.append(f"The background dispatcher keeps running for {', '.join(others)}.")
+        else:
+            lines.append(stop_dispatcher(self.workspace, timeout=HALT_WAIT_SECONDS, force=True))
+        return "\n".join(lines)
+
+    def _halt_one(self, investigation_id: str, reason: str, line: str) -> str:
+        if self.workspace.ledger.load(investigation_id).status in INVESTIGATION_MACHINE.terminal:
+            return f"{investigation_id}: already closed; nothing to halt."
+        found = []
+
+        def build(state: InvestigationState) -> list[EventDraft]:
+            live = tuple(c.calculation_id for c in state.calculations.values() if c.state in _AT_SCHEDULER)
+            message = self._message_draft(state, line, (Authorization(action=PermissionAction.CANCEL,
+                                                                      target_ids=live),) if live else ())
+            why = f"halted by the researcher ({message.payload.intervention_id})" + (f": {reason}" if reason else "")
+            found[:] = [message.payload.intervention_id, why, live]
+            return [message, *halt_drafts(state, self.user, why)]
+
+        result = self.workspace.ledger.record_with(investigation_id, build)
+        message_id, why, live = found
+        done = [event.payload for event in result.events[1:]]
+        lines = [f"{investigation_id}: halted ({message_id})."]
+        cancelled, failed = self._cancel_jobs(investigation_id, live, why)
+        if live:
+            lines.append(f"  - cancelled {len(cancelled)} job{'s' if len(cancelled) != 1 else ''}"
+                         + (f": {', '.join(cancelled)}" if cancelled else ""))
+        lines += [f"  - could not cancel {problem}" for problem in failed]
+        retired = [p.agent_id for p in done if p.type == "agent_retired"]
+        if retired:
+            lines.append(f"  - retired {', '.join(retired)}; a run in progress stops at its next model call")
+        lines += [f"  - withdrew the proposal {p.proposal_id}" for p in done if p.type == "proposal_withdrawn"]
+        paused = any(p.type == "investigation_status_changed" for p in done)
+        lines.append("  - paused: nothing new starts until you ask the Chief Scientist to resume it" if paused else
+                     f"  - left {self.workspace.ledger.load(investigation_id).status.value}, so nothing new starts")
+        return "\n".join(lines)
+
+    def _cancel_jobs(self, investigation_id: str, live: tuple[str, ...], reason: str) -> tuple[list[str], list[str]]:
+        if not live:
+            return [], []
+        state = self.workspace.ledger.load(investigation_id)
+        try:
+            manager = services_for(self.workspace, profile_for(state, self.profiles), self.backend).manager
+        except (LookupError, ProfileNotApproved, FileNotFoundError) as exc:
+            return [], [f"{', '.join(live)}: no usable compute profile ({exc})"]
+        cancelled, failed = [], []
+        for calculation_id in live:
+            job = state.calculations[calculation_id].scheduler_job_id
+            try:
+                manager.cancel(investigation_id, calculation_id, reason)
+                cancelled.append(f"{calculation_id}" + (f" (job {job})" if job else ""))
+            except (RuleViolation, SchedulerError, OSError) as exc:
+                failed.append(f"{calculation_id}: {exc}")
+        return cancelled, failed
 
     def _cancel(self, given: str, reason: str, line: str) -> str:
         state = self.workspace.ledger.load(self.investigation_id)

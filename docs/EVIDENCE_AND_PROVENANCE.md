@@ -48,7 +48,7 @@ Payloads cover the whole research process:
 
 | Area | Events |
 |---|---|
-| Problem | `investigation_created`, `investigation_status_changed`, `observable_alignment_recorded` |
+| Problem | `investigation_created`, `investigation_status_changed` (closing carries the researcher's authorization), `closing_proposed` (by the Chief Scientist; only the researcher closes), `observable_alignment_recorded` |
 | Direction | `user_intervention_recorded` (the researcher's words, verbatim, with any authorization), `plan_revised` (with the message that prompted it), `round_started` |
 | Hypotheses | `hypothesis_proposed`, `hypothesis_status_changed`, `prediction_registered` |
 | Computation | `calculation_requested`, `calculation_linked`, `calculation_inputs_examined`, `calculation_state_changed`, `run_checked` (the run's health checks and stored outputs) |

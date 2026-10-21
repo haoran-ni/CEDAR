@@ -366,9 +366,10 @@ def test_a_slash_at_the_start_of_a_line_lists_the_matching_commands(system):
 
         composer.value = "/a"
         await settle(pilot)
-        assert shown() == ["/agents", "/approve agents", "/approve submit <calc>", "/approve inputs <calc>"]
+        assert shown() == ["/agents", "/approve agents", "/approve submit <calc>", "/approve inputs <calc>",
+                           "/approve close"]
         await pilot.press("up")  # the arrows wrap around the menu
-        assert app.query_one("#commands", OptionList).highlighted == 3
+        assert app.query_one("#commands", OptionList).highlighted == 4
         await pilot.press("down", "down", "down", "tab")
         assert composer.value == "/approve submit " and shown() == ["/approve submit <calc>"]
         await pilot.press("escape")  # closed until the line changes

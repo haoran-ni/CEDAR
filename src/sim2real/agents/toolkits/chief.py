@@ -4,8 +4,9 @@ The Chief can open an investigation, record observable alignment, propose and ma
 hypotheses, propose hypothesis agents (one per hypothesis, each with the role the work
 needs), give agents further work or retire them, revise the plan, start rounds, and queue
 assessments by the Evidence Judge. Proposed agents start only after the researcher's review
-window. Submissions, cancellations, input approvals and early starts of agents belong to
-the researcher and are granted with explicit commands, never through these tools.
+window. Submissions, cancellations, input approvals, early starts of agents and closing the
+investigation belong to the researcher and are granted with explicit commands, never
+through these tools: the Chief can only propose closing.
 """
 
 from collections.abc import Callable
@@ -33,6 +34,7 @@ from sim2real.contracts.events import (
     AgentRetired,
     AgentsProposed,
     AgentTaskQueued,
+    ClosingProposed,
     EventDraft,
     HypothesisProposed,
     HypothesisStatusChanged,
@@ -141,9 +143,15 @@ class OpenArgs(Contract):
 
 
 class InvestigationStatusArgs(Contract):
-    status: Literal["ALIGNING_OBSERVABLES", "PLANNING", "INVESTIGATING", "REVIEWING", "COMPLETED", "INCONCLUSIVE",
-                    "PAUSED", "BLOCKED"]
+    status: Literal["ALIGNING_OBSERVABLES", "PLANNING", "INVESTIGATING", "REVIEWING", "PAUSED", "BLOCKED"]
     reason: NonEmptyStr
+
+
+class ClosingArgs(Contract):
+    status: Literal["COMPLETED", "INCONCLUSIVE"] = Field(description="COMPLETED when the question is answered as "
+                                                                     "far as the evidence allows; INCONCLUSIVE when "
+                                                                     "budgets or identifiability prevent it.")
+    reason: NonEmptyStr = Field(description="Why close now: what was found, and what remains open.")
 
 
 class AlignmentArgs(Contract):
@@ -310,6 +318,16 @@ def chief_tools(ctx: ChiefContext) -> list[AgentTool]:
         record(change)
         return f"Investigation is now {args.status}."
 
+    def propose_closing(args: ClosingArgs) -> str:
+        earlier = ctx.ledger.load(current()).pending_closing
+        closing_id = new_id("close")
+        record(ClosingProposed(closing_id=closing_id, status=InvestigationStatus(args.status), reason=args.reason))
+        replaced = f" It replaces {earlier.closing_id}." if earlier else ""
+        return (f"Proposed closing the investigation as {args.status} ({closing_id}).{replaced} Nothing changes "
+                "until the researcher types /approve close, which closes it for good; any status change you make "
+                "withdraws the proposal. Tell the researcher that you propose closing it, as what and why, what was "
+                "found and what remains open, and that /approve close closes it.")
+
     def record_alignment(args: AlignmentArgs) -> str:
         state = ctx.ledger.load(current())
         alignment = ObservableAlignment(simulated=state.alignment.simulated, measured=state.alignment.measured,
@@ -442,9 +460,12 @@ def chief_tools(ctx: ChiefContext) -> list[AgentTool]:
                   "evidence status, queued agent work, and what waits for the researcher. Check it before "
                   "answering questions about progress.", NoArgs, investigation_state),
         AgentTool("set_investigation_status", "Move the investigation one step at a time: CREATED -> "
-                  "ALIGNING_OBSERVABLES -> PLANNING -> INVESTIGATING <-> REVIEWING -> COMPLETED or INCONCLUSIVE "
-                  "(PAUSED or BLOCKED from any open state), with the reason.", InvestigationStatusArgs,
-                  set_investigation_status),
+                  "ALIGNING_OBSERVABLES -> PLANNING -> INVESTIGATING <-> REVIEWING (PAUSED or BLOCKED from any open "
+                  "state), with the reason. Only the researcher closes it; propose that with propose_closing.",
+                  InvestigationStatusArgs, set_investigation_status),
+        AgentTool("propose_closing", "Propose closing the investigation, from REVIEWING, as COMPLETED or "
+                  "INCONCLUSIVE. Only the researcher closes it, for good, by typing /approve close.", ClosingArgs,
+                  propose_closing),
         AgentTool("record_alignment", "Record whether the simulated and measured quantities are the same thing. A "
                   "numerical discrepancy exists only once they are ALIGNED.", AlignmentArgs, record_alignment),
         AgentTool("propose_hypothesis", "Propose one falsifiable explanation of the discrepancy.", HypothesisArgs,
@@ -472,8 +493,8 @@ def chief_tools(ctx: ChiefContext) -> list[AgentTool]:
                   lambda a: queue("evidence_judge", a)),
         AgentTool("agent_reports", "Read the latest reports of hypothesis agents and the Evidence Judge.",
                   ReportsArgs, agent_reports),
-        AgentTool("pending_approvals", "List what waits for the researcher (submissions, inputs needing review) "
-                  "and the exact command they type to grant each.", NoArgs, approvals),
+        AgentTool("pending_approvals", "List what waits for the researcher (agents, submissions, inputs needing "
+                  "review, closing) and the exact command they type to grant each.", NoArgs, approvals),
         AgentTool("describe_protocol", "Explain what a protocol under this investigation's compute profile "
                   "accepts.", ProtocolArgs, describe_protocol),
     ]

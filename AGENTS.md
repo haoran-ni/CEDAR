@@ -62,7 +62,7 @@ Responsibilities:
 - Consult Evidence Judge for scientific synthesis and Research Recorder for traceable history.
 - Accept user intervention without resetting unrelated work, e.g., “pause new coverage tests, prioritize XC” while active calculations remain unless explicitly cancelled.
 
-Hard constraints: no direct DFT execution or shell execution, no job submission that bypasses input examination, no fabricated job status, and no unilateral promotion of a user's preference to scientific evidence. Chief Scientist can **request** computation (and may draft inputs) through task orchestration, but only the job manager executes it, and only after examination. A continuously accessible chat **does not imply** a continuously running LLM inference process.
+Hard constraints: no direct DFT execution or shell execution, no job submission that bypasses input examination, no fabricated job status, no unilateral promotion of a user's preference to scientific evidence, and no closing of an investigation: the Chief Scientist proposes closing, with its reasons, and only the researcher closes it. Chief Scientist can **request** computation (and may draft inputs) through task orchestration, but only the job manager executes it, and only after examination. A continuously accessible chat **does not imply** a continuously running LLM inference process.
 
 ### 3.2 Hypothesis generation / review
 

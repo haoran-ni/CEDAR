@@ -33,6 +33,8 @@ class PermissionAction(StrEnum):
     """Run inputs whose examination ended NEEDS_REVIEW."""
     START_AGENTS = "start_agents"
     """Start proposed hypothesis agents before their review window ends."""
+    CLOSE_INVESTIGATION = "close_investigation"
+    """Close the investigation as the Chief Scientist proposed: COMPLETED or INCONCLUSIVE, for good."""
 
 
 class Authorization(Contract):

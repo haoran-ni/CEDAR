@@ -505,12 +505,132 @@ def test_the_chief_scientist_reviews_once_every_agent_has_reported(tmp_path, sit
     clients.add("chief_scientist", says("Nothing conflicts so far."))
     assert chat.handle("What came in?") == "Nothing conflicts so far."
     asked = clients.models["chief_scientist"].calls[-1].messages[-1].text
-    assert asked.startswith("[record: your background review of the agents' reports, run finished, concluded]\n"
+    assert asked.startswith("[record: your background review of the agents' reports, run finished]\n"
                             "Both agents reported.")
     assert asked.endswith("[researcher, recorded as msg-2] What came in?")
     assert chat.chief_session == f"{INV}.chief"
     round_page = render_notebook(system["workspace"].store.read_stream(INV))[round_file(ledger.load(INV).round)]
     assert "(chief scientist; review of the agents' reports; task" in round_page
+
+
+def test_a_review_proposes_closing_and_only_the_researcher_closes(tmp_path, site):
+    """The Chief Scientist's review proposes closing and says so; the researcher's /approve close closes it."""
+    system = make_system(tmp_path, site, reviews=True)
+    ledger, clients, dispatcher = system["workspace"].ledger, system["clients"], system["dispatcher"]
+    chat = investigation(system, "hyp-a")
+    propose(ledger, "p-1", "hyp-a")
+    chat.handle("/approve agents")
+    agents_answer(system, **{"hyp-a": [says("A answered its question.")]})
+    dispatcher.tick()
+
+    def chief(call_id, name, **arguments):
+        return reply(ToolCall(id=call_id, name=name, arguments=arguments))
+
+    message = "I propose closing the investigation as COMPLETED: A answered it. /approve close closes it."
+    clients.add("chief_scientist", chief("c1", "set_investigation_status", status="REVIEWING", reason="A reported"),
+                chief("c2", "propose_closing", status="COMPLETED", reason="A answered the question."), says(message))
+    dispatcher.tick()
+    state = ledger.load(INV)
+    assert state.status is InvestigationStatus.REVIEWING
+    closing = state.pending_closing
+    assert (closing.status, closing.reason) == (InvestigationStatus.COMPLETED, "A answered the question.")
+    (review,) = [r for r in state.agent_runs if r.role == "chief_scientist"]
+    assert (review.run.outcome, review.run.turns) == ("finished", 3)
+    assert "If you proposed closing the investigation, say so first" in \
+        clients.models["chief_scientist"].calls[0].messages[-1].text
+
+    # The researcher sees the Chief's message, and the request for approval whatever that message says.
+    notices = [n.text for n in chat.notices()]
+    assert message in notices
+    assert (f"[waiting for you] /approve close  (the Chief Scientist proposes closing the investigation as COMPLETED "
+            f"({closing.closing_id}): A answered the question.)") in notices
+
+    answer = chat.handle("/approve close")
+    assert answer.splitlines() == [
+        f"{INV} is now COMPLETED, closed for good (msg-2). The Chief Scientist proposed it ({closing.closing_id}): "
+        "A answered the question.",
+        "  - retired agent-hyp-a"]
+    state = ledger.load(INV)
+    assert state.status is InvestigationStatus.COMPLETED and state.pending_closing is None
+    assert not state.agents["agent-hyp-a"].active
+    assert chat.handle("/pending") == "Nothing waits for your approval."
+    assert chat.handle("/approve close").startswith("Nothing to close")
+    pages = render_notebook(system["workspace"].store.read_stream(INV))
+    assert f"{closing.closing_id}: closing proposed as COMPLETED: “A answered the question.”" in pages["timeline.md"]
+    assert "Investigation moved to COMPLETED, authorized by msg-2" in pages["timeline.md"]
+    assert f"- Closing as COMPLETED proposed by Chief Scientist ({closing.closing_id})" in \
+        pages[round_file(state.round)]
+
+
+def test_closing_needs_the_chiefs_proposal_and_the_researchers_command(system):
+    ledger = system["workspace"].ledger
+    chat = investigation(system, "hyp-a")
+    tools = {t.name: t for t in chief_tools(ChiefContext(
+        ledger=ledger, profiles=system["profiles"], registry_for=lambda name: None, actor=CHIEF, investigation_id=INV,
+        clock=system["clock"]))}
+
+    def use(name, **arguments):
+        return tools[name].invoke(arguments)
+
+    def close(actor, status):
+        ledger.record(INV, [draft(actor, InvestigationStatusChanged(status=status, reason="done"))])
+
+    assert use("set_investigation_status", status="COMPLETED", reason="done").is_error  # not the Chief's to set
+    outcome = use("propose_closing", status="COMPLETED", reason="done")
+    assert outcome.is_error and "closing is proposed while REVIEWING, not INVESTIGATING" in outcome.content
+    assert chat.handle("/approve close").startswith("Nothing to close")
+
+    use("set_investigation_status", status="REVIEWING", reason="reports in")
+    with pytest.raises(RuleViolation, match="only the researcher closes an investigation"):
+        close(CHIEF, InvestigationStatus.COMPLETED)
+    assert "as INCONCLUSIVE" in use("propose_closing", status="INCONCLUSIVE", reason="the budget is spent").content
+    with pytest.raises(RuleViolation, match="no proposal to close the investigation as COMPLETED"):
+        close(USER, InvestigationStatus.COMPLETED)
+    with pytest.raises(RuleViolation, match="requires a user authorization naming it"):
+        close(USER, InvestigationStatus.INCONCLUSIVE)  # the researcher's command carries one
+
+    use("set_investigation_status", status="INVESTIGATING", reason="one more test after all")
+    assert ledger.load(INV).pending_closing is None  # any other status change withdraws the proposal
+    assert chat.handle("/approve close").startswith("Nothing to close")
+
+
+def test_closing_waits_for_jobs_the_dispatcher_still_follows(system):
+    from test_orchestration import INV as OPEN
+
+    from sim2real.contracts import ClosingProposed
+
+    calc = halted_system(system)
+    ledger = system["workspace"].ledger
+    ledger.record(OPEN, [draft(CHIEF, InvestigationStatusChanged(status=InvestigationStatus.REVIEWING, reason="r")),
+                         draft(CHIEF, ClosingProposed(closing_id="close-1", status=InvestigationStatus.COMPLETED,
+                                                      reason="done"))])
+    answer = system["chat"].handle("/approve close")
+    assert answer == (f"The investigation could not be closed: {calc} still at the scheduler or waiting for a run "
+                      "check; wait for them, or cancel them, before closing")
+    assert ledger.load(OPEN).status is InvestigationStatus.REVIEWING
+
+
+def test_halt_still_stops_a_review_in_progress(tmp_path, site, monkeypatch):
+    import sim2real.chat
+
+    monkeypatch.setattr(sim2real.chat, "stop_dispatcher", lambda ws, timeout, force: "Stopped.")
+    system = make_system(tmp_path, site, reviews=True)
+    ledger, clients, dispatcher = system["workspace"].ledger, system["clients"], system["dispatcher"]
+    chat = investigation(system, "hyp-a")
+    propose(ledger, "p-1", "hyp-a")
+    chat.handle("/approve agents")
+    agents_answer(system, **{"hyp-a": [says("A answered its question.")]})
+    dispatcher.tick()
+
+    def halt_while_thinking(_call):
+        chat.handle("/halt")  # the researcher, while the review is in a model call
+        return reply(ToolCall(id="c1", name="investigation_state", arguments={}))
+
+    clients.add("chief_scientist", halt_while_thinking, says("never asked"))
+    dispatcher.tick()
+    (review,) = [r for r in ledger.load(INV).agent_runs if r.role == "chief_scientist"]
+    assert review.run.outcome == "stopped" and review.run.report == "stopped: the investigation is PAUSED"
+    assert len(clients.models["chief_scientist"].calls) == 1
 
 
 def test_the_chief_scientist_proposes_delegates_and_retires_agents(system):

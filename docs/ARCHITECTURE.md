@@ -88,7 +88,7 @@ Chief Scientist and research orchestrator are separate concerns. The LLM supervi
 
 `CREATED → ALIGNING_OBSERVABLES → PLANNING → INVESTIGATING ↔ REVIEWING → COMPLETED`
 
-Side transitions: `PAUSED`, `BLOCKED`, `CANCELLED`; investigations can resume from a pause if allowed. `BLOCKED` does not mean unsupported physical claims may be emitted. An investigation can end `INCONCLUSIVE` when finite budgets/identifiability prevent resolution.
+Only the researcher closes an investigation (`COMPLETED`, or `INCONCLUSIVE` below), approving the Chief Scientist's proposal to close it. Side transitions: `PAUSED`, `BLOCKED`, `CANCELLED`; investigations can resume from a pause if allowed. `BLOCKED` does not mean unsupported physical claims may be emitted. An investigation can end `INCONCLUSIVE` when finite budgets/identifiability prevent resolution.
 
 ### Hypothesis/agent
 

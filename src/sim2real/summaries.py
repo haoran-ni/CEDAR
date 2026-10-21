@@ -70,6 +70,10 @@ def approval_requests(state: InvestigationState) -> list[tuple[str, str]]:
         if (calc.state is CalculationState.VALIDATED_INPUT and state.spec.constraints.submit_requires_approval
                 and authorization_for(state, PermissionAction.SUBMIT, calc.calculation_id) is None):
             needs.append((f"/approve submit {calc.calculation_id}", f"{calc.task.system_label}: {calc.task.estimand}"))
+    closing = state.pending_closing
+    if closing is not None:
+        needs.append(("/approve close", f"the Chief Scientist proposes closing the investigation as "
+                                        f"{closing.status.value} ({closing.closing_id}): {closing.reason}"))
     return needs
 
 

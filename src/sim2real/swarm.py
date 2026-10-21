@@ -24,6 +24,7 @@ from sim2real.contracts.status import INVESTIGATION_MACHINE, InvestigationStatus
 from sim2real.state.projection import (
     AgentRecord,
     AgentTaskRecord,
+    ClosingRecord,
     InvestigationState,
     ProposalRecord,
     agent_id_for,
@@ -66,9 +67,8 @@ def start_drafts(state: InvestigationState, proposal: ProposalRecord, actor: Act
     return drafts
 
 
-def halt_drafts(state: InvestigationState, actor: Actor, reason: str) -> list[EventDraft]:
-    """Withdraw a waiting proposal, retire every agent and pause the investigation; a run in progress stops at its
-    next model call, and nothing new starts until the investigation is resumed."""
+def _wind_down(state: InvestigationState, actor: Actor, reason: str) -> list[EventDraft]:
+    """Withdraw a waiting proposal of agents and retire every agent."""
     drafts = []
     proposal = state.pending_proposal
     if proposal is not None:
@@ -76,6 +76,22 @@ def halt_drafts(state: InvestigationState, actor: Actor, reason: str) -> list[Ev
                                                                         reason=reason)))
     drafts += [EventDraft(actor=actor, payload=AgentRetired(agent_id=a.agent_id, reason=reason))
                for a in state.agents.values() if a.active]
+    return drafts
+
+
+def close_drafts(state: InvestigationState, closing: ClosingRecord, actor: Actor,
+                 authorization_id: str) -> list[EventDraft]:
+    """Close the investigation as the Chief Scientist proposed, on the researcher's command: withdraw a waiting
+    proposal of agents, retire every agent, then close it for good."""
+    reason = f"closed by the researcher ({authorization_id}), as the Chief Scientist proposed ({closing.closing_id})"
+    return [*_wind_down(state, actor, reason), EventDraft(actor=actor, payload=InvestigationStatusChanged(
+        status=closing.status, reason=reason, authorization_id=authorization_id))]
+
+
+def halt_drafts(state: InvestigationState, actor: Actor, reason: str) -> list[EventDraft]:
+    """Withdraw a waiting proposal, retire every agent and pause the investigation; a run in progress stops at its
+    next model call, and nothing new starts until the investigation is resumed."""
+    drafts = _wind_down(state, actor, reason)
     if state.status not in INVESTIGATION_MACHINE.suspend | INVESTIGATION_MACHINE.terminal:
         drafts.append(EventDraft(actor=actor, payload=InvestigationStatusChanged(
             status=InvestigationStatus.PAUSED, reason=reason)))
@@ -190,5 +206,7 @@ def review_material(state: InvestigationState, task: AgentTaskRecord) -> str:
               "needs it, citing the evidence id), an assessment (request_judgement), new hypotheses and agents "
               "(propose_agents), a plan revision, or moving the investigation on. The researcher may be talking with "
               "you in the chat at the same time; the record shows what has already been done. End with a short "
-              "message for the researcher: what came in, what it means, what you did, and what waits for them."]
+              "message for the researcher: what came in, what it means, what you did, and what waits for them. If "
+              "you proposed closing the investigation, say so first: as what and why, and that /approve close "
+              "closes it."]
     return "\n".join(lines)

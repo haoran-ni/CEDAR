@@ -49,6 +49,31 @@ class InvestigationStatusChanged(Contract):
     type: Literal["investigation_status_changed"] = "investigation_status_changed"
     status: InvestigationStatus
     reason: NonEmptyStr
+    authorization_id: Identifier | None = None
+    """The researcher's command that closes the investigation; required for COMPLETED and INCONCLUSIVE."""
+
+
+CLOSING_STATUSES = frozenset({InvestigationStatus.COMPLETED, InvestigationStatus.INCONCLUSIVE})
+"""How an investigation is closed: only by the researcher, approving the Chief Scientist's proposal."""
+
+
+class ClosingProposed(Contract):
+    """The Chief Scientist proposes closing the investigation; only the researcher's command closes it.
+
+    A newer proposal replaces one still waiting, and any other status change withdraws it.
+    """
+
+    type: Literal["closing_proposed"] = "closing_proposed"
+    closing_id: Identifier
+    status: InvestigationStatus
+    reason: NonEmptyStr
+    """Why now: what was found, and what remains open."""
+
+    @model_validator(mode="after")
+    def _closes(self) -> "ClosingProposed":
+        if self.status not in CLOSING_STATUSES:
+            raise ValueError("an investigation is closed as COMPLETED or INCONCLUSIVE")
+        return self
 
 
 class ObservableAlignmentRecorded(Contract):
@@ -304,6 +329,7 @@ class AssessmentRecorded(Contract):
 EventPayload = Annotated[
     InvestigationCreated
     | InvestigationStatusChanged
+    | ClosingProposed
     | ObservableAlignmentRecorded
     | UserInterventionRecorded
     | PlanRevised

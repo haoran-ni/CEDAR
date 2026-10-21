@@ -38,6 +38,7 @@ from sim2real.contracts.events import (
     CalculationLinked,
     CalculationRequested,
     CalculationStateChanged,
+    ClosingProposed,
     EvidenceRecorded,
     HypothesisProposed,
     HypothesisStatusChanged,
@@ -433,6 +434,8 @@ def _why(rnd: _Round, state: InvestigationState) -> list[str]:
             lines.append(f"- {ROOT.hyp(p.hypothesis_id)}, rationale by {who}: {_said(p.spec.rationale)}")
         elif isinstance(p, InvestigationStatusChanged):
             lines.append(f"- Investigation moved to {p.status.value} by {who}: {_said(p.reason)}")
+        elif isinstance(p, ClosingProposed):
+            lines.append(f"- Closing as {p.status.value} proposed by {who} ({p.closing_id}): {_said(p.reason)}")
         elif isinstance(p, ObservableAlignmentRecorded):
             label = f"Observables judged {p.alignment.status.value} by {who}"
             lines += _listed(label, p.alignment.rationale, quoted=True) if p.alignment.rationale else [f"- {label}"]
@@ -810,7 +813,10 @@ def _describe(event: RecordedEvent) -> str:
         case InvestigationCreated():
             return f"Investigation opened: {_said(p.spec.title)}"
         case InvestigationStatusChanged():
-            return f"Investigation moved to {p.status.value}: {_said(p.reason)}"
+            authorized = f", authorized by {p.authorization_id}" if p.authorization_id else ""
+            return f"Investigation moved to {p.status.value}{authorized}: {_said(p.reason)}"
+        case ClosingProposed():
+            return f"{p.closing_id}: closing proposed as {p.status.value}: {_said(p.reason)}"
         case ObservableAlignmentRecorded():
             return f"Observables judged {p.alignment.status.value}"
         case UserInterventionRecorded():

@@ -4,7 +4,8 @@ Every researcher message is recorded verbatim as a user intervention once an inv
 is open (messages sent before it opens are recorded right after). A message sent while
 proposed agents wait for review holds them until the Chief Scientist proposes again. Slash
 commands are handled here, not by a model: authorizations to submit, approve inputs,
-cancel or start agents early can only come from the researcher's own command.
+cancel, start agents early or close the investigation can only come from the researcher's
+own command.
 
 The Chief Scientist also reviews the agents' reports in the background, in a conversation
 of its own; what it concluded is shown here, and passed to it at the start of its next
@@ -53,7 +54,7 @@ from sim2real.dispatch import (
 from sim2real.notebook import round_file, update_notebook
 from sim2real.state.projection import AgentRunRecord, InvestigationState
 from sim2real.summaries import approval_requests, investigation_summary, pending_approvals
-from sim2real.swarm import CHIEF, agent_label, agents_summary, halt_drafts, start_drafts
+from sim2real.swarm import CHIEF, agent_label, agents_summary, close_drafts, halt_drafts, start_drafts
 from sim2real.workspace import ModelClients, Workspace, profile_for, registry_for, services_for
 
 @dataclass(frozen=True)
@@ -78,6 +79,7 @@ COMMANDS = (
     Command("/pending", "what waits for your approval"),
     Command("/approve submit <calc>", "allow a calculation with approved inputs to be submitted"),
     Command("/approve inputs <calc>", "allow inputs the examiner could not verify"),
+    Command("/approve close", "close the investigation for good, as the Chief Scientist proposes"),
     Command("/cancel <calc> <reason>", "cancel a calculation, stopping its job if it has one"),
     Command("/report", "update the research notebook and show where it is"),
     Command("/halt <reason>", "stop this investigation now: cancel its jobs, retire its agents, pause it (reason "
@@ -207,6 +209,8 @@ class ChatSession:
             return agents_summary(state, self.clock())
         if name == "/approve" and args == ["agents"]:
             return self._start_agents(line)
+        if name == "/approve" and args == ["close"]:
+            return self._close(line)
         if name == "/pending":
             return "\n".join(pending_approvals(state)) or "Nothing waits for your approval."
         if name == "/report":
@@ -272,6 +276,34 @@ class ChatSession:
         started = result.events[1].payload.agent_ids
         return (f"Started {', '.join(f'{a} on {h}' for h, a in started.items())} ({message_id}). The dispatcher runs "
                 "their first tasks.")
+
+    def _close(self, line: str) -> str:
+        found = []
+
+        def build(state: InvestigationState) -> list[EventDraft]:
+            closing = state.pending_closing
+            if closing is None:
+                return []
+            message = self._message_draft(state, line, (Authorization(action=PermissionAction.CLOSE_INVESTIGATION,
+                                                                      target_ids=(closing.closing_id,)),))
+            found[:] = [message.payload.intervention_id, closing]
+            return [message, *close_drafts(state, closing, self.user, message.payload.intervention_id)]
+
+        try:
+            result = self.workspace.ledger.record_with(self.investigation_id, build)
+        except RuleViolation as exc:
+            return f"The investigation could not be closed: {exc}"
+        if not found:
+            return "Nothing to close: the Chief Scientist has not proposed closing the investigation."
+        message_id, closing = found
+        done = [event.payload for event in result.events[1:]]
+        lines = [f"{self.investigation_id} is now {closing.status.value}, closed for good ({message_id}). The Chief "
+                 f"Scientist proposed it ({closing.closing_id}): {closing.reason}"]
+        retired = [p.agent_id for p in done if p.type == "agent_retired"]
+        if retired:
+            lines.append(f"  - retired {', '.join(retired)}")
+        lines += [f"  - withdrew the proposal {p.proposal_id}" for p in done if p.type == "proposal_withdrawn"]
+        return "\n".join(lines)
 
     def _halt(self, investigation_ids: list[str], reason: str, line: str, everything: bool = False) -> str:
         """Stop the investigations at once: cancel their jobs, withdraw their proposals, retire their agents,
@@ -393,7 +425,7 @@ class ChatSession:
         state = self.workspace.ledger.load(self.investigation_id)
         last = max((r.recorded_at for r in state.agent_runs if r.session_id == self.chief_session), default=0)
         reviews = [r for r in state.agent_runs if _is_review(r) and r.recorded_at > last and r.run.report][-3:]
-        return "".join(f"[record: your background review of the agents' reports, run {r.run.outcome}, concluded]\n"
+        return "".join(f"[record: your background review of the agents' reports, run {r.run.outcome}]\n"
                        f"{r.run.report.strip()}\n\n" for r in reviews)
 
     def _opened(self, investigation_id: str) -> list[str]:

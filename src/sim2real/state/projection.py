@@ -27,6 +27,8 @@ from sim2real.contracts.events import (
     CalculationLinked,
     CalculationRequested,
     CalculationStateChanged,
+    CLOSING_STATUSES,
+    ClosingProposed,
     EvidenceRecorded,
     HypothesisProposed,
     HypothesisStatusChanged,
@@ -72,6 +74,7 @@ _C = CalculationState
 EVENT_ACTORS: dict[type, frozenset[ActorKind]] = {
     InvestigationCreated: frozenset({_A.USER, _A.CHIEF_SCIENTIST}),
     InvestigationStatusChanged: frozenset({_A.USER, _A.CHIEF_SCIENTIST, _A.SYSTEM}),
+    ClosingProposed: frozenset({_A.CHIEF_SCIENTIST}),
     ObservableAlignmentRecorded: frozenset({_A.USER, _A.CHIEF_SCIENTIST}),
     UserInterventionRecorded: frozenset({_A.USER}),
     PlanRevised: frozenset({_A.USER, _A.CHIEF_SCIENTIST}),
@@ -121,6 +124,8 @@ EVIDENCE_KIND_ACTORS: dict[EvidenceKind, frozenset[ActorKind]] = {
 _IMPLIED_SCHEDULER_STATE = {_C.QUEUED: SchedulerState.PENDING, _C.RUNNING: SchedulerState.RUNNING}
 _LIVE_AT_SCHEDULER = frozenset({_C.SUBMISSION_PENDING, _C.SUBMITTED, _C.QUEUED, _C.RUNNING})
 """SUBMISSION_PENDING counts as live: sbatch may already have accepted the job."""
+_FOLLOWED = _LIVE_AT_SCHEDULER | {_C.SCHEDULER_TERMINAL, _C.PARSING}
+"""Calculations the dispatcher still follows: at the scheduler, or waiting for their run check."""
 _OUTCOME_UNSEEN = frozenset({
     _C.SPECIFIED, _C.VALIDATED_INPUT, _C.SUBMISSION_PENDING, _C.SUBMITTED, _C.QUEUED, _C.RUNNING,
 })
@@ -243,6 +248,17 @@ class ProposalRecord:
     """Stream version at which it started, was superseded or was withdrawn."""
 
 
+@dataclass(frozen=True)
+class ClosingRecord:
+    """The Chief Scientist's proposal to close the investigation, waiting for the researcher."""
+
+    closing_id: str
+    status: InvestigationStatus
+    reason: str
+    proposed_by: str
+    recorded_at: int
+
+
 @dataclass
 class AgentRecord:
     agent_id: str
@@ -306,6 +322,8 @@ class InvestigationState:
     tasks: dict[str, AgentTaskRecord] = field(default_factory=dict)
     proposals: dict[str, ProposalRecord] = field(default_factory=dict)
     agents: dict[str, AgentRecord] = field(default_factory=dict)
+    pending_closing: ClosingRecord | None = None
+    """A proposal to close the investigation that waits for the researcher's /approve close."""
 
     @property
     def pending_tasks(self) -> list[AgentTaskRecord]:
@@ -505,7 +523,29 @@ def _require_authorization(
 
 
 def _on_status_changed(state: InvestigationState, event: RecordedEvent, p: InvestigationStatusChanged) -> None:
+    closing = state.pending_closing
+    if p.status in CLOSING_STATUSES:
+        if event.actor.kind is not ActorKind.USER:
+            raise RuleViolation("only the researcher closes an investigation, with /approve close, once the Chief "
+                                "Scientist has proposed it")
+        if closing is None or closing.status is not p.status:
+            raise RuleViolation(f"no proposal to close the investigation as {p.status} waits for approval")
+        _require_authorization(state, p.authorization_id, PermissionAction.CLOSE_INVESTIGATION, closing.closing_id)
+        followed = [c.calculation_id for c in state.calculations.values() if c.state in _FOLLOWED]
+        if followed:  # the dispatcher follows open investigations only
+            raise RuleViolation(f"{', '.join(followed)} still at the scheduler or waiting for a run check; wait for "
+                                "them, or cancel them, before closing")
+    elif p.authorization_id is not None:
+        raise RuleViolation("only closing the investigation carries the researcher's authorization")
     state.status, state.resume_to = INVESTIGATION_MACHINE.advance(state.status, p.status, state.resume_to)
+    state.pending_closing = None  # closed as proposed; any other change withdraws the proposal
+
+
+def _on_closing_proposed(state: InvestigationState, event: RecordedEvent, p: ClosingProposed) -> None:
+    if state.status is not InvestigationStatus.REVIEWING:
+        raise RuleViolation(f"closing is proposed while REVIEWING, not {state.status}; move the investigation to "
+                            "REVIEWING first")
+    state.pending_closing = ClosingRecord(p.closing_id, p.status, p.reason, event.actor.id, event.stream_version)
 
 
 def _on_alignment(state: InvestigationState, event: RecordedEvent, p: ObservableAlignmentRecorded) -> None:
@@ -935,6 +975,7 @@ def _on_agent_retired(state: InvestigationState, event: RecordedEvent, p: AgentR
 
 _HANDLERS = {
     InvestigationStatusChanged: _on_status_changed,
+    ClosingProposed: _on_closing_proposed,
     ObservableAlignmentRecorded: _on_alignment,
     UserInterventionRecorded: _on_intervention,
     PlanRevised: _on_plan_revised,
@@ -959,7 +1000,7 @@ _HANDLERS = {
 }
 
 __all__ = [
-    "AgentRecord", "AnalysisRecord", "AssessmentEntry", "CalculationRecord", "EvidenceRecord", "HypothesisRecord", "InterventionRecord",
+    "AgentRecord", "AnalysisRecord", "AssessmentEntry", "CalculationRecord", "ClosingRecord", "EvidenceRecord", "HypothesisRecord", "InterventionRecord",
     "InvestigationState", "PlanRecord", "PredictionRecord", "ProposalRecord", "ProposalStatus", "agent_id_for", "apply",
     "authorization_for", "calculation_with_inputs", "evidence_owner", "hypothesis_evidence", "replay",
     "reusable_calculation", "review_deadline",

@@ -15,6 +15,7 @@ from pydantic import Field, JsonValue, model_validator
 from sim2real.contracts.base import (
     ArtifactRef,
     Contract,
+    FileName,
     Identifier,
     NonEmptyStr,
     Observable,
@@ -59,6 +60,9 @@ class ScientificTaskSpec(Contract):
     controls: dict[Identifier, JsonValue] = {}
     fidelity: FidelityTier = FidelityTier.SCREENING
     budget: ResourceBudget = ResourceBudget()
+    authored_files: dict[FileName, ArtifactRef] = {}
+    """Input files and job scripts written by an agent; the protocol generates any it needs
+    that are not given. All of them are examined before anything runs."""
 
     @model_validator(mode="after")
     def _each_variable_classified_once(self) -> "ScientificTaskSpec":
@@ -75,8 +79,8 @@ class ScientificTaskSpec(Contract):
     def identity_hash(self) -> str:
         """Hash of the scientific content, used to detect duplicate calculations.
 
-        Descriptive labels, fidelity tier and budget are excluded; the structure counts
-        only through its content hash.
+        Descriptive labels, fidelity tier and budget are excluded; the structure and
+        agent-written files count only through their content hashes.
         """
         return sha256_hex(canonical_json({
             "protocol": self.protocol.model_dump(mode="json"),
@@ -86,6 +90,7 @@ class ScientificTaskSpec(Contract):
             "interventions": self.interventions,
             "numerical_settings": self.numerical_settings,
             "controls": self.controls,
+            "authored_files": {name: ref.sha256 for name, ref in self.authored_files.items()},
         }))
 
 

@@ -13,11 +13,13 @@ from sim2real.contracts.base import (
     Contract,
     Identifier,
     NonEmptyStr,
+    RelativePath,
     Sha256Hex,
     canonical_json,
     sha256_hex,
 )
 from sim2real.contracts.evidence import EvidenceObject
+from sim2real.contracts.examination import InputExamination
 from sim2real.contracts.hypothesis import HypothesisSpec, Prediction
 from sim2real.contracts.investigation import InvestigationSpec, ObservableAlignment
 from sim2real.contracts.plan import Authorization, ResearchPlan
@@ -123,6 +125,16 @@ class CalculationLinked(Contract):
     rationale: NonEmptyStr
 
 
+class CalculationInputsExamined(Contract):
+    """The exact files a calculation will run, and what the examiner found in them."""
+
+    type: Literal["calculation_inputs_examined"] = "calculation_inputs_examined"
+    calculation_id: Identifier
+    examination: InputExamination
+    workdir: RelativePath
+    """Run directory, relative to the configured runs root."""
+
+
 class CalculationStateChanged(Contract):
     type: Literal["calculation_state_changed"] = "calculation_state_changed"
     calculation_id: Identifier
@@ -162,6 +174,7 @@ EventPayload = Annotated[
     | PredictionRegistered
     | CalculationRequested
     | CalculationLinked
+    | CalculationInputsExamined
     | CalculationStateChanged
     | EvidenceRecorded
     | AssessmentRecorded,

@@ -1,0 +1,89 @@
+"""Protocols: what a calculation type accepts, how its inputs are examined, how its runs are checked.
+
+A protocol never runs anything. It can generate inputs an agent did not write, examine
+the complete set of files that would run, and check a finished run's health.
+"""
+
+from abc import ABC, abstractmethod
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass, field
+
+from pydantic import JsonValue
+
+from sim2real.contracts.base import Observable, Quantity
+from sim2real.contracts.evidence import QualityCheck
+from sim2real.contracts.examination import Finding
+from sim2real.contracts.status import EvidenceQuality, SchedulerState
+from sim2real.contracts.task import ProtocolRef, ScientificTaskSpec
+
+
+@dataclass(frozen=True)
+class Reading:
+    """A value read from a raw output file, with the lines it came from."""
+
+    value: Quantity
+    file: str
+    line_start: int
+    line_end: int
+    quote: str
+
+
+@dataclass(frozen=True)
+class RunReport:
+    checks: tuple[QualityCheck, ...]
+    failure_quality: EvidenceQuality
+    """Quality to assign when any check fails."""
+    reading: Reading | None
+    """The protocol's own reading of the task's observable, if it knows how to read it."""
+    limitations: tuple[str, ...] = ()
+    method: dict[str, JsonValue] = field(default_factory=dict)
+
+
+class Protocol(ABC):
+    ref: ProtocolRef
+    observables: tuple[Observable, ...]
+    input_files: tuple[str, ...]
+    structure_file: str
+    execution_files: tuple[str, ...]
+    output_files: tuple[str, ...]
+
+    @property
+    @abstractmethod
+    def code_version(self) -> str: ...
+
+    @abstractmethod
+    def generate(
+        self, task: ScientificTaskSpec, present: Mapping[str, bytes]
+    ) -> tuple[dict[str, bytes], list[Finding]]:
+        """Write the input files missing from ``present``; never alter files that are present."""
+
+    @abstractmethod
+    def examine(self, task: ScientificTaskSpec, files: Mapping[str, bytes]) -> list[Finding]:
+        """Check the complete set of files against the declared task and this protocol's policy."""
+
+    @abstractmethod
+    def check_run(
+        self,
+        task: ScientificTaskSpec,
+        outputs: Mapping[str, bytes],
+        scheduler_state: SchedulerState | None,
+    ) -> RunReport: ...
+
+
+class ProtocolRegistry:
+    def __init__(self, protocols: Iterable[Protocol] = ()) -> None:
+        self._protocols: dict[tuple[str, str], Protocol] = {}
+        for protocol in protocols:
+            self.register(protocol)
+
+    def register(self, protocol: Protocol) -> None:
+        key = (protocol.ref.name, protocol.ref.version)
+        if key in self._protocols:
+            raise ValueError(f"protocol {key} is already registered")
+        self._protocols[key] = protocol
+
+    def get(self, ref: ProtocolRef) -> Protocol | None:
+        return self._protocols.get((ref.name, ref.version))
+
+    def refs(self) -> list[ProtocolRef]:
+        return [p.ref for p in self._protocols.values()]

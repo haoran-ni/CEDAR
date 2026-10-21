@@ -29,6 +29,8 @@ class ResearchPlan(Contract):
 class PermissionAction(StrEnum):
     SUBMIT = "submit"
     CANCEL = "cancel"
+    APPROVE_INPUTS = "approve_inputs"
+    """Run inputs whose examination ended NEEDS_REVIEW."""
 
 
 class Authorization(Contract):

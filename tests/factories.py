@@ -1,14 +1,20 @@
 """Builders for test data. All numbers here are synthetic and carry no scientific meaning."""
 
 from sim2real.contracts import (
+    CITATIONS_VERIFIED,
     Actor,
     ActorKind,
     AlignmentStatus,
     ArtifactRef,
     Authorization,
+    CalculationInputsExamined,
     CalculationState,
     CalculationStateChanged,
     EventDraft,
+    ExaminationVerdict,
+    Finding,
+    FindingSeverity,
+    InputExamination,
     EvidenceKind,
     EvidenceObject,
     EvidenceQuality,
@@ -24,6 +30,7 @@ from sim2real.contracts import (
     InvestigationStatusChanged,
     Observable,
     ObservableAlignment,
+    OutputCitation,
     PermissionAction,
     ProtocolRef,
     QualityCheck,
@@ -33,6 +40,7 @@ from sim2real.contracts import (
     ScientificTaskSpec,
     SimulationProvenance,
     UserInterventionRecorded,
+    scientific_input_hash,
 )
 from sim2real.state import ResearchLedger
 
@@ -158,10 +166,45 @@ def move(ledger, investigation_id, calculation_id, actor, state, **kwargs):
     ])
 
 
+PROTOCOL = task().protocol
+_SEVERITY_FOR = {
+    ExaminationVerdict.APPROVED: (),
+    ExaminationVerdict.NEEDS_REVIEW: (FindingSeverity.REVIEW,),
+    ExaminationVerdict.REJECTED: (FindingSeverity.ERROR,),
+}
+
+
+def examination(calculation_id: str, verdict: ExaminationVerdict = ExaminationVerdict.APPROVED,
+                files: dict | None = None) -> InputExamination:
+    """A synthetic examination record; the file hashes are made up per calculation."""
+    if files is None:
+        digest = sha256_of(calculation_id)
+        files = {"control.in": ArtifactRef(path=f"objects/{digest[:2]}/{digest}", sha256=digest, size_bytes=1)}
+    findings = tuple(Finding(severity=s, code="synthetic", message="test finding") for s in _SEVERITY_FOR[verdict])
+    return InputExamination(
+        protocol=PROTOCOL, code_version="test", files=files,
+        input_hash=scientific_input_hash(PROTOCOL, "test", files), findings=findings, verdict=verdict,
+    )
+
+
+def sha256_of(text: str) -> str:
+    import hashlib
+
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def examine(ledger, investigation_id, calculation_id, verdict=ExaminationVerdict.APPROVED, files=None):
+    return ledger.record(investigation_id, [draft(ENGINE, CalculationInputsExamined(
+        calculation_id=calculation_id, examination=examination(calculation_id, verdict, files),
+        workdir=f"{investigation_id}/{calculation_id}",
+    ))])
+
+
 def submit(ledger, investigation_id, calculation_id, job_id: str = "1001"):
-    """Prepare and submit a calculation, with the user authorization submission needs."""
+    """Examine, prepare and submit a calculation, with the user authorization submission needs."""
     auth = authorize(ledger, investigation_id, PermissionAction.SUBMIT, calculation_id,
                      intervention_id=f"approve-{calculation_id}")
+    examine(ledger, investigation_id, calculation_id)
     move(ledger, investigation_id, calculation_id, ENGINE, CalculationState.VALIDATED_INPUT)
     move(ledger, investigation_id, calculation_id, MANAGER, CalculationState.SUBMISSION_PENDING)
     move(ledger, investigation_id, calculation_id, MANAGER, CalculationState.SUBMITTED,
@@ -177,9 +220,12 @@ def run_to_parsing(ledger, investigation_id, calculation_id, *,
     move(ledger, investigation_id, calculation_id, VALIDATOR, CalculationState.PARSING)
 
 
+VERIFIED_CHECKS = (QualityCheck(name="scf_converged", passed=True), QualityCheck(name=CITATIONS_VERIFIED, passed=True))
+CITATION = OutputCitation(artifact=RAW_OUTPUT, line_start=10, line_end=10, quote="| Synthetic : 0.1 eV")
+
+
 def computed_evidence(calculation_id: str, *, quality: EvidenceQuality = EvidenceQuality.VALIDATED,
-                      checks=(QualityCheck(name="scf_converged", passed=True),),
-                      observable: Observable = SITE_ENERGY) -> EvidenceObject:
+                      checks=VERIFIED_CHECKS, observable: Observable = SITE_ENERGY) -> EvidenceObject:
     return EvidenceObject(
         kind=EvidenceKind.DIRECT_COMPUTATION,
         summary="Synthetic test result",
@@ -189,6 +235,7 @@ def computed_evidence(calculation_id: str, *, quality: EvidenceQuality = Evidenc
         quality=quality,
         quality_checks=checks,
         sources=(RAW_OUTPUT,),
+        citations=(CITATION,),
     )
 
 

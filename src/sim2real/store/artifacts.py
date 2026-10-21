@@ -69,3 +69,10 @@ class ArtifactStore:
             while chunk := stream.read(_CHUNK):
                 digest.update(chunk)
         return digest.hexdigest() == ref.sha256
+
+    def read(self, ref: ArtifactRef) -> bytes:
+        """The artifact's bytes, after checking they still match the reference."""
+        data = self.resolve(ref).read_bytes()
+        if len(data) != ref.size_bytes or hashlib.sha256(data).hexdigest() != ref.sha256:
+            raise ValueError(f"artifact {ref.path} no longer matches its recorded hash")
+        return data

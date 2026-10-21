@@ -1,4 +1,5 @@
 import pytest
+from sites import build_site
 
 from sim2real.state import ResearchLedger
 from sim2real.store import ArtifactStore, SQLiteEventStore
@@ -17,3 +18,8 @@ def ledger(store):
 @pytest.fixture
 def artifacts(tmp_path):
     return ArtifactStore(tmp_path / "artifacts")
+
+
+@pytest.fixture
+def site(tmp_path):
+    return build_site(tmp_path / "site")

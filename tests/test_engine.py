@@ -1,0 +1,330 @@
+"""End-to-end path from an agent's request to recorded evidence.
+
+Uses the FakeScheduler TEST DOUBLE and SYNTHETIC outputs: no job runs, no numbers are real.
+"""
+
+import os
+from pathlib import Path
+
+import pytest
+from factories import AGENT, add_hypothesis, authorize, draft, start_investigation
+from sites import aims_output, co_on_cu111, declared, geometry_text
+
+from sim2real.contracts import (
+    CalculationState,
+    CalculationStateChanged,
+    EvidenceQuality,
+    ExaminationVerdict,
+    FileCitation,
+    OutputReading,
+    PermissionAction,
+    ProtocolRef,
+    Quantity,
+    SchedulerState,
+    ScientificTaskSpec,
+)
+from sim2real.engine import InputsChanged, JobManager, JobMonitor, ProtocolEngine, ResultValidator, job_name_for
+from sim2real.engine.jobs import JOB_MANAGER
+from sim2real.errors import RuleViolation
+from sim2real.hpc.fake import FakeScheduler
+from sim2real.protocols import TOTAL_ENERGY, FhiAimsTotalEnergy, ProtocolRegistry
+from sim2real.state import replay
+
+ENERGY = -98765.432101234
+
+
+class World:
+    """A ledger, a synthetic site and every engine service wired together."""
+
+    def __init__(self, ledger, store, artifacts, site):
+        self.ledger, self.store, self.artifacts, self.site = ledger, store, artifacts, site
+        self.scheduler = FakeScheduler()
+        self.registry = ProtocolRegistry([FhiAimsTotalEnergy(site)])
+        self.runs = Path(site.runs_root)
+        self.engine = ProtocolEngine(ledger, self.registry, artifacts, self.runs)
+        self.manager = JobManager(ledger, self.scheduler, self.runs)
+        self.monitor = JobMonitor(ledger, self.scheduler)
+        self.validator = ResultValidator(ledger, self.registry, artifacts, self.scheduler, self.runs)
+        self.inv = start_investigation(ledger)
+        self.hyp = add_hypothesis(ledger, self.inv)
+        slab, bottom = co_on_cu111()
+        self.structure = artifacts.put_bytes(geometry_text(slab, fixed=bottom).encode(), label="geometry.in")
+
+    def task(self, authored=None, **overrides) -> ScientificTaskSpec:
+        return ScientificTaskSpec(
+            protocol=ProtocolRef(name="fhiaims.total_energy", version="0.1"), observable=TOTAL_ENERGY,
+            estimand="total energy of CO/Cu(111) atop", system_label="CO/Cu(111) atop (synthetic)",
+            structure=self.structure, authored_files=authored or {}, **declared(**overrides))
+
+    def request(self, **kwargs) -> str:
+        return self.ledger.request_calculation(self.inv, AGENT, self.hyp, self.task(**kwargs), "test").calculation_id
+
+    def state(self):
+        return self.ledger.load(self.inv)
+
+    def calc(self, cid):
+        return self.state().calculations[cid]
+
+    def approve_submission(self, cid):
+        authorize(self.ledger, self.inv, PermissionAction.SUBMIT, cid, intervention_id=f"submit-{cid}")
+
+    def run(self, cid, *, output: str | None = None, final: SchedulerState = SchedulerState.COMPLETED) -> str:
+        """Examine, authorize, submit and drive the fake job to its end, writing a synthetic aims.out."""
+        self.engine.examine(self.inv, cid)
+        self.approve_submission(cid)
+        job = self.manager.submit(self.inv, cid)
+        self.scheduler.set_state(job, SchedulerState.RUNNING)
+        self.monitor.poll(self.inv)
+        if output is not None:
+            (self.runs / self.calc(cid).workdir / "aims.out").write_text(output)
+        self.scheduler.set_state(job, final)
+        self.monitor.poll(self.inv)
+        return job
+
+
+@pytest.fixture
+def world(ledger, store, artifacts, site):
+    return World(ledger, store, artifacts, site)
+
+
+def energy_line(text: str) -> tuple[int, str]:
+    for number, line in enumerate(text.splitlines(), start=1):
+        if "Total energy of the DFT" in line:
+            return number, line.strip()
+    raise AssertionError("no final energy line")
+
+
+def reading(text: str, value: float = ENERGY, *, line_offset: int = 0, quote: str | None = None) -> OutputReading:
+    number, line = energy_line(text)
+    return OutputReading(
+        reader=AGENT, value=Quantity(value=value, unit="eV"), summary="Final total energy read from aims.out",
+        citations=(FileCitation(file="aims.out", line_start=number + line_offset, line_end=number + line_offset,
+                                quote=quote or line),),
+    )
+
+
+class TestExamination:
+    def test_generated_inputs_are_approved_and_written_read_only(self, world):
+        cid = world.request()
+        world.engine.examine(world.inv, cid)
+        calc = world.calc(cid)
+        assert calc.state is CalculationState.VALIDATED_INPUT
+        assert calc.examination.verdict is ExaminationVerdict.APPROVED
+        assert set(calc.examination.files) == {"control.in", "geometry.in", "job.sh"}
+        assert calc.examination.execution_files == ("job.sh",)
+        directory = world.runs / calc.workdir
+        for name, ref in calc.examination.files.items():
+            assert (directory / name).read_bytes() == world.artifacts.read(ref)
+            assert not os.access(directory / name, os.W_OK)
+
+    def test_agent_written_control_is_examined_unchanged(self, world):
+        first = world.request()
+        world.engine.examine(world.inv, first)
+        control = world.artifacts.read(world.calc(first).examination.files["control.in"])
+        rewritten = control.replace(b"xc                pbe", b"xc pbe0")
+        ref = world.artifacts.put_bytes(rewritten, label="control.in")
+        cid = world.request(authored={"control.in": ref})
+        world.engine.examine(world.inv, cid)
+        calc = world.calc(cid)
+        assert calc.examination.files["control.in"].sha256 == ref.sha256
+        assert calc.state is CalculationState.REJECTED
+        (finding,) = [f for f in calc.examination.findings if f.code == "contradicts_task"]
+        assert finding.message == "xc pbe0 does not match the declared xc pbe"
+        assert not (world.runs / calc.workdir).exists()
+
+    def test_identical_inputs_from_another_request_are_rejected_as_duplicates(self, world):
+        first = world.request()
+        world.engine.examine(world.inv, first)
+        control = world.calc(first).examination.files["control.in"]
+        second = world.request(authored={"control.in": control})
+        world.engine.examine(world.inv, second)
+        calc = world.calc(second)
+        assert calc.state is CalculationState.REJECTED
+        assert "duplicate_inputs" in {f.code for f in calc.examination.findings}
+
+    def test_inputs_needing_review_wait_for_the_user(self, world):
+        first = world.request()
+        world.engine.examine(world.inv, first)
+        control = world.artifacts.read(world.calc(first).examination.files["control.in"])
+        unusual = world.artifacts.put_bytes(control.replace(b"\nspin", b"\nsome_new_keyword 1\nspin", 1))
+        cid = world.request(authored={"control.in": unusual})
+        world.engine.examine(world.inv, cid)
+        assert world.calc(cid).state is CalculationState.SPECIFIED
+        assert world.calc(cid).examination.verdict is ExaminationVerdict.NEEDS_REVIEW
+        with pytest.raises(RuleViolation, match="no user approval"):
+            world.engine.approve(world.inv, cid)
+        authorize(world.ledger, world.inv, PermissionAction.APPROVE_INPUTS, cid, intervention_id="looked-at-it")
+        world.engine.approve(world.inv, cid)
+        assert world.calc(cid).state is CalculationState.VALIDATED_INPUT
+
+    def test_unknown_protocol_is_rejected_with_a_reason(self, world):
+        spec = world.task().model_copy(update={"protocol": ProtocolRef(name="vasp.energy", version="1")})
+        cid = world.ledger.request_calculation(world.inv, AGENT, world.hyp, spec, "test").calculation_id
+        world.engine.examine(world.inv, cid)
+        assert world.calc(cid).state is CalculationState.REJECTED
+
+    def test_examination_happens_once(self, world):
+        cid = world.request()
+        world.engine.examine(world.inv, cid)
+        with pytest.raises(RuleViolation, match="already been examined"):
+            world.engine.examine(world.inv, cid)
+
+
+class TestSubmission:
+    def test_submission_needs_user_authorization_before_the_scheduler_is_called(self, world):
+        cid = world.request()
+        world.engine.examine(world.inv, cid)
+        with pytest.raises(RuleViolation, match="authorization"):
+            world.manager.submit(world.inv, cid)
+        assert world.scheduler.submissions == []
+        assert world.calc(cid).state is CalculationState.VALIDATED_INPUT
+
+    def test_submission_uses_the_examined_script_and_is_idempotent(self, world):
+        cid = world.request()
+        world.engine.examine(world.inv, cid)
+        world.approve_submission(cid)
+        job = world.manager.submit(world.inv, cid)
+        assert world.manager.submit(world.inv, cid) == job
+        (script, workdir, name), = world.scheduler.submissions
+        assert script == world.runs / world.calc(cid).workdir / "job.sh" and name == job_name_for(cid)
+        assert world.calc(cid).scheduler_job_id == job
+
+    def test_tampered_run_directory_is_not_submitted(self, world):
+        cid = world.request()
+        world.engine.examine(world.inv, cid)
+        world.approve_submission(cid)
+        path = world.runs / world.calc(cid).workdir / "control.in"
+        os.chmod(path, 0o644)
+        path.write_text(path.read_text() + "\npostprocess_anyway .true.\n")
+        with pytest.raises(InputsChanged):
+            world.manager.submit(world.inv, cid)
+        assert world.scheduler.submissions == []
+
+    def test_crash_after_submission_is_reconciled_without_a_second_job(self, world):
+        cid = world.request()
+        world.engine.examine(world.inv, cid)
+        world.approve_submission(cid)
+        world.ledger.record(world.inv, [draft(JOB_MANAGER, CalculationStateChanged(
+            calculation_id=cid, state=CalculationState.SUBMISSION_PENDING))])
+        directory = world.runs / world.calc(cid).workdir
+        orphan = world.scheduler.submit(directory / "job.sh", directory, job_name_for(cid))  # then the process "died"
+        assert world.manager.submit(world.inv, cid) == orphan
+        assert len(world.scheduler.submissions) == 1
+
+    def test_reconcile_reports_pending_submissions_with_no_job(self, world):
+        cid = world.request()
+        world.engine.examine(world.inv, cid)
+        world.ledger.record(world.inv, [draft(JOB_MANAGER, CalculationStateChanged(
+            calculation_id=cid, state=CalculationState.SUBMISSION_PENDING))])
+        assert world.manager.reconcile(world.inv) == {cid: None}
+
+    def test_cancel_needs_authorization_and_stops_the_job(self, world):
+        cid = world.request()
+        world.engine.examine(world.inv, cid)
+        world.approve_submission(cid)
+        job = world.manager.submit(world.inv, cid)
+        with pytest.raises(RuleViolation, match="authorization"):
+            world.manager.cancel(world.inv, cid, "not needed")
+        assert world.scheduler.jobs[job]["state"] is SchedulerState.PENDING
+        authorize(world.ledger, world.inv, PermissionAction.CANCEL, cid, intervention_id=f"cancel-{cid}")
+        world.manager.cancel(world.inv, cid, "user asked")
+        assert world.scheduler.jobs[job]["state"] is SchedulerState.CANCELLED
+        assert world.calc(cid).state is CalculationState.CANCELLED
+
+
+class TestMonitoring:
+    def test_states_follow_the_scheduler_and_repeat_polls_record_nothing(self, world):
+        cid = world.request()
+        world.engine.examine(world.inv, cid)
+        world.approve_submission(cid)
+        job = world.manager.submit(world.inv, cid)
+        assert [e.payload.state for e in world.monitor.poll(world.inv).recorded] == [CalculationState.QUEUED]
+        assert world.monitor.poll(world.inv).recorded == []
+        world.scheduler.set_state(job, SchedulerState.TIMEOUT)
+        world.monitor.poll(world.inv)
+        calc = world.calc(cid)
+        assert (calc.state, calc.scheduler_state) == (CalculationState.SCHEDULER_TERMINAL, SchedulerState.TIMEOUT)
+
+    def test_jobs_the_scheduler_no_longer_reports_are_left_alone(self, world):
+        cid = world.request()
+        world.engine.examine(world.inv, cid)
+        world.approve_submission(cid)
+        job = world.manager.submit(world.inv, cid)
+        world.scheduler.forget(job)
+        result = world.monitor.poll(world.inv)
+        assert result.unknown == [cid] and result.recorded == []
+        assert world.calc(cid).state is CalculationState.SUBMITTED
+
+
+class TestResults:
+    def test_agent_reading_becomes_validated_evidence(self, world):
+        output = aims_output(energy=ENERGY)
+        cid = world.request()
+        world.run(cid, output=output)
+        assert set(world.validator.output_paths(world.inv, cid)) == {"aims.out"}
+        outcome = world.validator.assess(world.inv, cid, reading(output))
+        assert outcome.reading_problems == ()
+        state = outcome.recorded.state
+        calc = state.calculations[cid]
+        evidence = state.evidence[calc.evidence_id].evidence
+        assert calc.state is CalculationState.QUALITY_ASSESSED
+        assert evidence.quality is EvidenceQuality.VALIDATED
+        assert evidence.value.value == ENERGY and evidence.interpreted_by == AGENT
+        assert evidence.citations[0].artifact.label == "aims.out"
+        assert world.artifacts.read(evidence.citations[0].artifact) == output.encode()
+        assert {c.name for c in evidence.quality_checks} >= {
+            "scheduler_completed", "normal_termination", "scf_converged", "code_version", "inputs_unchanged",
+            "citations_verified", "agrees_with_protocol_reading"}
+        assert replay(world.store.read_stream(world.inv)) == state
+
+    @pytest.mark.parametrize("bad", [
+        {"line_offset": 1},
+        {"quote": "| Total energy of the DFT / Hartree-Fock s.c.f. calculation : -1.0 eV"},
+        {"value": ENERGY + 1.0},
+    ])
+    def test_unverifiable_readings_are_refused_and_nothing_is_recorded(self, world, bad):
+        output = aims_output(energy=ENERGY)
+        cid = world.request()
+        world.run(cid, output=output)
+        before = world.state().version
+        value = bad.pop("value", ENERGY)
+        outcome = world.validator.assess(world.inv, cid, reading(output, value, **bad))
+        assert outcome.recorded is None and outcome.reading_problems
+        assert world.state().version == before
+        assert world.validator.assess(world.inv, cid, reading(output)).recorded is not None
+
+    def test_reading_a_different_energy_is_inconclusive(self, world):
+        output = aims_output(energy=ENERGY)
+        cid = world.request()
+        world.run(cid, output=output)
+        number, line = next((n, l.strip()) for n, l in enumerate(output.splitlines(), start=1)
+                            if "Total energy corrected" in l)
+        value = float(line.split(":")[1].split()[0])
+        other = OutputReading(reader=AGENT, value=Quantity(value=value, unit="eV"), summary="corrected energy",
+                              citations=(FileCitation(file="aims.out", line_start=number, line_end=number, quote=line),))
+        evidence = world.validator.assess(world.inv, cid, other).recorded.state.evidence
+        (record,) = evidence.values()
+        assert record.evidence.quality is EvidenceQuality.INCONCLUSIVE
+        assert not next(c for c in record.evidence.quality_checks if c.name == "agrees_with_protocol_reading").passed
+
+    def test_without_an_agent_reading_the_protocol_reads_the_value(self, world):
+        output = aims_output(energy=ENERGY)
+        cid = world.request()
+        world.run(cid, output=output)
+        state = world.validator.assess(world.inv, cid).recorded.state
+        (record,) = state.evidence.values()
+        assert record.evidence.quality is EvidenceQuality.VALIDATED and record.evidence.interpreted_by is None
+        assert record.evidence.citations[0].line_start == energy_line(output)[0]
+
+    def test_timed_out_run_is_invalid_evidence(self, world):
+        cid = world.request()
+        world.run(cid, output=aims_output(normal_end=False), final=SchedulerState.TIMEOUT)
+        state = world.validator.assess(world.inv, cid).recorded.state
+        (record,) = state.evidence.values()
+        assert record.evidence.quality is EvidenceQuality.INVALID and record.evidence.value is None
+
+    def test_runs_that_have_not_ended_cannot_be_assessed(self, world):
+        cid = world.request()
+        world.engine.examine(world.inv, cid)
+        with pytest.raises(RuleViolation, match="has not ended"):
+            world.validator.assess(world.inv, cid)

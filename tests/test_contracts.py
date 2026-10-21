@@ -194,3 +194,67 @@ def test_naive_timestamps_are_rejected():
         RecordedEvent(event_id="e", investigation_id="i", stream_version=1, occurred_at=datetime(2026, 1, 1),
                       actor=Actor(kind=ActorKind.USER, id="u"), round=0, plan_version=1,
                       payload={"type": "round_started", "round": 1, "reason": "r"})
+
+
+class TestExaminationContract:
+    def test_verdict_must_follow_from_findings(self):
+        from factories import examination
+        from sim2real.contracts import ExaminationVerdict, Finding, FindingSeverity, InputExamination
+
+        exam = examination("c1")
+        with pytest.raises(ValidationError, match="does not follow"):
+            InputExamination.model_validate({**exam.model_dump(), "findings": [
+                Finding(severity=FindingSeverity.ERROR, code="x", message="m").model_dump()]})
+        assert exam.verdict is ExaminationVerdict.APPROVED
+
+    def test_input_hash_must_match_files(self):
+        from factories import examination
+        from sim2real.contracts import InputExamination
+
+        with pytest.raises(ValidationError, match="input_hash"):
+            InputExamination.model_validate({**examination("c1").model_dump(), "input_hash": "0" * 64})
+
+    def test_job_scripts_do_not_change_scientific_identity(self):
+        from sim2real.contracts import ProtocolRef, scientific_input_hash
+
+        protocol = ProtocolRef(name="p", version="1")
+        control = RAW_OUTPUT
+        script_a = RAW_OUTPUT.model_copy(update={"sha256": "b" * 64})
+        script_b = RAW_OUTPUT.model_copy(update={"sha256": "c" * 64})
+        a = scientific_input_hash(protocol, "v", {"control.in": control, "job.sh": script_a}, ["job.sh"])
+        b = scientific_input_hash(protocol, "v", {"control.in": control, "job.sh": script_b}, ["job.sh"])
+        assert a == b != scientific_input_hash(protocol, "v2", {"control.in": control}, [])
+
+
+class TestCitations:
+    def test_computed_values_must_be_cited(self):
+        base = computed_evidence("c1").model_dump()
+        with pytest.raises(ValidationError, match="cite the output lines"):
+            EvidenceObject.model_validate({**base, "citations": []})
+
+    def test_cited_output_must_be_a_source(self):
+        base = computed_evidence("c1").model_dump()
+        other = RAW_OUTPUT.model_copy(update={"sha256": "b" * 64}).model_dump()
+        citation = {**base["citations"][0], "artifact": other}
+        with pytest.raises(ValidationError, match="among the sources"):
+            EvidenceObject.model_validate({**base, "citations": [citation]})
+
+    def test_validated_citations_need_verification(self):
+        with pytest.raises(ValidationError, match="citations_verified"):
+            computed_evidence("c1", checks=(QualityCheck(name="scf_converged", passed=True),))
+
+    def test_line_range_is_ordered(self):
+        from sim2real.contracts import OutputCitation
+
+        with pytest.raises(ValidationError):
+            OutputCitation(artifact=RAW_OUTPUT, line_start=5, line_end=4, quote="x")
+
+
+def test_agent_written_files_are_part_of_task_identity():
+    control = RAW_OUTPUT.model_copy(update={"label": "control.in"})
+    written = task(authored_files={"control.in": control})
+    rewritten = task(authored_files={"control.in": control.model_copy(update={"sha256": "b" * 64})})
+    assert written.identity_hash() != task().identity_hash()
+    assert written.identity_hash() != rewritten.identity_hash()
+    assert written.identity_hash() == task(authored_files={"control.in": control.model_copy(
+        update={"label": "renamed"})}).identity_hash()

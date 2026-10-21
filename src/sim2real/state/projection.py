@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from sim2real.contracts.base import ActorKind
 from sim2real.contracts.events import (
     AssessmentRecorded,
+    CalculationInputsExamined,
     CalculationLinked,
     CalculationRequested,
     CalculationStateChanged,
@@ -28,6 +29,7 @@ from sim2real.contracts.events import (
     UserInterventionRecorded,
 )
 from sim2real.contracts.evidence import EvidenceKind, EvidenceObject
+from sim2real.contracts.examination import ExaminationVerdict, InputExamination
 from sim2real.contracts.hypothesis import HypothesisSpec, Prediction
 from sim2real.contracts.investigation import (
     Discrepancy,
@@ -67,6 +69,7 @@ EVENT_ACTORS: dict[type, frozenset[ActorKind]] = {
     PredictionRegistered: frozenset({_A.HYPOTHESIS_AGENT}),
     CalculationRequested: frozenset({_A.CHIEF_SCIENTIST, _A.HYPOTHESIS_AGENT}),
     CalculationLinked: frozenset({_A.CHIEF_SCIENTIST, _A.HYPOTHESIS_AGENT}),
+    CalculationInputsExamined: frozenset({_A.PROTOCOL_ENGINE}),
     CalculationStateChanged: frozenset({_A.PROTOCOL_ENGINE, _A.JOB_MANAGER, _A.JOB_MONITOR, _A.VALIDATOR}),
     EvidenceRecorded: frozenset({_A.VALIDATOR, _A.HYPOTHESIS_AGENT, _A.USER}),
     AssessmentRecorded: frozenset({_A.EVIDENCE_JUDGE}),
@@ -167,6 +170,8 @@ class CalculationRecord:
     scheduler_state: SchedulerState | None = None
     scheduler_job_id: str | None = None
     evidence_id: str | None = None
+    examination: InputExamination | None = None
+    workdir: str | None = None
     history: list[tuple[int, CalculationState]] = field(default_factory=list)
 
 
@@ -217,11 +222,24 @@ def reusable_calculation(state: InvestigationState, task_hash: str) -> str | Non
     do not count: requesting the same task again is then a fresh attempt.
     """
     for calc in state.calculations.values():
-        if calc.task_hash != task_hash or calc.state in (_C.REJECTED, _C.CANCELLED):
-            continue
-        if calc.scheduler_state in SCHEDULER_TERMINAL_STATES and calc.scheduler_state is not SchedulerState.COMPLETED:
-            continue
-        return calc.calculation_id
+        if calc.task_hash == task_hash and _is_reusable(calc):
+            return calc.calculation_id
+    return None
+
+
+def _is_reusable(calc: CalculationRecord) -> bool:
+    if calc.state in (_C.REJECTED, _C.CANCELLED):
+        return False
+    return not (
+        calc.scheduler_state in SCHEDULER_TERMINAL_STATES and calc.scheduler_state is not SchedulerState.COMPLETED
+    )
+
+
+def calculation_with_inputs(state: InvestigationState, input_hash: str) -> str | None:
+    """A reusable calculation whose examined scientific inputs are identical."""
+    for calc in state.calculations.values():
+        if calc.examination is not None and calc.examination.input_hash == input_hash and _is_reusable(calc):
+            return calc.calculation_id
     return None
 
 
@@ -283,6 +301,14 @@ def _calculation(state: InvestigationState, calculation_id: str) -> CalculationR
         return state.calculations[calculation_id]
     except KeyError:
         raise RuleViolation(f"unknown calculation {calculation_id}") from None
+
+
+def authorization_for(state: InvestigationState, action: PermissionAction, target_id: str) -> str | None:
+    """The most recent user intervention authorizing ``action`` on ``target_id``, if any."""
+    for record in reversed(list(state.interventions.values())):
+        if any(a.action is action and target_id in a.target_ids for a in record.authorizations):
+            return record.intervention_id
+    return None
 
 
 def _require_authorization(
@@ -409,6 +435,28 @@ def _on_calculation_linked(state: InvestigationState, event: RecordedEvent, p: C
     hyp.calculation_ids.append(p.calculation_id)
 
 
+def _on_inputs_examined(state: InvestigationState, event: RecordedEvent, p: CalculationInputsExamined) -> None:
+    calc = _calculation(state, p.calculation_id)
+    exam = p.examination
+    if calc.state is not _C.SPECIFIED or calc.examination is not None:
+        raise RuleViolation(f"calculation {calc.calculation_id} was already examined or has moved on")
+    if exam.protocol != calc.task.protocol:
+        raise RuleViolation("examination used a different protocol than the task requested")
+    for name, ref in calc.task.authored_files.items():
+        examined = exam.files.get(name)
+        if examined is None or examined.sha256 != ref.sha256:
+            raise RuleViolation(f"examined {name} is not the file the agent wrote")
+    structure = calc.task.structure
+    if structure is not None and structure.sha256 not in {ref.sha256 for ref in exam.files.values()}:
+        raise RuleViolation("the requested structure is not among the examined files")
+    if exam.verdict is not ExaminationVerdict.REJECTED:
+        duplicate = calculation_with_inputs(state, exam.input_hash)
+        if duplicate is not None:
+            raise RuleViolation(f"inputs are identical to calculation {duplicate}")
+    calc.examination = exam
+    calc.workdir = p.workdir
+
+
 def _on_calculation_state(state: InvestigationState, event: RecordedEvent, p: CalculationStateChanged) -> None:
     calc = _calculation(state, p.calculation_id)
     if event.actor.kind not in CALCULATION_STATE_ACTORS[p.state]:
@@ -429,6 +477,14 @@ def _on_calculation_state(state: InvestigationState, event: RecordedEvent, p: Ca
 
     if (p.state is _C.SUBMITTED) != (p.scheduler_job_id is not None):
         raise RuleViolation("a scheduler job id is required for, and only allowed on, SUBMITTED")
+    if p.state is _C.VALIDATED_INPUT:
+        exam = calc.examination
+        if exam is None:
+            raise RuleViolation("VALIDATED_INPUT requires an examination of the inputs")
+        if exam.verdict is ExaminationVerdict.REJECTED:
+            raise RuleViolation("the examination rejected these inputs")
+        if exam.verdict is ExaminationVerdict.NEEDS_REVIEW:
+            _require_authorization(state, p.authorization_id, PermissionAction.APPROVE_INPUTS, calc.calculation_id)
     if p.state is _C.SUBMITTED:
         if any(c.scheduler_job_id == p.scheduler_job_id for c in state.calculations.values()):
             raise RuleViolation(f"scheduler job {p.scheduler_job_id} is already attached to a calculation")
@@ -521,6 +577,7 @@ _HANDLERS = {
     PredictionRegistered: _on_prediction,
     CalculationRequested: _on_calculation_requested,
     CalculationLinked: _on_calculation_linked,
+    CalculationInputsExamined: _on_inputs_examined,
     CalculationStateChanged: _on_calculation_state,
     EvidenceRecorded: _on_evidence,
     AssessmentRecorded: _on_assessment,
@@ -528,5 +585,7 @@ _HANDLERS = {
 
 __all__ = [
     "AssessmentEntry", "CalculationRecord", "EvidenceRecord", "HypothesisRecord", "InterventionRecord",
-    "InvestigationState", "PlanRecord", "PredictionRecord", "apply", "replay", "reusable_calculation",
+    "InvestigationState", "PlanRecord", "PredictionRecord", "apply", "authorization_for", "calculation_with_inputs",
+    "replay",
+    "reusable_calculation",
 ]

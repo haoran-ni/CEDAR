@@ -15,6 +15,8 @@ from factories import (
     authorize,
     computed_evidence,
     draft,
+    examine,
+    examination,
     hypothesis_spec,
     investigation_spec,
     move,
@@ -32,8 +34,10 @@ from sim2real.contracts import (
     CalculationRequested,
     CalculationState,
     CalculationStateChanged,
+    CalculationInputsExamined,
     Completeness,
     EvidenceQuality,
+    ExaminationVerdict,
     EvidenceRecorded,
     HypothesisProposed,
     HypothesisStatus,
@@ -310,6 +314,7 @@ class TestAuthority:
 class TestUserAuthorization:
     def test_submission_requires_approval_by_default(self, ledger, inv, hyp):
         calc = request(ledger, inv, hyp).calculation_id
+        examine(ledger, inv, calc)
         move(ledger, inv, calc, ENGINE, CalculationState.VALIDATED_INPUT)
         move(ledger, inv, calc, MANAGER, CalculationState.SUBMISSION_PENDING)
         with pytest.raises(RuleViolation, match="submit"):
@@ -319,6 +324,7 @@ class TestUserAuthorization:
         inv = start_investigation(ledger, "inv-open", submit_requires_approval=False)
         hyp = add_hypothesis(ledger, inv)
         calc = request(ledger, inv, hyp).calculation_id
+        examine(ledger, inv, calc)
         move(ledger, inv, calc, ENGINE, CalculationState.VALIDATED_INPUT)
         move(ledger, inv, calc, MANAGER, CalculationState.SUBMISSION_PENDING)
         move(ledger, inv, calc, MANAGER, CalculationState.SUBMITTED, scheduler_job_id="1001")
@@ -455,3 +461,56 @@ def test_concurrent_writer_forces_a_retry_on_fresh_state(ledger, store, inv):
     assert builds[1] == builds[0] + 1
     assert result.events[0].stream_version == builds[0] + 2
     assert set(result.state.interventions) == {"sneaky", "mine"}
+
+
+class TestInputExamination:
+    def test_inputs_must_be_examined_before_validation(self, ledger, inv, hyp):
+        calc = request(ledger, inv, hyp).calculation_id
+        with pytest.raises(RuleViolation, match="requires an examination"):
+            move(ledger, inv, calc, ENGINE, CalculationState.VALIDATED_INPUT)
+
+    def test_rejected_inputs_cannot_be_validated(self, ledger, inv, hyp):
+        calc = request(ledger, inv, hyp).calculation_id
+        examine(ledger, inv, calc, ExaminationVerdict.REJECTED)
+        with pytest.raises(RuleViolation, match="rejected"):
+            move(ledger, inv, calc, ENGINE, CalculationState.VALIDATED_INPUT)
+        state = move(ledger, inv, calc, ENGINE, CalculationState.REJECTED, reason="examination rejected").state
+        assert state.calculations[calc].state is CalculationState.REJECTED
+
+    def test_inputs_needing_review_run_only_with_user_approval(self, ledger, inv, hyp):
+        calc = request(ledger, inv, hyp).calculation_id
+        examine(ledger, inv, calc, ExaminationVerdict.NEEDS_REVIEW)
+        with pytest.raises(RuleViolation, match="approve_inputs"):
+            move(ledger, inv, calc, ENGINE, CalculationState.VALIDATED_INPUT)
+        approval = authorize(ledger, inv, PermissionAction.APPROVE_INPUTS, calc, intervention_id="ok-inputs")
+        move(ledger, inv, calc, ENGINE, CalculationState.VALIDATED_INPUT, authorization_id=approval)
+
+    def test_examined_files_must_be_the_agents_files(self, ledger, inv, hyp):
+        from factories import RAW_OUTPUT
+
+        written = RAW_OUTPUT.model_copy(update={"label": "control.in"})
+        calc = request(ledger, inv, hyp, authored_files={"control.in": written}).calculation_id
+        with pytest.raises(RuleViolation, match="not the file the agent wrote"):
+            examine(ledger, inv, calc)  # synthetic examination holds a different control.in
+        examine(ledger, inv, calc, files={"control.in": written})
+
+    def test_examination_happens_once(self, ledger, inv, hyp):
+        calc = request(ledger, inv, hyp).calculation_id
+        examine(ledger, inv, calc)
+        with pytest.raises(RuleViolation, match="already examined"):
+            examine(ledger, inv, calc)
+
+    def test_identical_inputs_from_different_specs_are_duplicates(self, ledger, inv, hyp):
+        first = request(ledger, inv, hyp).calculation_id
+        second = request(ledger, inv, hyp, xc="PBE0").calculation_id
+        same_files = examination(first).files
+        examine(ledger, inv, first, files=same_files)
+        with pytest.raises(RuleViolation, match="identical to calculation"):
+            examine(ledger, inv, second, files=same_files)
+        examine(ledger, inv, second, ExaminationVerdict.REJECTED, files=same_files)
+
+    def test_only_the_protocol_engine_examines(self, ledger, inv, hyp):
+        calc = request(ledger, inv, hyp).calculation_id
+        with pytest.raises(RuleViolation, match="hypothesis_agent may not"):
+            ledger.record(inv, [draft(AGENT, CalculationInputsExamined(
+                calculation_id=calc, examination=examination(calc), workdir=f"{inv}/{calc}"))])

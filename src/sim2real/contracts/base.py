@@ -29,6 +29,9 @@ Identifier = Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.
 
 Sha256Hex = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
 
+FileName = Annotated[str, StringConstraints(pattern=r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")]
+"""A plain file name such as ``control.in``: no directories, no leading dot."""
+
 
 def _check_relative_path(value: str) -> str:
     if not value or "\\" in value or "\x00" in value:

@@ -1,8 +1,9 @@
 """Command-line entry point (``sim2real``).
 
 Implemented: ``auth`` (API keys), ``models`` (which model each agent role uses), ``setup``
-(the environment-setup agent) and ``profile`` (review and approve compute profiles).
-Investigation commands such as ``start`` are added when the features behind them work.
+(the environment-setup agent), ``profile`` (review and approve compute profiles), ``start``
+(talk with the Chief Scientist), ``investigations`` and ``dispatch`` (the process that
+submits authorized work, follows jobs and runs agents between conversations).
 """
 
 import argparse
@@ -13,7 +14,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from sim2real import __version__
-from sim2real.paths import config_dir
+from sim2real.paths import config_dir, data_dir
 
 
 def _credentials():
@@ -224,6 +225,86 @@ def _profile_approve(args) -> int:
     return 0
 
 
+def _model_clients():
+    from sim2real.models import load_model_config
+    from sim2real.workspace import ModelClients
+
+    return ModelClients(load_model_config(_models_path()), _credentials())
+
+
+def _workspace():
+    from sim2real.workspace import Workspace
+
+    return Workspace.open(data_dir())
+
+
+def _start(args) -> int:
+    from sim2real.chat import HELP, ChatSession
+    from sim2real.dispatch import heartbeat_age
+
+    workspace = _workspace()
+    if args.investigation and args.investigation not in workspace.store.investigation_ids():
+        print(f"No investigation {args.investigation}. See `sim2real investigations`.", file=sys.stderr)
+        return 1
+    session = ChatSession(workspace, _profiles(), _model_clients(), investigation_id=args.investigation)
+    age = heartbeat_age(workspace)
+    if age is None or age > 600:
+        print("Note: no dispatcher has run recently, so queued agent work and jobs will not progress. Start one in "
+              "another terminal (or tmux/screen): sim2real dispatch")
+    if args.investigation:
+        print(f"Investigation {args.investigation}. Type /help for commands.")
+    else:
+        print("New conversation with the Chief Scientist. Describe the simulation-experiment discrepancy you want to "
+              "investigate. Type /help for commands.")
+    while True:
+        for notice in session.notices():
+            print(notice)
+        try:
+            line = input("\nyou> ")
+        except EOFError:
+            break
+        if line.strip() in ("/quit", "/exit"):
+            break
+        reply = session.handle(line)
+        if reply:
+            print(f"\n{reply}")
+    if session.investigation_id:
+        print(f"Resume with: sim2real start {session.investigation_id}")
+    return 0
+
+
+def _investigations(args) -> int:
+    workspace = _workspace()
+    ids = workspace.store.investigation_ids()
+    if not ids:
+        print("No investigations yet. Start one with: sim2real start")
+    for investigation_id in ids:
+        state = workspace.ledger.load(investigation_id)
+        print(f"{investigation_id}: {state.status.value}; {len(state.hypotheses)} hypotheses, "
+              f"{len(state.calculations)} calculations; {state.spec.title}")
+    return 0
+
+
+def _make_dispatcher():
+    from sim2real.dispatch import Dispatcher
+
+    return Dispatcher(_workspace(), _profiles(), _model_clients(), deny=[config_dir()])
+
+
+def _dispatch(args) -> int:
+    dispatcher = _make_dispatcher()
+    if args.once:
+        for note in dispatcher.tick():
+            print(note)
+        return 0
+    print(f"Dispatcher running every {args.interval:g} s on {data_dir()}; stop with Ctrl-C.")
+    try:
+        dispatcher.run_forever(args.interval)
+    except KeyboardInterrupt:
+        print("Stopped.")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="sim2real", description="Sim2Real Scientist (pre-alpha).")
     parser.add_argument("--version", action="version", version=f"sim2real {__version__}")
@@ -265,6 +346,15 @@ def main(argv: list[str] | None = None) -> int:
     approve = profile.add_parser("approve", help="approve a profile after reviewing it")
     approve.add_argument("name")
     approve.set_defaults(handler=_profile_approve)
+
+    start = commands.add_parser("start", help="talk with the Chief Scientist (new or existing investigation)")
+    start.add_argument("investigation", nargs="?", help="an existing investigation to continue")
+    start.set_defaults(handler=_start)
+    commands.add_parser("investigations", help="list investigations").set_defaults(handler=_investigations)
+    dispatch = commands.add_parser("dispatch", help="submit authorized work, follow jobs and run queued agents")
+    dispatch.add_argument("--once", action="store_true", help="do one round of work and exit")
+    dispatch.add_argument("--interval", type=float, default=60.0, help="seconds between rounds (default 60)")
+    dispatch.set_defaults(handler=_dispatch)
 
     args = parser.parse_args(argv)
     if not hasattr(args, "handler"):

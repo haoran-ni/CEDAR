@@ -13,6 +13,7 @@ from sim2real.contracts.base import (
 )
 from sim2real.contracts.events import (
     AgentRunRecorded,
+    AgentTaskQueued,
     AssessmentRecorded,
     CalculationInputsExamined,
     CalculationLinked,
@@ -82,6 +83,7 @@ from sim2real.contracts.task import (
 
 __all__ = [
     "AgentRunRecorded",
+    "AgentTaskQueued",
     "Actor",
     "ActorKind",
     "AlignmentStatus",

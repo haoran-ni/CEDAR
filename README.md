@@ -24,6 +24,42 @@ The project is being designed as a **general-purpose investigation framework**, 
 
 ## Project status
 
-**Design specification / pre-implementation.** The architecture and demonstration strategy are documented, but this repository description does not claim that the agent runtime, DFT workflows, terminal interface, or benchmarks have been implemented or validated yet. Installation and usage instructions will be added when working software exists.
+**Early prototype.** The path from a described discrepancy to recorded evidence is built:
+- The Chief Scientist opens an investigation and delegates work to hypothesis agents.
+- Agents write FHI-aims inputs, which protocol tools examine.
+- Researcher-authorized jobs run under Slurm.
+- Agents read the outputs, and their cited readings are verified before they become evidence.
+- The Evidence Judge assesses hypotheses.
 
-For detailed implementation guidance, start with [`AGENTS.md`](AGENTS.md). Supporting design documents are in [`docs/`](docs/).
+The full path passes automated tests that use stand-ins for the models and the scheduler. On one Slurm cluster, with FHI-aims and Claude models, each step except the Evidence Judge has also run for real, though not yet together in one uninterrupted investigation.
+
+Not yet built:
+- the terminal dashboard
+- readable round reports
+- protocols beyond FHI-aims total energies
+- schedulers other than Slurm
+- model providers other than Anthropic
+- parallel agents
+- blind evaluation
+
+Nothing here has been validated as producing correct scientific conclusions.
+
+## Getting started
+
+Requirements: Python 3.12, a Slurm cluster with FHI-aims, and an Anthropic API key.
+
+```bash
+pip install -e ".[dev]"                 # in a conda env or venv; puts `sim2real` in its bin/
+sim2real auth add anthropic             # stores the key in ~/.config/sim2real (mode 600)
+sim2real models init                    # choose models per agent role in ~/.config/sim2real/models.toml
+sim2real models check                   # one tiny request to confirm the key works
+sim2real setup --name mycluster         # an agent works out how FHI-aims runs here and asks you questions
+sim2real profile show mycluster
+sim2real profile approve mycluster      # nothing runs on the cluster until you approve a profile
+sim2real dispatch                       # keep running (e.g. in tmux): submits what you authorize, runs agents
+sim2real start                          # talk with the Chief Scientist; /help lists commands
+```
+
+Calculations are submitted only after you type `/approve submit <calculation>` in the chat.
+
+For detailed implementation guidance, start with [`AGENTS.md`](AGENTS.md). Design documents and the record of decisions are in [`docs/`](docs/).

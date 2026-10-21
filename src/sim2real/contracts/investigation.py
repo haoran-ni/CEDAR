@@ -6,6 +6,7 @@ from pydantic import AwareDatetime, Field, JsonValue, model_validator
 
 from sim2real.contracts.base import (
     Contract,
+    Identifier,
     NonEmptyStr,
     Observable,
     Quantity,
@@ -80,6 +81,8 @@ class RetrievalPolicy(StrEnum):
 
 
 class InvestigationConstraints(Contract):
+    compute_profile: Identifier | None = None
+    """The user-approved compute profile calculations run with."""
     allowed_protocols: tuple[ProtocolRef, ...] = ()
     budget: ResourceBudget | None = None
     deadline: AwareDatetime | None = None

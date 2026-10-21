@@ -16,7 +16,6 @@ from sim2real.agents.toolkits.files import FileAccess
 from sim2real.contracts.base import Actor, Contract, FileName, Identifier, NonEmptyStr, Observable, Quantity
 from sim2real.contracts.events import EventDraft, HypothesisStatusChanged, PredictionRegistered
 from sim2real.contracts.evidence import FileCitation, OutputReading
-from sim2real.contracts.examination import FindingSeverity
 from sim2real.contracts.hypothesis import Prediction
 from sim2real.contracts.status import CalculationState, HypothesisStatus
 from sim2real.contracts.task import ProtocolRef, ResourceBudget, ScientificTaskSpec
@@ -26,6 +25,7 @@ from sim2real.protocols.base import ProtocolRegistry
 from sim2real.state.ledger import ResearchLedger
 from sim2real.state.projection import CalculationRecord
 from sim2real.store.artifacts import ArtifactStore
+from sim2real.summaries import calculation_summary
 
 
 @dataclass
@@ -115,30 +115,8 @@ class ReadingArgs(Contract):
     limitations: list[NonEmptyStr] = []
 
 
-def _findings(calc: CalculationRecord) -> list[str]:
-    if calc.examination is None:
-        return []
-    shown = [f for f in calc.examination.findings if f.severity is not FindingSeverity.INFO or f.code == "generated"]
-    return [f"  [{f.severity.value}] {f.code}: {f.message}"
-            + (f" ({f.file}{':' + str(f.line) if f.line else ''})" if f.file else "") for f in shown]
-
-
 def _calculation_summary(ctx: ResearchContext, calc: CalculationRecord) -> str:
-    state = ctx.ledger.load(ctx.investigation_id)
-    lines = [f"{calc.calculation_id}: {calc.state.value}"
-             + (f"; examination {calc.examination.verdict.value}" if calc.examination else "")
-             + (f"; scheduler job {calc.scheduler_job_id} {calc.scheduler_state.value if calc.scheduler_state else ''}"
-                if calc.scheduler_job_id else "")]
-    lines.append(f"  task: {calc.task.observable.name} via {calc.task.protocol.name} {calc.task.protocol.version}; "
-                 f"estimand: {calc.task.estimand}")
-    lines += _findings(calc)
-    if calc.evidence_id:
-        evidence = state.evidence[calc.evidence_id].evidence
-        value = f"{evidence.value.value} {evidence.value.unit}" if evidence.value else "no value"
-        failed = [c.name for c in evidence.quality_checks if not c.passed]
-        lines.append(f"  evidence {calc.evidence_id}: {evidence.quality.value}, {value}"
-                     + (f"; failed checks: {', '.join(failed)}" if failed else ""))
-    return "\n".join(lines)
+    return calculation_summary(ctx.ledger.load(ctx.investigation_id), calc)
 
 
 def _next_step(calc: CalculationRecord) -> str:
@@ -164,6 +142,8 @@ def research_tools(ctx: ResearchContext) -> list[AgentTool]:
         lines = [
             f"Investigation {state.investigation_id}: {spec.title} ({state.status.value}, round {state.round}, "
             f"plan v{state.plan_version})",
+            f"Compute profile: {spec.constraints.compute_profile or 'none'} (set by the investigation; it is not "
+            "a calculation variable). Calculations can be requested only while the investigation is INVESTIGATING.",
             f"Question: {spec.question}",
             f"Your hypothesis {hyp.hypothesis_id} ({hyp.status.value}; assessment {hyp.assessment.value}; "
             f"plan priority {state.plan.priority(hyp.hypothesis_id).value}): {hyp.spec.statement}",
@@ -271,8 +251,9 @@ def research_tools(ctx: ResearchContext) -> list[AgentTool]:
                   "later; register it before the calculations it predicts have finished.", PredictionArgs,
                   register_prediction),
         AgentTool("request_calculation", "Request a calculation, optionally with input files you wrote yourself. "
-                  "Declare every physical and numerical setting. The protocol's examiner checks the files at once "
-                  "and its findings come back; a rejected request must be fixed and made again.",
+                  "Declare every physical and numerical setting the protocol lists, and nothing else (the compute "
+                  "profile, for one, comes from the investigation). The protocol's examiner checks the files at "
+                  "once and its findings come back; a rejected request must be fixed and made again.",
                   CalculationArgs, request_calculation),
         AgentTool("wait_for_calculations", "Wait for submitted or approved calculations to finish. This ends your "
                   "current turn; you are resumed when they are done.", WaitArgs, wait_for_calculations),

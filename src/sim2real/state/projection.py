@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from sim2real.contracts.base import ActorKind
 from sim2real.contracts.events import (
     AgentRunRecorded,
+    AgentTaskQueued,
     AssessmentRecorded,
     CalculationInputsExamined,
     CalculationLinked,
@@ -75,6 +76,7 @@ EVENT_ACTORS: dict[type, frozenset[ActorKind]] = {
     EvidenceRecorded: frozenset({_A.VALIDATOR, _A.HYPOTHESIS_AGENT, _A.USER}),
     AssessmentRecorded: frozenset({_A.EVIDENCE_JUDGE}),
     AgentRunRecorded: frozenset({_A.CHIEF_SCIENTIST, _A.HYPOTHESIS_AGENT, _A.EVIDENCE_JUDGE}),
+    AgentTaskQueued: frozenset({_A.USER, _A.CHIEF_SCIENTIST, _A.SYSTEM}),
 }
 """Who may record each event type. Nobody but the computing services moves a calculation."""
 
@@ -186,6 +188,18 @@ class EvidenceRecord:
 
 
 @dataclass
+class AgentTaskRecord:
+    task_id: str
+    role: str
+    hypothesis_id: str
+    instruction: str
+    queued_by: str
+    queued_at: int
+    completed_by: int | None = None
+    """Stream version of the run that carried it out."""
+
+
+@dataclass
 class AgentRunRecord:
     session_id: str
     role: str
@@ -211,6 +225,11 @@ class InvestigationState:
     calculations: dict[str, CalculationRecord] = field(default_factory=dict)
     evidence: dict[str, EvidenceRecord] = field(default_factory=dict)
     agent_runs: list[AgentRunRecord] = field(default_factory=list)
+    tasks: dict[str, AgentTaskRecord] = field(default_factory=dict)
+
+    @property
+    def pending_tasks(self) -> list[AgentTaskRecord]:
+        return [t for t in self.tasks.values() if t.completed_by is None]
 
     @property
     def plan(self) -> ResearchPlan:
@@ -589,7 +608,25 @@ def _on_assessment(state: InvestigationState, event: RecordedEvent, p: Assessmen
     ))
 
 
+def _on_agent_task(state: InvestigationState, event: RecordedEvent, p: AgentTaskQueued) -> None:
+    _require_open(state)
+    if p.task_id in state.tasks:
+        raise RuleViolation(f"task {p.task_id} already exists")
+    _hypothesis(state, p.hypothesis_id)
+    state.tasks[p.task_id] = AgentTaskRecord(p.task_id, p.role, p.hypothesis_id, p.instruction, event.actor.id,
+                                             event.stream_version)
+
+
 def _on_agent_run(state: InvestigationState, event: RecordedEvent, p: AgentRunRecorded) -> None:
+    if p.task_id is not None:
+        task = state.tasks.get(p.task_id)
+        if task is None:
+            raise RuleViolation(f"unknown task {p.task_id}")
+        if task.completed_by is not None:
+            raise RuleViolation(f"task {p.task_id} was already carried out")
+        if task.role != p.role:
+            raise RuleViolation(f"task {p.task_id} is for a {task.role}, not a {p.role}")
+        task.completed_by = event.stream_version
     state.agent_runs.append(AgentRunRecord(p.session_id, p.role, event.actor.id, p, event.stream_version, event.round))
 
 
@@ -608,6 +645,7 @@ _HANDLERS = {
     CalculationStateChanged: _on_calculation_state,
     EvidenceRecorded: _on_evidence,
     AssessmentRecorded: _on_assessment,
+    AgentTaskQueued: _on_agent_task,
     AgentRunRecorded: _on_agent_run,
 }
 

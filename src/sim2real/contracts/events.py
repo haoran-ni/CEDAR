@@ -146,12 +146,27 @@ class CalculationStateChanged(Contract):
     """User intervention that authorizes this change, where one is required."""
 
 
+AGENT_TASK_ROLES = ("hypothesis_agent", "evidence_judge")
+
+
+class AgentTaskQueued(Contract):
+    """Work for an agent, run by the dispatcher outside any conversation."""
+
+    type: Literal["agent_task_queued"] = "agent_task_queued"
+    task_id: Identifier
+    role: Literal["hypothesis_agent", "evidence_judge"]
+    hypothesis_id: Identifier
+    instruction: NonEmptyStr
+
+
 class AgentRunRecorded(Contract):
     """One invocation of an agent: which model served it, what it used, how it ended."""
 
     type: Literal["agent_run_recorded"] = "agent_run_recorded"
     session_id: Identifier
     role: Identifier
+    task_id: Identifier | None = None
+    """The queued task this run carried out, if any."""
     provider: NonEmptyStr
     requested_model: NonEmptyStr
     served_models: tuple[NonEmptyStr, ...] = ()
@@ -198,6 +213,7 @@ EventPayload = Annotated[
     | CalculationStateChanged
     | EvidenceRecorded
     | AssessmentRecorded
+    | AgentTaskQueued
     | AgentRunRecorded,
     Field(discriminator="type"),
 ]

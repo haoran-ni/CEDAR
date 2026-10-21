@@ -34,6 +34,7 @@ from sim2real.contracts.events import (
     HypothesisStatusChanged,
     InvestigationCreated,
     InvestigationStatusChanged,
+    NextActionsRecommended,
     ObservableAlignmentRecorded,
     PlanRevised,
     PredictionRegistered,
@@ -75,6 +76,7 @@ EVENT_ACTORS: dict[type, frozenset[ActorKind]] = {
     InvestigationCreated: frozenset({_A.USER, _A.CHIEF_SCIENTIST}),
     InvestigationStatusChanged: frozenset({_A.USER, _A.CHIEF_SCIENTIST, _A.SYSTEM}),
     ClosingProposed: frozenset({_A.CHIEF_SCIENTIST}),
+    NextActionsRecommended: frozenset({_A.CHIEF_SCIENTIST}),
     ObservableAlignmentRecorded: frozenset({_A.USER, _A.CHIEF_SCIENTIST}),
     UserInterventionRecorded: frozenset({_A.USER}),
     PlanRevised: frozenset({_A.USER, _A.CHIEF_SCIENTIST}),
@@ -259,6 +261,20 @@ class ClosingRecord:
     recorded_at: int
 
 
+@dataclass(frozen=True)
+class RecommendationRecord:
+    """The Chief Scientist's candidate next steps and its choice among them."""
+
+    recommendation: NextActionsRecommended
+    recorded_by: str
+    recorded_at: int
+    round: int
+
+    @property
+    def recommendation_id(self) -> str:
+        return self.recommendation.recommendation_id
+
+
 @dataclass
 class AgentRecord:
     agent_id: str
@@ -288,6 +304,8 @@ class AgentTaskRecord:
     queued_at: int
     completed_by: int | None = None
     """Stream version of the run that carried it out."""
+    recommendation_id: str | None = None
+    """The Chief Scientist's recommendation it carries out, if any."""
     dropped_at: int | None = None
     """Stream version at which its agent was retired before carrying it out."""
 
@@ -324,6 +342,7 @@ class InvestigationState:
     agents: dict[str, AgentRecord] = field(default_factory=dict)
     pending_closing: ClosingRecord | None = None
     """A proposal to close the investigation that waits for the researcher's /approve close."""
+    recommendations: dict[str, RecommendationRecord] = field(default_factory=dict)
 
     @property
     def pending_tasks(self) -> list[AgentTaskRecord]:
@@ -539,6 +558,22 @@ def _on_status_changed(state: InvestigationState, event: RecordedEvent, p: Inves
         raise RuleViolation("only closing the investigation carries the researcher's authorization")
     state.status, state.resume_to = INVESTIGATION_MACHINE.advance(state.status, p.status, state.resume_to)
     state.pending_closing = None  # closed as proposed; any other change withdraws the proposal
+
+
+def _on_next_actions(state: InvestigationState, event: RecordedEvent, p: NextActionsRecommended) -> None:
+    _require_open(state)
+    if p.recommendation_id in state.recommendations:
+        raise RuleViolation(f"recommendation {p.recommendation_id} already exists")
+    unknown = sorted({h for c in p.candidates for h in c.hypothesis_ids} - set(state.hypotheses))
+    if unknown:
+        raise RuleViolation(f"unknown hypotheses {', '.join(unknown)}; propose them before recommending tests of them")
+    state.recommendations[p.recommendation_id] = RecommendationRecord(p, event.actor.id, event.stream_version,
+                                                                      event.round)
+
+
+def _require_recommendation(state: InvestigationState, recommendation_id: str | None) -> None:
+    if recommendation_id is not None and recommendation_id not in state.recommendations:
+        raise RuleViolation(f"unknown recommendation {recommendation_id}")
 
 
 def _on_closing_proposed(state: InvestigationState, event: RecordedEvent, p: ClosingProposed) -> None:
@@ -884,8 +919,10 @@ def _on_agent_task(state: InvestigationState, event: RecordedEvent, p: AgentTask
             raise RuleViolation(f"no active agent {p.agent_id}")
         if agent.hypothesis_id != p.hypothesis_id:
             raise RuleViolation(f"{p.agent_id} works on {agent.hypothesis_id}, not {p.hypothesis_id}")
+    _require_recommendation(state, p.recommendation_id)
     state.tasks[p.task_id] = AgentTaskRecord(p.task_id, p.role, p.hypothesis_id, p.agent_id, p.instruction,
-                                             event.actor.id, event.stream_version)
+                                             event.actor.id, event.stream_version,
+                                             recommendation_id=p.recommendation_id)
 
 
 def _on_agent_run(state: InvestigationState, event: RecordedEvent, p: AgentRunRecorded) -> None:
@@ -918,6 +955,7 @@ def _on_agents_proposed(state: InvestigationState, event: RecordedEvent, p: Agen
         raise RuleViolation(f"agents are proposed while INVESTIGATING, not {state.status}")
     if p.proposal_id in state.proposals:
         raise RuleViolation(f"proposal {p.proposal_id} already exists")
+    _require_recommendation(state, p.recommendation_id)
     for spec in p.agents:
         _require_can_have_agent(state, spec.hypothesis_id)
     earlier = state.pending_proposal
@@ -976,6 +1014,7 @@ def _on_agent_retired(state: InvestigationState, event: RecordedEvent, p: AgentR
 _HANDLERS = {
     InvestigationStatusChanged: _on_status_changed,
     ClosingProposed: _on_closing_proposed,
+    NextActionsRecommended: _on_next_actions,
     ObservableAlignmentRecorded: _on_alignment,
     UserInterventionRecorded: _on_intervention,
     PlanRevised: _on_plan_revised,
@@ -1001,7 +1040,7 @@ _HANDLERS = {
 
 __all__ = [
     "AgentRecord", "AnalysisRecord", "AssessmentEntry", "CalculationRecord", "ClosingRecord", "EvidenceRecord", "HypothesisRecord", "InterventionRecord",
-    "InvestigationState", "PlanRecord", "PredictionRecord", "ProposalRecord", "ProposalStatus", "agent_id_for", "apply",
+    "InvestigationState", "PlanRecord", "PredictionRecord", "ProposalRecord", "ProposalStatus", "RecommendationRecord", "agent_id_for", "apply",
     "authorization_for", "calculation_with_inputs", "evidence_owner", "hypothesis_evidence", "replay",
     "reusable_calculation", "review_deadline",
 ]

@@ -53,7 +53,7 @@ from sim2real.dispatch import (
 )
 from sim2real.notebook import round_file, update_notebook
 from sim2real.state.projection import AgentRunRecord, InvestigationState
-from sim2real.summaries import approval_requests, investigation_summary, pending_approvals
+from sim2real.summaries import approval_requests, investigation_summary, pending_approvals, recommendation_text
 from sim2real.swarm import CHIEF, agent_label, agents_summary, close_drafts, halt_drafts, start_drafts
 from sim2real.workspace import ModelClients, Workspace, profile_for, registry_for, services_for
 
@@ -456,13 +456,14 @@ class ChatSession:
     # -- what happened meanwhile ----------------------------------------------------------------
 
     def notices(self) -> list[Notice]:
-        """What arrived since the researcher last looked: agent reports, the Chief Scientist's reviews,
-        agents that started, and each request for approval the first time it is seen."""
+        """What arrived since the researcher last looked: agent reports, the Chief Scientist's reviews and the next
+        steps it recommended, agents that started, and each request for approval the first time it is seen."""
         if self.investigation_id is None:
             return []
         state = self.workspace.ledger.load(self.investigation_id)
         fresh = [r for r in state.agent_runs if r.recorded_at > self._seen_runs
                  and (r.role != "chief_scientist" or _is_review(r))]
+        recommended = [r for r in state.recommendations.values() if r.recorded_at > self._seen_runs]
         self._seen_runs = state.version
         notices = []
         for agent in state.agents.values():  # the researcher's own /approve agents already said who started
@@ -479,6 +480,7 @@ class ChatSession:
             who = f"{agent_label(agent)}" if agent else f"{run.role} {run.actor_id}"
             report = (run.run.report or "(no report)").strip().splitlines()[0][:300]
             notices.append(Notice(f"[{who}: {run.run.outcome}] {report}"))
+        notices += [Notice(f"[{recommendation_text(r)}]") for r in recommended]
         for command, note in approval_requests(state):
             if f"{command} {note}" not in self._shown_approvals:
                 self._shown_approvals.add(f"{command} {note}")

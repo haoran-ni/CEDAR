@@ -4,8 +4,9 @@ The Chief Scientist proposes agents, one per hypothesis it wants tested. A propo
 when the researcher types ``/approve agents``, or by itself once its review window has
 passed without a message from the researcher; any message holds it until the Chief
 Scientist revises it. Agents work independently and see only their own hypothesis. When
-every agent that was given work has finished its current step, the dispatcher wakes the
-Chief Scientist to collect and compare what they reported.
+every agent that was given work has finished its current step, and no proposed agents are
+about to start, the dispatcher wakes the Chief Scientist to collect and compare what they
+reported, together with the evidence and assessments recorded since its last review.
 """
 
 from datetime import datetime
@@ -25,9 +26,11 @@ from sim2real.state.projection import (
     AgentRecord,
     AgentTaskRecord,
     ClosingRecord,
+    EvidenceRecord,
     InvestigationState,
     ProposalRecord,
     agent_id_for,
+    evidence_owner,
     review_deadline,
 )
 
@@ -164,11 +167,16 @@ def blocking_tasks(state: InvestigationState) -> list[AgentTaskRecord]:
 
 
 def review_due(state: InvestigationState) -> bool:
-    """Whether agents reported since the last review and none of them has work left in hand."""
+    """Whether agents reported since the last review, none of them has work left in hand, and no proposed agents
+    are about to start: those are reviewed together with the rest. A proposal the researcher's reply holds does not
+    hold the review back, nor one that cannot start because the investigation is not INVESTIGATING."""
     if state.status not in (InvestigationStatus.INVESTIGATING, InvestigationStatus.REVIEWING):
         return False
     reviews = _reviews(state)
     if any(t.completed_by is None for t in reviews) or blocking_tasks(state):
+        return False
+    proposal = state.pending_proposal
+    if proposal is not None and not proposal.feedback_ids and state.status is InvestigationStatus.INVESTIGATING:
         return False
     since = reviews[-1].queued_at if reviews else 0
     return any(r.role in REVIEW_ROLES and r.recorded_at > since for r in state.agent_runs)
@@ -178,8 +186,29 @@ REVIEW_INSTRUCTION = ("Review the agents' reports: the hypothesis agents and the
                       "they were given.")
 
 
+def _evidence_line(state: InvestigationState, record: EvidenceRecord) -> str:
+    """One piece of evidence as the record holds it: whose, from what, the value, its quality and failed checks."""
+    ev = record.evidence
+    runs = ev.calculation_ids or ((ev.calculation_id,) if ev.calculation_id else ())
+    owner = evidence_owner(state, ev)
+    hypotheses = [owner] if owner else sorted({h for c in runs for h in state.calculations[c].hypothesis_ids})
+    if ev.analysis_id is not None:
+        origin = f"analysis {ev.analysis_id} of {', '.join(runs)}"
+    elif ev.calculation_id is not None:
+        origin = f"reading of {ev.calculation_id}"
+    else:
+        origin = ev.kind.value.replace("_", " ")
+    value = f"{ev.value.value!r} {ev.value.unit}" if ev.value else "no value"
+    failed = [c.name for c in ev.quality_checks if not c.passed]
+    return (f"- {record.evidence_id} for {', '.join(hypotheses) or 'no hypothesis'} ({origin}): "
+            f"{ev.observable.name} = {value}; {ev.quality.value}"
+            + (f"; failed checks: {', '.join(failed)}" if failed else "")
+            + (f"; not comparable when: {'; '.join(ev.non_comparability)}" if ev.non_comparability else ""))
+
+
 def review_material(state: InvestigationState, task: AgentTaskRecord) -> str:
-    """What the Chief Scientist reviews: the reports and researcher messages since the previous review."""
+    """What the Chief Scientist reviews: the reports, the evidence and the Evidence Judge's assessments recorded, and
+    the researcher's messages, since the previous review."""
     reviews = _reviews(state)
     before = [t for t in reviews if t.queued_at < task.queued_at]
     since = before[-1].queued_at if before else 0
@@ -195,14 +224,25 @@ def review_material(state: InvestigationState, task: AgentTaskRecord) -> str:
             agent = state.agents.get(run.actor_id)
             who = f"{agent_label(agent)} on {agent.hypothesis_id}" if agent else run.actor_id
         lines += ["", f"[{who}; run {run.run.outcome}]", (run.run.report or "(no report)").strip()]
+    evidence = [r for r in state.evidence.values() if since < r.recorded_at <= task.queued_at]
+    lines += ["", "Evidence recorded since your last review, as the record holds it:"]
+    lines += [_evidence_line(state, r) for r in evidence] or ["None."]
+    assessments = [(h, a) for h, hyp in state.hypotheses.items() for a in hyp.assessments
+                   if since < a.recorded_at <= task.queued_at]
+    if assessments:
+        lines += ["", "The Evidence Judge's assessments since your last review:"]
+        lines += [f"- {h}: {a.assessment.value} ({a.completeness.value.lower()}), citing "
+                  f"{', '.join(a.evidence_ids) or 'no evidence'}: {a.rationale}" for h, a in assessments]
     messages = [i for i in state.interventions.values() if since < i.recorded_at <= task.queued_at]
     if messages:
         lines += ["", "The researcher's messages meanwhile:"]
         lines += [f"[{i.intervention_id}] {i.text}" for i in messages]
-    lines += ["", "Collect and compare these results across hypotheses; check investigation_state and the "
-              "Evidence Judge's assessments first. Agents never see each other's work: noticing confounders, "
+    lines += ["", "Collect and compare these results across hypotheses. A report is its agent's account, not "
+              "evidence: weigh the recorded evidence and the Judge's assessments above, and check investigation_state "
+              "for the rest. Agents never see each other's work: noticing confounders, "
               "contradictions and interactions between hypotheses is your job. Then decide what follows, if "
-              "anything: further work for an agent (delegate; pass on another agent's finding only when its test "
+              "anything, recording the candidates you weighed and your choice with recommend_next_actions before "
+              "you act on it: further work for an agent (delegate; pass on another agent's finding only when its test "
               "needs it, citing the evidence id), an assessment (request_judgement), new hypotheses and agents "
               "(propose_agents), a plan revision, or moving the investigation on. The researcher may be talking with "
               "you in the chat at the same time; the record shows what has already been done. End with a short "

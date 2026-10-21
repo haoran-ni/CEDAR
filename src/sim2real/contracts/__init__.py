@@ -32,6 +32,7 @@ from sim2real.contracts.events import (
     HypothesisStatusChanged,
     InvestigationCreated,
     InvestigationStatusChanged,
+    NextActionsRecommended,
     ObservableAlignmentRecorded,
     PlanRevised,
     PredictionRegistered,
@@ -71,6 +72,7 @@ from sim2real.contracts.investigation import (
     SimulationProvenance,
     discrepancy,
 )
+from sim2real.contracts.next_actions import ActionKind, ActionPriority, CandidateAction, ExpectedOutcome
 from sim2real.contracts.plan import Authorization, PermissionAction, Priority, ResearchPlan
 from sim2real.contracts.status import (
     Assessment,
@@ -92,11 +94,14 @@ from sim2real.contracts.task import (
 )
 
 __all__ = [
+    "ActionKind",
+    "ActionPriority",
     "AgentRetired",
     "AgentRunRecorded",
     "AgentSpec",
     "AgentsProposed",
     "AgentsStarted",
+    "CandidateAction",
     "ClosingProposed",
     "AgentTaskQueued",
     "Actor",
@@ -126,6 +131,7 @@ __all__ = [
     "Discrepancy",
     "EventDraft",
     "EvidenceKind",
+    "ExpectedOutcome",
     "EvidenceObject",
     "EvidenceQuality",
     "EvidenceRecorded",
@@ -146,6 +152,7 @@ __all__ = [
     "InvestigationSpec",
     "InvestigationStatus",
     "InvestigationStatusChanged",
+    "NextActionsRecommended",
     "Observable",
     "ObservableAlignment",
     "ObservableAlignmentRecorded",

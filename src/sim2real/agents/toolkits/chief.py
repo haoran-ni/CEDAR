@@ -2,8 +2,8 @@
 
 The Chief can open an investigation, record observable alignment, propose and manage
 hypotheses, propose hypothesis agents (one per hypothesis, each with the role the work
-needs), give agents further work or retire them, revise the plan, start rounds, and queue
-assessments by the Evidence Judge. Proposed agents start only after the researcher's review
+needs), give agents further work or retire them, revise the plan, start rounds, queue
+assessments by the Evidence Judge, and record the next steps it recommends and why. Proposed agents start only after the researcher's review
 window. Submissions, cancellations, input approvals, early starts of agents and closing the
 investigation belong to the researcher and are granted with explicit commands, never
 through these tools: the Chief can only propose closing.
@@ -40,6 +40,7 @@ from sim2real.contracts.events import (
     HypothesisStatusChanged,
     InvestigationCreated,
     InvestigationStatusChanged,
+    NextActionsRecommended,
     ObservableAlignmentRecorded,
     PlanRevised,
     RoundStarted,
@@ -53,6 +54,7 @@ from sim2real.contracts.investigation import (
     ObservableAlignment,
     SimulationProvenance,
 )
+from sim2real.contracts.next_actions import CandidateAction
 from sim2real.contracts.plan import Priority, ResearchPlan
 from sim2real.contracts.status import HypothesisStatus, InvestigationStatus
 from sim2real.contracts.task import ProtocolRef
@@ -213,6 +215,14 @@ class ProposeArgs(Contract):
     agents: list[AgentArg] = Field(min_length=1, description="At most one agent per hypothesis.")
     rationale: NonEmptyStr = Field(description="Why these agents and roles, and why the other open hypotheses get "
                                                "none.")
+    recommendation_id: Identifier | None = Field(default=None, description="The recommendation whose chosen step "
+                                                                           "this carries out, if any.")
+
+
+class RecommendArgs(Contract):
+    candidates: list[CandidateAction] = Field(min_length=1, description="The next steps worth considering, compared.")
+    chosen: list[Identifier] = Field(default=[], description="Candidate ids you take now; none is a valid choice.")
+    reason: NonEmptyStr = Field(description="Why the chosen ones over the others, or why none now.")
 
 
 class RetireArgs(Contract):
@@ -224,6 +234,8 @@ class TaskArgs(Contract):
     hypothesis_id: Identifier
     instruction: NonEmptyStr = Field(description="Specific work: what to test or assess, with which protocol, and "
                                                  "any limits the researcher set.")
+    recommendation_id: Identifier | None = Field(default=None, description="The recommendation whose chosen step "
+                                                                           "this carries out, if any.")
 
 
 class ReportsArgs(Contract):
@@ -377,7 +389,7 @@ def chief_tools(ctx: ChiefContext) -> list[AgentTool]:
         earlier = state.pending_proposal
         proposal_id = new_id("prop")
         record(AgentsProposed(proposal_id=proposal_id, rationale=args.rationale, agents=tuple(
-            AgentSpec(**a.model_dump()) for a in args.agents)))
+            AgentSpec(**a.model_dump()) for a in args.agents), recommendation_id=args.recommendation_id))
         state = ctx.ledger.load(current())
         deadline = review_deadline(state, state.proposals[proposal_id])
         replaced = f" It replaces {earlier.proposal_id}, which never started." if earlier else ""
@@ -385,6 +397,16 @@ def chief_tools(ctx: ChiefContext) -> list[AgentTool]:
                 f"They start at {clock_time(deadline)} ({state.spec.constraints.agent_review_minutes} minutes from "
                 "now) unless the researcher replies; a reply holds them until you propose again. The researcher can "
                 "start them at once with /approve agents. Tell the researcher what you propose and why.")
+
+    def recommend_next_actions(args: RecommendArgs) -> str:
+        recommendation_id = new_id("rec")
+        record(NextActionsRecommended(recommendation_id=recommendation_id, candidates=tuple(args.candidates),
+                                      chosen=tuple(args.chosen), reason=args.reason))
+        taken = ", ".join(args.chosen) or "none for now"
+        return (f"Recorded {recommendation_id}: {len(args.candidates)} candidates; taking {taken}. The researcher "
+                "sees it in the chat and the notebook. It authorizes nothing: carry out the chosen steps with your "
+                f"tools, giving recommendation_id {recommendation_id} when you delegate, request a judgement or "
+                "propose agents for them. A measurement is a suggestion for the researcher.")
 
     def retire_agent(args: RetireArgs) -> str:
         agent = ctx.ledger.load(current()).active_agent(args.hypothesis_id)
@@ -413,7 +435,7 @@ def chief_tools(ctx: ChiefContext) -> list[AgentTool]:
             agent_id = agent.agent_id
         task_id = new_id("task")
         record(AgentTaskQueued(task_id=task_id, role=role, hypothesis_id=args.hypothesis_id, agent_id=agent_id,
-                               instruction=args.instruction))
+                               instruction=args.instruction, recommendation_id=args.recommendation_id))
         who = agent_id or f"the {role.replace('_', ' ')}"
         return (f"Queued {task_id} for {who} on {args.hypothesis_id}. The dispatcher runs it; results appear in "
                 "investigation_state and agent_reports.")
@@ -481,6 +503,11 @@ def chief_tools(ctx: ChiefContext) -> list[AgentTool]:
                   "work needs and its first task. Not every hypothesis needs one. The researcher reviews the proposal; "
                   "it starts after the review window unless they reply, or at once on their /approve agents. A new "
                   "proposal replaces one still waiting.", ProposeArgs, propose_agents),
+        AgentTool("recommend_next_actions", "Record the next steps worth considering, compared: for each, what it "
+                  "is, the hypotheses it bears on and what each predicts it would show, why it is informative, its "
+                  "cost and feasibility, and a qualitative priority with the reason; then which you take now and "
+                  "why. No numerical scores or probabilities. It authorizes nothing.", RecommendArgs,
+                  recommend_next_actions),
         AgentTool("agents", "List the agents, their roles and token use, and any proposal waiting for the "
                   "researcher.", NoArgs, agents),
         AgentTool("delegate", "Queue further work for the agent of a hypothesis. It sees only its own hypothesis: "

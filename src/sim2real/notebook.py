@@ -44,6 +44,7 @@ from sim2real.contracts.events import (
     HypothesisStatusChanged,
     InvestigationCreated,
     InvestigationStatusChanged,
+    NextActionsRecommended,
     ObservableAlignmentRecorded,
     PlanRevised,
     PredictionRegistered,
@@ -394,7 +395,7 @@ def _round_page(rnd: _Round, state: InvestigationState, next_start: RecordedEven
     meta = (f"Investigation `{state.investigation_id}` · events #{first.stream_version}–#{last.stream_version} · "
             f"{_when(first)} to {_when(last)} · [notebook index](index.md)")
     bodies = (_hypothesized(rnd, state), _why(rnd, state), _predicted(rnd), _tested(rnd, state),
-              _observed(rnd, state), _assessed(rnd, state), _unknown(rnd, state), _next(state, next_start),
+              _observed(rnd, state), _assessed(rnd, state), _unknown(rnd, state), _next(rnd, state, next_start),
               _messages(rnd), _reports(rnd))
     blocks = [f"# {_round_name(rnd.number)}: {state.spec.title}", meta, opening, _NOTE]
     blocks += [_section(title, body) for title, body in zip(ROUND_SECTIONS, bodies, strict=True)]
@@ -451,7 +452,8 @@ def _why(rnd: _Round, state: InvestigationState) -> list[str]:
                                                                              ActorKind.USER):
             lines.append(f"- {ROOT.hyp(p.hypothesis_id)} moved to {p.status.value} by {who}: {_said(p.reason)}")
         elif isinstance(p, AgentsProposed):
-            lines.append(f"- Agents proposed by {who} ({p.proposal_id}): {_said(p.rationale)}")
+            following = f", carrying out {p.recommendation_id}" if p.recommendation_id else ""
+            lines.append(f"- Agents proposed by {who} ({p.proposal_id}{following}): {_said(p.rationale)}")
             lines += [f"  - {ROOT.hyp(a.hypothesis_id)}: {_flat(a.role)}; first task: {_said(a.brief)}"
                       for a in p.agents]
         elif isinstance(p, AgentsStarted):
@@ -560,8 +562,24 @@ def _unknown(rnd: _Round, state: InvestigationState) -> list[str]:
                      "SUPPORTED or CHALLENGED assessment."]
 
 
-def _next(state: InvestigationState, next_start: RecordedEvent | None) -> list[str]:
-    lines = []
+def _recommended(event: RecordedEvent, p: NextActionsRecommended) -> list[str]:
+    taken = ", ".join(p.chosen) if p.chosen else "none for now"
+    lines = [f"- Next steps recommended by {_actor(event.actor)} ({p.recommendation_id}). Taking: {taken}. Why: "
+             f"{_said(p.reason)}"]
+    for c in p.candidates:
+        mark = "chosen; " if c.candidate_id in p.chosen else ""
+        bears = f" on {', '.join(ROOT.hyp(h) for h in c.hypothesis_ids)}" if c.hypothesis_ids else ""
+        lines.append(f"  - **{c.candidate_id}** ({mark}{c.kind.value}, {c.priority.value} priority){bears}: "
+                     f"{_said(c.action)}")
+        lines += [f"    - If {ROOT.hyp(o.hypothesis_id)} holds: {_said(o.outcome)}" for o in c.expected_outcomes]
+        lines += [f"    - Informative because: {_said(c.rationale)}",
+                  f"    - Cost: {_said(c.cost)}; feasibility: {_said(c.feasibility)}",
+                  f"    - Priority because: {_said(c.priority_reason)}"]
+    return lines
+
+
+def _next(rnd: _Round, state: InvestigationState, next_start: RecordedEvent | None) -> list[str]:
+    lines = [line for event, p in rnd.of(NextActionsRecommended) for line in _recommended(event, p)]
     if next_start is not None:
         n = next_start.payload.round
         lines.append(f"- [{_round_name(n)}]({round_file(n)}) started next, by {_actor(next_start.actor)}: "
@@ -579,7 +597,8 @@ def _next(state: InvestigationState, next_start: RecordedEvent | None) -> list[s
             who = f"the Evidence Judge on {ROOT.hyp(task.hypothesis_id)}"
         else:
             who = f"{task.agent_id} on {ROOT.hyp(task.hypothesis_id)}"
-        lines.append(f"- Queued for {who}, by {task.queued_by}: {_said(task.instruction)}")
+        following = f", carrying out {task.recommendation_id}" if task.recommendation_id else ""
+        lines.append(f"- Queued for {who}, by {task.queued_by}{following}: {_said(task.instruction)}")
     lines += [f"- Waiting for the researcher: `{command}` ({note})" for command, note in approval_requests(state)]
     lines += [f"- {c.calculation_id} not finished: {_calc_status(c)}" for c in state.calculations.values()
               if c.state not in _FINISHED]
@@ -862,9 +881,16 @@ def _describe(event: RecordedEvent) -> str:
             if p.role == "chief_scientist":
                 return f"{p.task_id} queued for the Chief Scientist's review of the agents' reports"
             who = p.agent_id or f"the {p.role.replace('_', ' ')}"
-            return f"{p.task_id} queued for {who} on {p.hypothesis_id}"
+            following = f", carrying out {p.recommendation_id}" if p.recommendation_id else ""
+            return f"{p.task_id} queued for {who} on {p.hypothesis_id}{following}"
         case AgentsProposed():
-            return f"{p.proposal_id}: agents proposed: " + ", ".join(f"{a.role} on {a.hypothesis_id}" for a in p.agents)
+            following = f" (carrying out {p.recommendation_id})" if p.recommendation_id else ""
+            return (f"{p.proposal_id}: agents proposed{following}: "
+                    + ", ".join(f"{a.role} on {a.hypothesis_id}" for a in p.agents))
+        case NextActionsRecommended():
+            taken = ", ".join(p.chosen) or "none for now"
+            return (f"{p.recommendation_id}: {len(p.candidates)} next steps compared; taking {taken}: "
+                    f"{_said(p.reason)}")
         case AgentsStarted():
             how = f"by {p.authorization_id}" if p.authorization_id else "after the review window"
             return f"{p.proposal_id} started {how}: " + ", ".join(p.agent_ids.values())

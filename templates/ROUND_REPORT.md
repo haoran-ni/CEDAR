@@ -61,9 +61,12 @@ round's evidence that is not VALIDATED.
 
 ## What is next?
 
-At the end of the round: the next round and why it started, queued agent work, what waits
-for the researcher (with the exact command), unfinished calculations, and the plan's
-objective and priorities.
+The Chief Scientist's recommendations this round: each candidate next step with the
+hypotheses it bears on, what each predicts it would show, why it is informative, its cost,
+feasibility and priority, and which were taken and why. Then, at the end of the round: the
+next round and why it started, queued agent work (with the recommendation it carries out),
+what waits for the researcher (with the exact command), unfinished calculations, and the
+plan's objective and priorities.
 
 ## Researcher's messages
 

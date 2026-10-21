@@ -76,7 +76,7 @@ Chief Scientist and research orchestrator are separate concerns. The LLM supervi
 ### B. Asynchronous research channel
 
 - Execute independent agents concurrently: several at once, never two runs of the same agent, each until it finishes its task, waits for a job or reaches its budget. Submission and job polling go on meanwhile.
-- When every agent given work has reported, the Chief Scientist reviews the reports in the background (fan-in) and decides what follows; its conclusions reach the researcher in the chat.
+- When every agent given work has reported, and no proposed agents are about to start, the Chief Scientist reviews the reports, with the evidence and assessments recorded since its last review, in the background (fan-in) and decides what follows: another round, follow-up work, new hypotheses and agents, or a proposal to close. Its conclusions reach the researcher in the chat.
 - Submission of a long-running job records `WAITING_FOR_JOB` and ends the current agent invocation.
 - External work proceeds without the TUI connected. The monitor observes completion and publishes an event; the dispatcher restores a worker from a checkpoint and relevant evidence.
 - Worker runs can be resumed from any process; shared state is serialized, not held solely in memory.
@@ -148,9 +148,9 @@ When using LangGraph interrupts, be alert to **node replay**: divide submission,
 3. Screener merges redundant hypotheses, verifies testability, and prioritizes.
 4. The Chief Scientist proposes agents, at most one per hypothesis, each with a role, a first task and optionally a budget. The researcher reviews the proposal: it starts on `/approve agents`, or after a 10-minute review window with no reply; any reply holds it until the Chief Scientist proposes again. Each agent is a separate, restricted instance (common LLM backend is fine) with its own conversation, and its tools reach only its own hypothesis's work.
 5. Independent investigators preregister predictions and request evidence.
-6. Once every agent given work has reported, the Chief Scientist collects the reports, compares them across hypotheses and consults the Evidence Judge. Agents never see each other's work, so cross-examination goes through the Chief Scientist, which passes on the findings a test needs.
+6. Once every agent given work has reported, and no proposed agents are about to start, the Chief Scientist collects the reports and the evidence recorded since its last review, compares them across hypotheses and consults the Evidence Judge. Agents never see each other's work, so cross-examination goes through the Chief Scientist, which passes on the findings a test needs.
 7. New evidence can trigger a joint hypothesis (e.g., XC × coverage), suspension, revived mechanism, or another round.
-8. Supervisor checks next-action budget, user intent, dependencies and approval before issuing tasks.
+8. Supervisor checks next-action budget, user intent, dependencies and approval before issuing tasks. For now the Next Best Action Planner is the Chief Scientist itself: it records the candidate next steps it weighed, what each hypothesis predicts each would show, their cost and feasibility, a qualitative priority, and which it takes and why (`next_actions_recommended`). The record authorizes nothing; the actions that follow cite it.
 
 If the user asks to pause a mechanism, do not throw away its evidence. Distinguish queued, running and future follow-up tasks. Running Slurm jobs are not automatically cancelled by a priority change.
 

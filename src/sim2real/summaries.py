@@ -7,7 +7,13 @@ always shown separately.
 from sim2real.contracts.examination import ExaminationVerdict, FindingSeverity
 from sim2real.contracts.plan import PermissionAction
 from sim2real.contracts.status import CalculationState
-from sim2real.state.projection import CalculationRecord, InvestigationState, authorization_for, evidence_owner
+from sim2real.state.projection import (
+    CalculationRecord,
+    InvestigationState,
+    RecommendationRecord,
+    authorization_for,
+    evidence_owner,
+)
 from sim2real.swarm import agent_label, proposal_note
 
 
@@ -34,6 +40,10 @@ def calculation_summary(state: InvestigationState, calc: CalculationRecord, *, f
                                         "FAILED " + "; ".join(f"{c.name} ({c.detail or 'no detail'})" for c in failed)))
         lines += [f"  protocol read {r.name} = {r.value.value!r} {r.value.unit} at {r.file} line {r.line_start}: "
                   f"{r.quote}" for r in calc.run_check.readings]
+    if viewer is None:  # what every hypothesis expects of this run, side by side; agents see only their own
+        lines += [f"  predicted by {r.hypothesis_id} ({r.prediction_id}): {r.prediction.expected_outcome}; falsified "
+                  f"if {r.prediction.falsified_if}" for r in state.predictions.values()
+                  if calc.calculation_id in r.prediction.calculation_ids]
     for evidence_id in calc.evidence_ids:
         evidence = state.evidence[evidence_id].evidence
         if viewer is not None and evidence_owner(state, evidence) not in (None, viewer):
@@ -43,6 +53,25 @@ def calculation_summary(state: InvestigationState, calc: CalculationRecord, *, f
         origin = f" (analysis {evidence.analysis_id})" if evidence.analysis_id else ""
         lines.append(f"  evidence {evidence_id}{origin}: {evidence.quality.value}, {evidence.observable.name} = "
                      f"{value}" + (f"; failed checks: {', '.join(failed)}" if failed else ""))
+    return "\n".join(lines)
+
+
+def recommendation_text(record: RecommendationRecord, *, brief: bool = False) -> str:
+    """The Chief Scientist's candidate next steps and its choice; ``brief`` gives one line per candidate."""
+    rec = record.recommendation
+    taken = ", ".join(rec.chosen) if rec.chosen else "none for now"
+    lines = [f"Next steps recommended by the Chief Scientist ({rec.recommendation_id}, round {record.round}). Taking: "
+             f"{taken}. Why: {rec.reason}"]
+    for c in rec.candidates:
+        mark = "chosen; " if c.candidate_id in rec.chosen else ""
+        bears = f" on {', '.join(c.hypothesis_ids)}" if c.hypothesis_ids else ""
+        lines.append(f"  {c.candidate_id} ({mark}{c.kind.value}, {c.priority.value} priority){bears}: {c.action}")
+        if brief:
+            continue
+        lines += [f"    if {o.hypothesis_id} holds: {o.outcome}" for o in c.expected_outcomes]
+        lines += [f"    informative because: {c.rationale}",
+                  f"    cost: {c.cost}; feasibility: {c.feasibility}",
+                  f"    priority because: {c.priority_reason}"]
     return "\n".join(lines)
 
 
@@ -103,10 +132,16 @@ def investigation_summary(state: InvestigationState) -> str:
         if hyp.assessments:
             last = hyp.assessments[-1]
             lines.append(f"  latest assessment ({last.completeness.value}): {last.rationale}")
+        lines += [f"  prediction {pid} (about no particular calculation): {state.predictions[pid].prediction.statement} "
+                  f"Expected: {state.predictions[pid].prediction.expected_outcome}" for pid in hyp.prediction_ids
+                  if not state.predictions[pid].prediction.calculation_ids]
     if state.calculations:
         lines.append("Calculations:")
         lines += ["  " + line for c in state.calculations.values()
                   for line in calculation_summary(state, c, findings=False).splitlines()]
+    if state.recommendations:
+        latest = list(state.recommendations.values())[-1]
+        lines += ["Latest recommendation:", "  " + recommendation_text(latest, brief=True).replace("\n", "\n  ")]
     proposal = state.pending_proposal
     if proposal is not None:
         lines.append("Agents proposed, not started: " + "; ".join(f"{s.hypothesis_id}: {s.role}" for s in proposal.agents)

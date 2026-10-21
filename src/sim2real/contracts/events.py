@@ -26,6 +26,7 @@ from sim2real.contracts.evidence import EvidenceObject, QualityCheck, RunReading
 from sim2real.contracts.examination import InputExamination
 from sim2real.contracts.hypothesis import HypothesisSpec, Prediction
 from sim2real.contracts.investigation import InvestigationSpec, ObservableAlignment
+from sim2real.contracts.next_actions import CandidateAction
 from sim2real.contracts.plan import Authorization, ResearchPlan
 from sim2real.contracts.status import (
     Assessment,
@@ -73,6 +74,30 @@ class ClosingProposed(Contract):
     def _closes(self) -> "ClosingProposed":
         if self.status not in CLOSING_STATUSES:
             raise ValueError("an investigation is closed as COMPLETED or INCONCLUSIVE")
+        return self
+
+
+class NextActionsRecommended(Contract):
+    """The Chief Scientist's candidate next steps, compared, and the ones it takes now.
+
+    A record of reasoning for the researcher and for evaluation; it authorizes nothing.
+    """
+
+    type: Literal["next_actions_recommended"] = "next_actions_recommended"
+    recommendation_id: Identifier
+    candidates: tuple[CandidateAction, ...] = Field(min_length=1)
+    chosen: tuple[Identifier, ...] = ()
+    """Candidates taken now; none is a valid choice, e.g. while jobs run."""
+    reason: NonEmptyStr
+    """Why these over the others, or why none now."""
+
+    @model_validator(mode="after")
+    def _chosen_among_candidates(self) -> "NextActionsRecommended":
+        ids = [c.candidate_id for c in self.candidates]
+        if len(set(ids)) != len(ids):
+            raise ValueError("candidate ids must be unique")
+        if len(set(self.chosen)) != len(self.chosen) or not set(self.chosen) <= set(ids):
+            raise ValueError("chosen names distinct candidates of this recommendation")
         return self
 
 
@@ -221,6 +246,8 @@ class AgentsProposed(Contract):
     agents: tuple[AgentSpec, ...] = Field(min_length=1)
     rationale: NonEmptyStr
     """Why these agents, and why the other open hypotheses get none."""
+    recommendation_id: Identifier | None = None
+    """The Chief Scientist's recommendation this carries out, if any."""
 
     @model_validator(mode="after")
     def _one_agent_per_hypothesis(self) -> "AgentsProposed":
@@ -274,6 +301,8 @@ class AgentTaskQueued(Contract):
     hypothesis_id: Identifier | None = None
     agent_id: Identifier | None = None
     instruction: NonEmptyStr
+    recommendation_id: Identifier | None = None
+    """The Chief Scientist's recommendation this carries out, if any."""
 
     @model_validator(mode="after")
     def _names_what_its_role_needs(self) -> "AgentTaskQueued":
@@ -330,6 +359,7 @@ EventPayload = Annotated[
     InvestigationCreated
     | InvestigationStatusChanged
     | ClosingProposed
+    | NextActionsRecommended
     | ObservableAlignmentRecorded
     | UserInterventionRecorded
     | PlanRevised

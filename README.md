@@ -31,6 +31,7 @@ The project is being designed as a **general-purpose investigation framework**, 
 - Researcher-authorized jobs run under Slurm.
 - Agents read the outputs and compute whatever quantities they need with their own analysis scripts, which run under guards on the login node. Cited readings and script results are verified or recorded before they become evidence.
 - The Evidence Judge assesses hypotheses.
+- When the Chief Scientist decides what to do next, it records the candidate steps it weighed (what each hypothesis predicts each would show, cost, feasibility, priority) and which it takes, and why. You see this in the chat and the notebook.
 - A research notebook in Markdown, generated from the event log, records each round: what was hypothesized and why, predicted, tested and observed, what changed, what remains unknown and what is next.
 - A full-screen terminal interface keeps a live panel of hypotheses, agents, jobs, evidence and assessments above the conversation, and opens notebook pages and cited output lines in place.
 

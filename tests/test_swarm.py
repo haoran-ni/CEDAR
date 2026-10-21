@@ -5,12 +5,14 @@ Chief Scientist's reviews of what they report.
 ScriptedModel and FakeScheduler TEST DOUBLES on a SYNTHETIC site; no model or job runs.
 """
 
+import itertools
 import os
 import threading
 from collections import Counter
 
 import pytest
 from factories import (
+    JUDGE,
     USER,
     add_hypothesis,
     agent_for,
@@ -40,6 +42,9 @@ from sim2real.contracts import (
     AgentsProposed,
     AgentTaskQueued,
     AnalysisRecorded,
+    Assessment,
+    AssessmentRecorded,
+    Completeness,
     EvidenceRecorded,
     HypothesisProposed,
     HypothesisStatus,
@@ -60,7 +65,7 @@ from sim2real.models.scripted import ScriptedModel, reply
 from sim2real.notebook import render_notebook, round_file
 from sim2real.state.projection import ProposalStatus
 from sim2real.summaries import calculation_summary
-from sim2real.swarm import CHIEF, review_due, start_drafts
+from sim2real.swarm import CHIEF, REVIEW_INSTRUCTION, review_due, review_material, start_drafts
 
 INV = "swarm-test"
 ENERGY = -4321.987654321
@@ -511,6 +516,154 @@ def test_the_chief_scientist_reviews_once_every_agent_has_reported(tmp_path, sit
     assert chat.chief_session == f"{INV}.chief"
     round_page = render_notebook(system["workspace"].store.read_stream(INV))[round_file(ledger.load(INV).round)]
     assert "(chief scientist; review of the agents' reports; task" in round_page
+
+
+def test_a_review_can_start_another_round_that_builds_on_the_first(tmp_path, site):
+    """The review finds the question open: a new hypothesis and agent, a follow-up for an agent, a new round; the
+    next review waits for all of them and sees only what is new, with its earlier reviews in mind."""
+    system = make_system(tmp_path, site, reviews=True)
+    ledger, clients, dispatcher = system["workspace"].ledger, system["clients"], system["dispatcher"]
+    chat = investigation(system, "hyp-a", "hyp-b")
+    propose(ledger, "p-1", "hyp-a", "hyp-b")
+    chat.handle("/approve agents")
+    router = agents_answer(system, **{
+        "hyp-a": [says("A: the effect halves with method X but remains."),
+                  says("A: with B1 controlled, the effect still remains.")],
+        "hyp-b": [says("B: confounder B1 explains part of the effect.")],
+        "hyp-c": [says("C: tested C with the context I was given.")]})
+    dispatcher.tick()
+    first_round = ledger.load(INV).round
+    ids = itertools.count()
+
+    def chief(*steps):
+        return reply(*(ToolCall(id=f"c{next(ids)}", name=name, arguments=arguments) for name, arguments in steps))
+
+    clients.add(
+        "chief_scientist",
+        chief(("set_investigation_status", {"status": "REVIEWING", "reason": "both reported"}),
+              ("propose_hypothesis", {"hypothesis_id": "hyp-c", "title": "C", "statement": "C explains the rest.",
+                                      "rationale": "B explains only part of A's effect.",
+                                      "falsifiers": ["no effect remains once B1 is controlled"]}),
+              ("set_hypothesis_status", {"hypothesis_id": "hyp-c", "status": "SCREENED", "reason": "testable"}),
+              ("set_hypothesis_status", {"hypothesis_id": "hyp-c", "status": "ACTIVE", "reason": "worth testing"}),
+              ("retire_agent", {"hypothesis_id": "hyp-b", "reason": "B1 found; passed on"}),
+              ("recommend_next_actions", {"reason": "Both steps tell the remaining explanations apart.",
+                                          "chosen": ["a1", "a2"], "candidates": [
+                  {"candidate_id": "a1", "kind": "calculation", "action": "A repeats its test controlling for B1",
+                   "hypothesis_ids": ["hyp-a", "hyp-c"], "rationale": "separates B1 from the rest", "cost": "one run",
+                   "feasibility": "now", "priority": "high", "priority_reason": "cheapest"},
+                  {"candidate_id": "a2", "kind": "calculation", "action": "test C", "hypothesis_ids": ["hyp-c"],
+                   "rationale": "C is untested", "cost": "one agent", "feasibility": "after approval",
+                   "priority": "high", "priority_reason": "the remaining explanation"}]})),
+        lambda call: chief(
+            ("set_investigation_status", {"status": "INVESTIGATING", "reason": "an effect remains: test C"}),
+            ("delegate", {"hypothesis_id": "hyp-a", "recommendation_id": next(iter(ledger.load(INV).recommendations)),
+                          "instruction": "agent-hyp-b found confounder B1. Repeat your test controlling for it."}),
+            ("propose_agents", {"rationale": "C may explain what B1 does not",
+                                "recommendation_id": next(iter(ledger.load(INV).recommendations)), "agents": [
+                                    {"hypothesis_id": "hyp-c", "role": "C specialist",
+                                     "brief": "Test C. Context: A saw the effect halve with X; B found confounder "
+                                              "B1."}]})),
+        says("Not resolved: an effect remains. Round 2: A controls for B1, and I propose an agent for C."))
+    dispatcher.tick()
+    state = ledger.load(INV)
+    assert state.round == first_round + 1  # back to INVESTIGATING from REVIEWING: a new round
+    assert not state.agents["agent-hyp-b"].active and state.pending_proposal is not None
+    (rec_id,) = state.recommendations
+    assert [t.recommendation_id for t in state.pending_tasks] == [rec_id]  # A's follow-up carries out a1
+    texts = [n.text for n in chat.notices()]
+    review, recommended = texts.index("Not resolved: an effect remains. Round 2: A controls for B1, and I propose "
+                                      "an agent for C."), texts.index(next(t for t in texts if rec_id in t))
+    assert review < recommended and "Taking: a1, a2." in texts[recommended]
+
+    dispatcher.tick()  # A's follow-up runs at once, in A's own conversation
+    follow_up = router.models["agent-hyp-a"].calls[-1].messages
+    assert follow_up[1].text == "A: the effect halves with method X but remains."
+    assert follow_up[-1].text.endswith("agent-hyp-b found confounder B1. Repeat your test controlling for it.")
+    assert not any("review" in n for n in dispatcher.tick())  # not while C's agent waits to start
+    assert not review_due(ledger.load(INV))
+
+    chat.handle("/approve agents")
+    dispatcher.tick()  # the new agent knows only what the Chief wrote
+    assert router.models["agent-hyp-c"].calls[0].messages[-1].text.endswith(
+        "Test C. Context: A saw the effect halve with X; B found confounder B1.")
+    clients.add("chief_scientist", says("A and C both reported; C accounts for the rest."))
+    assert f"{INV}: queued the Chief Scientist's review of the agents' reports" in dispatcher.tick()
+    assert len([r for r in ledger.load(INV).agent_runs if r.role == "chief_scientist"]) == 2
+    second = clients.models["chief_scientist"].calls[-1].messages
+    material = second[-1].text
+    assert "[agent-hyp-a (hyp-a specialist) on hyp-a; run finished]\nA: with B1 controlled" in material
+    assert "[agent-hyp-c (C specialist) on hyp-c; run finished]\nC: tested C" in material
+    assert "B: confounder B1" not in material and "the effect halves" not in material  # only what is new
+    assert any(m.text.startswith("Not resolved: an effect remains.") for m in second[:-1])  # its first review
+
+
+def test_proposed_agents_hold_the_review_back_only_while_they_can_start(system):
+    ledger = system["workspace"].ledger
+    chat = investigation(system, "hyp-a", "hyp-b")
+    propose(ledger, "p-1", "hyp-a")
+    chat.handle("/approve agents")
+    (task,) = ledger.load(INV).pending_tasks
+    ledger.record(INV, [draft(agent_for("hyp-a"), AgentRunRecorded(
+        session_id="s", role="hypothesis_agent", task_id=task.task_id, provider="p", requested_model="m", turns=1,
+        input_tokens=1, output_tokens=1, cache_read_tokens=0, cache_write_tokens=0, outcome="finished",
+        report="A reported."))])
+    assert review_due(ledger.load(INV))
+    propose(ledger, "p-2", "hyp-b")
+    assert not review_due(ledger.load(INV))  # B's agent starts soon; both are reviewed together
+
+    def move(status):
+        ledger.record(INV, [draft(CHIEF, InvestigationStatusChanged(status=status, reason="test"))])
+
+    move(InvestigationStatus.REVIEWING)
+    assert review_due(ledger.load(INV))  # it cannot start while REVIEWING
+    move(InvestigationStatus.INVESTIGATING)
+    assert not review_due(ledger.load(INV))
+    ledger.record(INV, [draft(USER, UserInterventionRecorded(intervention_id="msg-9", text="Not B yet."))])
+    assert review_due(ledger.load(INV))  # the researcher's reply holds it
+
+
+def test_a_review_shows_the_evidence_and_assessments_recorded_since_the_last_one(system):
+    from test_orchestration import ENERGY as RUN_ENERGY, HYP, INV as OPEN, agent_reads, agent_requests, latest_calc
+    from test_orchestration import open_and_start
+
+    ledger, clients, dispatcher, scheduler = (system["workspace"].ledger, system["clients"], system["dispatcher"],
+                                              system["scheduler"])
+    open_and_start(system)
+    clients.add("hypothesis_agent", *agent_requests(system))
+    dispatcher.tick()
+    calc = latest_calc(system["workspace"])
+    system["chat"].handle(f"/approve submit {calc}")
+    output = aims_output(energy=RUN_ENERGY)
+    scheduler.on_submit = lambda job, workdir: (workdir / "aims.out").write_text(output)
+    dispatcher.tick()
+    scheduler.set_state(next(iter(scheduler.jobs)), SchedulerState.COMPLETED)
+    clients.add("hypothesis_agent", *agent_reads(system, output))
+    dispatcher.tick()
+    state = ledger.load(OPEN)
+    reading, computed = state.calculations[calc].evidence_ids
+    ledger.record(OPEN, [draft(JUDGE, AssessmentRecorded(
+        hypothesis_id=HYP, assessment=Assessment.INCONCLUSIVE, completeness=Completeness.PARTIAL,
+        evidence_ids=(reading,), rationale="One energy cannot rank adsorption sites."))])
+
+    def review(task_id):
+        ledger.record(OPEN, [draft(SYSTEM, AgentTaskQueued(task_id=task_id, role="chief_scientist",
+                                                           instruction=REVIEW_INSTRUCTION))])
+        state = ledger.load(OPEN)
+        return review_material(state, state.tasks[task_id])
+
+    material = review("review-1")
+    analysis = ledger.load(OPEN).evidence[computed].evidence
+    assert ("Evidence recorded since your last review, as the record holds it:\n"
+            f"- {reading} for {HYP} (reading of {calc}): total energy = {RUN_ENERGY!r} eV; VALIDATED\n"
+            f"- {computed} for {HYP} (analysis {analysis.analysis_id} of {calc}): total energy in Hartree = "
+            f"{analysis.value.value!r} {analysis.value.unit}; VALIDATED") in material
+    assert ("The Evidence Judge's assessments since your last review:\n"
+            f"- {HYP}: INCONCLUSIVE (partial), citing {reading}: One energy cannot rank adsorption sites.") in material
+    assert "A report is its agent's account, not evidence" in material
+    later = review("review-2")  # nothing was recorded since the first
+    assert "Evidence recorded since your last review, as the record holds it:\nNone." in later
+    assert "The Evidence Judge's assessments since" not in later
 
 
 def test_a_review_proposes_closing_and_only_the_researcher_closes(tmp_path, site):

@@ -171,6 +171,16 @@ class ProfileStore:
         self._path(name, ".approval.json").write_text(approval.model_dump_json(indent=2) + "\n")
         return approval
 
+    def names(self) -> list[str]:
+        return sorted(p.name.removesuffix(".profile.json") for p in self.directory.glob("*.profile.json"))
+
+    def is_approved(self, name: str) -> bool:
+        try:
+            self.load_approved(name)
+        except ProfileNotApproved:
+            return False
+        return True
+
     def load_approved(self, name: str) -> ComputeProfile:
         profile = self.load(name)
         approval_path = self._path(name, ".approval.json")

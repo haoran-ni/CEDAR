@@ -7,7 +7,7 @@ was cut off (``max_tokens``) or refused are never run; their calls are answered 
 error so the transcript stays valid for the next invocation.
 """
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -16,6 +16,7 @@ from sim2real.agents.transcripts import TranscriptStore
 from sim2real.models.types import (
     Message,
     ModelClient,
+    ToolCall,
     ModelError,
     ModelSettings,
     TextPart,
@@ -63,7 +64,9 @@ class AgentRunner:
         self._secrets = list(secrets)
 
     def run(self, session_id: str, *, system: str, tools: Sequence[AgentTool], instruction: str,
-            limits: RunLimits = RunLimits()) -> RunResult:
+            limits: RunLimits = RunLimits(),
+            observer: Callable[[ToolCall, ToolOutcome], None] | None = None) -> RunResult:
+        """Run one invocation; ``observer`` sees each tool call and its outcome, e.g. to show progress."""
         by_name = {tool.name: tool for tool in tools}
         specs = [tool.spec() for tool in tools]
         history = self._transcripts.load(session_id)
@@ -106,8 +109,10 @@ class AgentRunner:
                 tool = by_name.get(call.name)
                 outcome = tool.invoke(call.arguments) if tool else ToolOutcome(
                     f"Unknown tool {call.name!r}; available: {', '.join(sorted(by_name))}", is_error=True)
-                results.append(ToolResult(call_id=call.id, content=redact(outcome.content, self._secrets),
-                                          is_error=outcome.is_error))
+                outcome = ToolOutcome(redact(outcome.content, self._secrets), outcome.is_error, outcome.end_run)
+                if observer is not None:
+                    observer(call, outcome)
+                results.append(ToolResult(call_id=call.id, content=outcome.content, is_error=outcome.is_error))
                 end_run = end_run or outcome.end_run
             self._append(session_id, history, Message(role="user", parts=tuple(results)))
             if end_run:

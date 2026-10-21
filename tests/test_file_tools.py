@@ -77,3 +77,10 @@ def test_binary_files_are_refused(tools, tree):
 def test_bad_regular_expression_is_reported(tools, tree):
     out = run(tools, "search_file", path=str(tree / "runs/calc-1/aims.out"), pattern="(")
     assert out.is_error and "invalid regular expression" in out.content
+
+
+def test_find_reports_matches_it_did_not_show(tools, tree):
+    for i in range(5):
+        (tree / "runs" / "calc-1" / f"extra{i}.in").write_text("x\n")
+    out = run(tools, "find_files", root=str(tree / "runs"), name_pattern="*.in", max_results=2).content
+    assert len(out.splitlines()) == 3 and out.endswith("[4 more matches not shown]")

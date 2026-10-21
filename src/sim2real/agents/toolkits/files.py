@@ -6,7 +6,7 @@ every denied directory, such as the one holding API keys. Nothing here writes.
 
 import fnmatch
 import re
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 from pydantic import Field
@@ -54,6 +54,8 @@ class ListArgs(Contract):
 class FindArgs(Contract):
     root: str = Field(description="Absolute path of the directory to search under.")
     name_pattern: str = Field(description="Shell-style file name pattern, e.g. 'aims.out' or '*.in'.")
+    max_results: int = Field(default=50, ge=1, le=MAX_ENTRIES, description="Paths to return; narrow the root "
+                                                                          "or pattern rather than raising this.")
 
 
 class ReadArgs(Contract):
@@ -69,7 +71,15 @@ class SearchArgs(Contract):
     context_lines: int = Field(default=0, ge=0, le=5, description="Lines of context before and after each match.")
 
 
-def file_tools(access: FileAccess) -> list[AgentTool]:
+def file_tools(access: FileAccess, on_read: Callable[[Path], None] | None = None) -> list[AgentTool]:
+    """The file tools; ``on_read`` is told about every file whose contents an agent reads."""
+
+    def text_lines(path: str) -> list[str]:
+        resolved, lines = access.text_lines(path)
+        if on_read is not None:
+            on_read(resolved)
+        return lines
+
     def list_directory(args: ListArgs) -> str:
         directory = access.resolve(args.path)
         if not directory.is_dir():
@@ -82,19 +92,24 @@ def file_tools(access: FileAccess) -> list[AgentTool]:
 
     def find_files(args: FindArgs) -> str:
         root = access.resolve(args.root)
-        found = []
+        found, more = [], 0
         for path in root.rglob("*"):
             if fnmatch.fnmatch(path.name, args.name_pattern) and path.is_file():
                 try:
-                    found.append(str(access.resolve(str(path))))
+                    resolved = str(access.resolve(str(path)))
                 except PermissionError:
                     continue
-                if len(found) >= MAX_ENTRIES:
-                    break
-        return "\n".join(found) or "no matching files"
+                if len(found) < args.max_results:
+                    found.append(resolved)
+                else:
+                    more += 1
+                    if more >= 10_000:
+                        break
+        note = f"\n[{more}{'+' if more >= 10_000 else ''} more matches not shown]" if more else ""
+        return ("\n".join(found) or "no matching files") + note
 
     def read_file(args: ReadArgs) -> str:
-        _, lines = access.text_lines(args.path)
+        lines = text_lines(args.path)
         first = args.start_line - 1
         chosen = lines[first:first + args.max_lines]
         body = "\n".join(f"{first + i + 1}: {_clip(line)}" for i, line in enumerate(chosen))
@@ -106,7 +121,7 @@ def file_tools(access: FileAccess) -> list[AgentTool]:
             pattern = re.compile(args.pattern)
         except re.error as exc:
             raise ToolFailure(f"invalid regular expression: {exc}") from None
-        _, lines = access.text_lines(args.path)
+        lines = text_lines(args.path)
         shown: set[int] = set()
         out: list[str] = []
         matches = 0

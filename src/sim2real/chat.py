@@ -38,20 +38,46 @@ from sim2real.summaries import approval_requests, investigation_summary, pending
 from sim2real.swarm import CHIEF, agent_label, agents_summary, start_drafts
 from sim2real.workspace import ModelClients, Workspace, profile_for, registry_for, services_for
 
-HELP = """Commands:
-  /status                      the investigation's state
-  /agents                      the hypothesis agents, and any the Chief Scientist proposes
-  /approve agents              start the proposed agents now instead of after the review window
-  /pending                     what waits for your approval
-  /approve submit <calc>       allow a calculation with approved inputs to be submitted
-  /approve inputs <calc>       allow inputs the examiner could not verify
-  /cancel <calc> <reason>      cancel a calculation, stopping its job if it has one
-                               (<calc> may be the first characters of its id, if unique)
-  /report                      update the research notebook and show where it is
-  /help                        this list
-  /quit                        leave (queued work and jobs continue with the dispatcher)
-Anything else goes to the Chief Scientist. A message sent while agents are proposed holds them
-until the Chief Scientist proposes again."""
+@dataclass(frozen=True)
+class Command:
+    usage: str
+    description: str
+
+    @property
+    def stem(self) -> str:
+        """What is typed before any argument: the usage up to its first <placeholder>."""
+        return self.usage.split("<", 1)[0]
+
+    @property
+    def takes_arguments(self) -> bool:
+        return "<" in self.usage
+
+
+COMMANDS = (
+    Command("/status", "the investigation's state"),
+    Command("/agents", "the hypothesis agents, and any the Chief Scientist proposes"),
+    Command("/approve agents", "start the proposed agents now instead of after the review window"),
+    Command("/pending", "what waits for your approval"),
+    Command("/approve submit <calc>", "allow a calculation with approved inputs to be submitted"),
+    Command("/approve inputs <calc>", "allow inputs the examiner could not verify"),
+    Command("/cancel <calc> <reason>", "cancel a calculation, stopping its job if it has one"),
+    Command("/report", "update the research notebook and show where it is"),
+    Command("/help", "this list"),
+    Command("/quit", "leave (queued work and jobs continue with the dispatcher)"),
+    Command("/exit", "leave, like /quit"),
+)
+"""Every command of the conversation, wherever it runs; interfaces may add their own."""
+
+
+def command_lines(commands: tuple[Command, ...]) -> str:
+    return "\n".join(f"  {c.usage:<28} {c.description}" for c in commands)
+
+
+HELP = f"""Commands:
+{command_lines(COMMANDS)}
+A <calc> may be given by the first characters of its id, if they are unique. Anything else goes to
+the Chief Scientist. A message sent while agents are proposed holds them until the Chief Scientist
+proposes again."""
 
 
 @dataclass(frozen=True)

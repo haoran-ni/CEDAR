@@ -4,9 +4,12 @@ The interface is only a client. It reads the record and the dispatcher's status 
 and talks to the Chief Scientist through ``ChatSession``. Closing it interrupts nothing,
 and reopening it shows the same investigation.
 
-Top to bottom: a status line; the live panel, one row per hypothesis, keeping lifecycle,
-agent role and activity, scheduler state, evidence quality and assessment in separate
-columns; the scrolling conversation; and the input line. The Chief Scientist answers in a
+Top to bottom: the panel, always shown: the logo, set across its top border, with the
+tagline and the models in use beside it; the status lines; which sub-agents are working;
+and a table with one row per hypothesis, keeping lifecycle, agent role and activity,
+scheduler state, evidence quality and assessment in separate columns. Then the scrolling
+conversation and the input line, above which a menu of matching commands opens when a
+line starts with "/". The Chief Scientist answers in a
 background thread, so the panel keeps updating and commands keep working while it thinks.
 Messages sent meanwhile wait their turn. The Chief Scientist's background reviews of the
 agents' reports appear in the conversation as its messages.
@@ -22,24 +25,95 @@ from pathlib import Path
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import VerticalScroll
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import Screen
-from textual.widgets import Collapsible, DataTable, Footer, Input, Markdown, Static, TextArea
+from textual.widget import Widget
+from textual.widgets import Collapsible, DataTable, Footer, Input, Markdown, OptionList, Static, TextArea
+from textual.widgets.option_list import Option
 
-from sim2real.chat import HELP, ChatSession, Notice
-from sim2real.dashboard import SwarmRow, dispatcher_status, status_line, swarm_rows, work_summary
+from sim2real.chat import COMMANDS, HELP, ChatSession, Command, Notice, command_lines
+from sim2real.dashboard import (
+    SwarmRow,
+    dispatcher_status,
+    model_line,
+    status_line,
+    subagent_status,
+    swarm_rows,
+    work_summary,
+)
 from sim2real.dispatch import current_activity, heartbeat_age
 from sim2real.notebook import round_file, update_notebook
 from sim2real.state.projection import InvestigationState, replay
 
-TUI_HELP = """In this window:
-  /notebook, /round, /timeline   open the research notebook: index, this round, every event (F2, F3, F4)
-  /panel                         hide or show the live panel (F8); it starts hidden on narrow terminals
-  Tab moves to the panel; Enter on a hypothesis opens its page. Esc closes a page, Backspace goes back.
-  /quit or Ctrl+Q                leave; jobs and queued agent work continue with the dispatcher"""
+TUI_COMMANDS = (
+    Command("/notebook", "open the research notebook's index"),
+    Command("/round", "open this round's notebook page"),
+    Command("/timeline", "open the timeline of every event"),
+    Command("/panel", "hide or show the panel's table of hypotheses"),
+)
+MENU_COMMANDS = COMMANDS + TUI_COMMANDS
+
+TUI_HELP = f"""In this window:
+{command_lines(TUI_COMMANDS)}
+A line starting with / lists the commands that match it: ↑/↓ choose, Tab or Enter completes, Esc closes
+the list; Enter on a complete command runs it. On narrow terminals the panel's table starts hidden.
+Tab moves to the panel; Enter on a hypothesis opens its page. Esc closes a page, Backspace goes back."""
+
+
+def suggestions(text: str) -> list[Command]:
+    """The commands whose typed part begins with ``text``; none unless ``text`` starts with "/"."""
+    if not text.startswith("/"):
+        return []
+    typed = text.lower()
+    return [c for c in MENU_COMMANDS if c.stem.lower().startswith(typed)]
+
+
+class Composer(Input):
+    """The input line. While the command menu is open, ↑/↓ move through it, Tab completes and Esc closes it;
+    otherwise these keys do what they always do."""
+
+    BINDINGS = [Binding("up", "menu_move(-1)", show=False), Binding("down", "menu_move(1)", show=False),
+                Binding("tab", "menu_complete", show=False), Binding("escape", "menu_close", show=False)]
+
+    def check_action(self, action: str, parameters: tuple[object, ...]) -> bool | None:
+        if action.startswith("menu_"):
+            return self.app.menu_open
+        return super().check_action(action, parameters)
+
+    def action_menu_move(self, step: int) -> None:
+        self.app.move_menu(step)
+
+    def action_menu_complete(self) -> None:
+        self.app.complete_command()
+
+    def action_menu_close(self) -> None:
+        self.app.close_menu()
 
 NARROW_COLUMNS = 110
-"""Below this terminal width the live panel starts hidden; the status lines still summarize it."""
+"""Below this terminal width the panel's table starts hidden; the status lines still summarize it."""
+
+TAGLINE = "An Autonomous Scientific Agent Swarm for Reconciling Simulation and Experiment"
+_LOGO_ANSI = (
+    "\x1b[0;96;46m▓░\x1b[0;36m▀\x1b[0;96;46m▓\x1b[0;37m \x1b[0;96;46m▓▒\x1b[0;36m▀▀\x1b[0;37m \x1b[0;96;46m▓▒\x1b[0;36m▀▄"
+    "\x1b[0;37m \x1b[0;96;46m▓▒\x1b[0;36m▀\x1b[0;96;46m▓\x1b[0;37m \x1b[0;96;46m▓█\x1b[0;36m▀\x1b[0;96;46m▓\x1b[0m",
+    "\x1b[0;96;46m▒▒\x1b[0;37m   \x1b[0;96;46m▒▓\x1b[0;36m▀▀\x1b[0;37m \x1b[0;96;46m▒▓\x1b[0;97m \x1b[0;96;46m░"
+    "\x1b[0;37m \x1b[0;96;46m▒░\x1b[0;36m▄\x1b[0;96;46m▒\x1b[0;37m \x1b[0;96;46m▒▓\x1b[0;36m▄▀\x1b[0m",
+    "\x1b[0;96;46m░▓\x1b[0;36m▄\x1b[0;96;46m░\x1b[0;37m \x1b[0;96;46m░ \x1b[0;36m▄▄\x1b[0;37m \x1b[0;96;46m░ \x1b[0;36m▄▀"
+    "\x1b[0;37m \x1b[0;96;46m░ \x1b[0;97m \x1b[0;96;46m░\x1b[0;37m \x1b[0;96;46m░▒\x1b[0;97m \x1b[0;96;46m▒\x1b[0m",
+)
+"""The logo, three rows of shaded blocks in two cyans, as ANSI text."""
+LOGO = tuple(Text.from_ansi(row) for row in _LOGO_ANSI)
+LOGO_WIDTH = max(row.cell_len for row in LOGO)
+
+
+class PanelTop(Widget):
+    """The logo's upper two rows, with the panel's top border running through the second, a space either side."""
+
+    DEFAULT_CSS = "PanelTop { height: 2; }"
+
+    def render(self) -> Text:
+        rest = max(0, self.size.width - LOGO_WIDTH - 5)
+        return Text("\n").join([Text("   ") + LOGO[0], Text("╭─ ") + LOGO[1] + Text(" " + "─" * rest + "╮")])
 
 FILE_WINDOW_LINES = 20_000
 """Longer files are shown as a window of this many lines around the cited line."""
@@ -125,6 +199,8 @@ class _Snapshot:
     status: str
     summary: str
     alarm: bool
+    subagents: str
+    models: str
     rows: list[SwarmRow] = field(default_factory=list)
     notices: list[Notice] = field(default_factory=list)
     alerts: list[str] = field(default_factory=list)
@@ -134,11 +210,22 @@ class _Snapshot:
 class Sim2RealApp(App):
     TITLE = "Sim2Real Scientist"
     CSS = """
-    #status { height: auto; padding: 0 1; background: $boost; }
+    #panel { height: auto; }
+    PanelTop { color: $accent; }
+    #panel-body { height: auto; border: round $accent; border-top: none; padding: 0 1; }
+    #masthead { height: auto; margin-bottom: 1; }
+    #logo-bottom { width: 27; }
+    #about { width: 1fr; height: auto; }
+    #tagline { text-style: bold; }
+    #models { color: $text-muted; }
+    #status { height: auto; }
     #status.alarm { color: $warning; text-style: bold; }
-    #swarm { height: auto; max-height: 40%; }
+    #subagents { height: auto; color: $success; }
+    #swarm { height: auto; max-height: 40vh; margin-top: 1; }
     #chat { height: 1fr; padding: 0 1; }
     #working { height: auto; padding: 0 1; color: $text-muted; display: none; }
+    #commands { height: auto; max-height: 12; margin: 0 1; display: none; }
+    #commands.open { display: block; }
     #working.busy { display: block; }
     .user { margin-top: 1; color: $accent; text-style: bold; }
     .speaker { margin-top: 1; color: $success; text-style: bold; }
@@ -148,13 +235,8 @@ class Sim2RealApp(App):
     .title { height: auto; padding: 0 1; background: $boost; }
     Collapsible { margin: 0; padding: 0; border: none; }
     """
-    BINDINGS = [
-        Binding("f2", "page('index.md')", "Notebook"),
-        Binding("f3", "round_page", "This round"),
-        Binding("f4", "page('timeline.md')", "Timeline"),
-        Binding("f8", "toggle_panel", "Panel"),
-        Binding("ctrl+q", "quit", "Quit", priority=True),
-    ]
+    ENABLE_COMMAND_PALETTE = False
+    """Commands in the conversation are typed, starting with "/"; there are no shortcut keys."""
     COLUMNS = ("Hypothesis", "Lifecycle", "Agent", "Jobs (scheduler)", "Evidence (validator)", "Assessment (judge)")
 
     def __init__(self, session: ChatSession, *, refresh_seconds: float = 2.0,
@@ -176,16 +258,30 @@ class Sim2RealApp(App):
         self._working_text = ""
         self._panel_choice: bool | None = None
         """Whether the researcher chose to show the panel; None follows the terminal's width."""
+        self._menu: list[Command] = []
+        self._menu_closed = False
+        """The researcher closed the menu with Esc; it stays closed until the line changes."""
 
     # -- layout -------------------------------------------------------------------------------
 
     def compose(self) -> ComposeResult:
-        yield Static(id="status")
-        yield DataTable(id="swarm", cursor_type="row", zebra_stripes=True)
+        with Vertical(id="panel"):
+            yield PanelTop()
+            with Vertical(id="panel-body"):
+                with Horizontal(id="masthead"):
+                    yield Static(Text(" ") + LOGO[2], id="logo-bottom")
+                    with Vertical(id="about"):
+                        yield Static(TAGLINE, id="tagline")
+                        yield Static(id="models")
+                yield Static(id="status")
+                yield Static("No working sub-agents", id="subagents")
+                yield DataTable(id="swarm", cursor_type="row", zebra_stripes=True)
         yield VerticalScroll(id="chat")
         yield Static(id="working")
-        yield Input(placeholder="Message the Chief Scientist, or a /command (/help)", id="composer")
-        yield Footer()
+        menu = OptionList(id="commands")
+        menu.can_focus = False
+        yield menu
+        yield Composer(placeholder="Message the Chief Scientist, or a /command (/help)", id="composer")
 
     def on_mount(self) -> None:
         self.query_one(DataTable).add_columns(*self.COLUMNS)
@@ -204,7 +300,7 @@ class Sim2RealApp(App):
 
     def _fit_panel(self) -> None:
         show = self._panel_choice if self._panel_choice is not None else self.size.width >= NARROW_COLUMNS
-        self.query_one(DataTable).display = show
+        self.query_one(DataTable).display = show and bool(self._rows)
 
     def say(self, text: str, kind: str) -> None:
         """Add a line to the conversation, shown exactly as written."""
@@ -214,7 +310,60 @@ class Sim2RealApp(App):
 
     # -- input --------------------------------------------------------------------------------
 
+    # -- the command menu ---------------------------------------------------------------------
+
+    @property
+    def menu_open(self) -> bool:
+        return self.query_one("#commands", OptionList).has_class("open")
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        self._menu_closed = False
+        self._show_menu(event.value)
+
+    def _show_menu(self, text: str) -> None:
+        menu = self.query_one("#commands", OptionList)
+        matches = [] if self._menu_closed else suggestions(text)
+        if matches != self._menu:
+            self._menu = matches
+            width = max((len(c.usage) for c in matches), default=0)
+            menu.clear_options()
+            menu.add_options(Option(Text.assemble((c.usage.ljust(width + 2), "bold"), (c.description, "dim")))
+                             for c in matches)
+            if matches:
+                menu.highlighted = 0
+        menu.set_class(bool(matches), "open")
+
+    def move_menu(self, step: int) -> None:
+        menu = self.query_one("#commands", OptionList)
+        menu.highlighted = ((menu.highlighted or 0) + step) % len(self._menu)
+
+    def _chosen(self) -> Command | None:
+        index = self.query_one("#commands", OptionList).highlighted
+        return self._menu[index] if self.menu_open and index is not None else None
+
+    def complete_command(self, command: Command | None = None) -> None:
+        command = command or self._chosen()
+        if command is not None:
+            composer = self.query_one(Composer)
+            composer.value = command.stem
+            composer.cursor_position = len(command.stem)
+            composer.focus()
+
+    def close_menu(self) -> None:
+        self._menu_closed = True
+        self._show_menu(self.query_one(Composer).value)
+
+    def on_option_list_option_selected(self, event: OptionList.OptionSelected) -> None:
+        event.stop()
+        self.complete_command(self._menu[event.option_index])
+
+    # -- input --------------------------------------------------------------------------------
+
     def on_input_submitted(self, event: Input.Submitted) -> None:
+        chosen = self._chosen()
+        if chosen is not None and event.value.strip() != chosen.stem.strip():
+            self.complete_command(chosen)  # Enter on a partial command completes it; Enter again runs it
+            return
         line = event.value.strip()
         event.input.clear()
         if not line:
@@ -326,9 +475,10 @@ class Sim2RealApp(App):
         activities = current_activity(self.workspace)
         dispatcher, alarm = dispatcher_status(heartbeat_age(self.workspace, now), activities, now)
         investigation_id = self.session.investigation_id
+        settings = self.session.clients.settings
         if investigation_id is None:
             return _Snapshot("No investigation yet: describe the discrepancy to the Chief Scientist.", dispatcher,
-                             alarm)
+                             alarm, subagent_status(None, activities, now), model_line(settings, None))
         version = self.workspace.store.current_version(investigation_id)
         changed = version != self._version
         if changed:
@@ -337,6 +487,7 @@ class Sim2RealApp(App):
             self._version = version
         state = self._state
         return _Snapshot(status_line(state, now), f"{work_summary(state)} · {dispatcher}", alarm,
+                         subagent_status(state, activities, now), model_line(settings, state),
                          swarm_rows(state, self._events, activities, now),
                          self.session.notices() if changed else [], self._new_results(state) if changed else [],
                          state.round)
@@ -367,6 +518,8 @@ class Sim2RealApp(App):
             return
         status.update(Text(f"{snapshot.status}\n{snapshot.summary}"))
         status.set_class(snapshot.alarm, "alarm")
+        self.query_one("#subagents", Static).update(Text(snapshot.subagents))
+        self.query_one("#models", Static).update(Text(snapshot.models))
         self._round = snapshot.round
         if snapshot.rows != self._rows:
             self._rows = snapshot.rows
@@ -379,6 +532,7 @@ class Sim2RealApp(App):
                               key=row.hypothesis_id)
             if snapshot.rows:
                 table.move_cursor(row=min(cursor, len(snapshot.rows) - 1))
+            self._fit_panel()
         for notice in snapshot.notices:
             if notice.review:
                 chat = self.query_one("#chat", VerticalScroll)
@@ -396,7 +550,8 @@ class Sim2RealApp(App):
     # -- actions ----------------------------------------------------------------------------------
 
     def action_toggle_panel(self) -> None:
-        self._panel_choice = not self.query_one(DataTable).display
+        shown = self._panel_choice if self._panel_choice is not None else self.size.width >= NARROW_COLUMNS
+        self._panel_choice = not shown
         self._fit_panel()
 
     def action_round_page(self) -> None:

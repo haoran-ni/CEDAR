@@ -44,11 +44,14 @@ from sim2real.dashboard import (
     agent_status,
     dispatcher_status,
     job_status,
+    model_line,
     short_id,
     status_line,
+    subagent_status,
     swarm_rows,
     work_summary,
 )
+from sim2real.models import ModelSettings
 from sim2real.dispatch import Activity
 from sim2real.workspace import Workspace
 
@@ -204,3 +207,46 @@ def test_dispatcher_status_and_status_line(ledger):
     line = status_line(ledger.load(inv), now)
     assert "1 agent proposed: start in " in line and line.endswith("unless you reply (/agents) · 2 waiting for you "
                                                                    "(/pending)")
+
+
+def test_the_panel_says_which_sub_agents_are_working(ledger):
+    assert subagent_status(None, [], LATER) == "No working sub-agents"
+    inv = start_investigation(ledger)
+    hyp = add_hypothesis(ledger, inv)
+    state = ledger.load(inv)
+    assert subagent_status(state, [], LATER) == "No working sub-agents"
+
+    def running(role, agent=None, hypothesis=hyp, investigation=inv, minutes=2):
+        return Activity(investigation_id=investigation, task_id=f"t-{role}", role=role, hypothesis_id=hypothesis,
+                        agent_id=agent, started_at=LATER - timedelta(minutes=minutes))
+
+    review = running("chief_scientist", hypothesis=None, minutes=1)
+    assert subagent_status(state, [running("hypothesis_agent", AGENT.id, investigation="other")], LATER) == \
+        "No working sub-agents"
+    assert subagent_status(state, [review], LATER) == ("No working sub-agents · the Chief Scientist is reviewing "
+                                                       "their reports")
+    assert subagent_status(state, [running("hypothesis_agent", AGENT.id), running("evidence_judge", minutes=1)],
+                           LATER) == f"Working sub-agents: test specialist on {hyp} (2 min); Evidence Judge on {hyp} (1 min)"
+
+
+def test_the_panel_names_the_models_in_use(ledger):
+    opus = ModelSettings(provider="anthropic", model="claude-opus-5-5", effort="high")
+    assert model_line(lambda role: opus, None) == "Model: claude-opus-5-5, effort high (anthropic)"
+
+    def missing(role):
+        raise KeyError(role)
+
+    assert model_line(missing, None) == "Model: none configured (sim2real models init)"
+    mixed = {"hypothesis_agent": ModelSettings(provider="anthropic", model="claude-sonnet-5-5")}
+    assert model_line(lambda role: mixed.get(role, opus), None) == (
+        "Models: Chief Scientist claude-opus-5-5, effort high (anthropic) · hypothesis agents claude-sonnet-5-5 "
+        "(anthropic) · Evidence Judge claude-opus-5-5, effort high (anthropic)")
+
+    inv = start_investigation(ledger)
+    hyp = add_hypothesis(ledger, inv)
+    ledger.record(inv, [draft(AGENT, AgentRunRecorded(
+        session_id="s", role="hypothesis_agent", provider="anthropic", requested_model="claude-opus-5-5",
+        served_models=("claude-opus-5-5", "claude-sonnet-5-5"), turns=2, input_tokens=1, output_tokens=1,
+        cache_read_tokens=0, cache_write_tokens=0, outcome="finished"))])
+    assert model_line(lambda role: opus, ledger.load(inv)).endswith(
+        "· hypothesis agents: latest run answered by claude-opus-5-5, claude-sonnet-5-5")

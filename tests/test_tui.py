@@ -22,14 +22,23 @@ from test_orchestration import (
     open_and_delegate,
     open_and_start,
 )
-from textual.widgets import Collapsible, DataTable, Input, Markdown, Static, TextArea
+from textual.widgets import Collapsible, DataTable, Footer, Input, Markdown, OptionList, Static, TextArea
 
 from sim2real.contracts import Assessment, AssessmentRecorded, Completeness, EventDraft, SchedulerState
 from sim2real.dashboard import short_id
 from sim2real.dispatch import JUDGE
 from sim2real.models import TextPart
 from sim2real.models.scripted import reply
-from sim2real.tui import FileScreen, NotebookScreen, Sim2RealApp
+from sim2real.tui import (
+    LOGO,
+    MENU_COMMANDS,
+    TAGLINE,
+    Composer,
+    FileScreen,
+    NotebookScreen,
+    PanelTop,
+    Sim2RealApp,
+)
 
 
 @pytest.fixture
@@ -269,7 +278,7 @@ def test_narrow_terminals_start_with_the_panel_hidden_and_a_summary_shown(system
         assert not app.query_one(DataTable).display
         summary = status(app).splitlines()[1]
         assert summary.startswith("1 hypothesis · jobs: none active · evidence: 2 VALIDATED")
-        await pilot.press("f8")
+        await send(pilot, "/panel")
         assert app.query_one(DataTable).display
         await send(pilot, "/panel")
         assert not app.query_one(DataTable).display
@@ -295,5 +304,117 @@ def test_the_chief_scientists_reviews_appear_as_its_messages(system):
         assert "Chief Scientist (review of the agents' reports) ›" in text
         assert "The agent has **not requested** any calculation yet." in [
             w.source for w in app.query_one("#chat").query(Markdown)]
+
+    drive(app, script)
+
+
+def test_the_panel_is_always_there_with_the_logo_across_its_top_border(system):
+    app = Sim2RealApp(system["chat"], refresh_seconds=3600, clock=lambda: NOW)
+
+    async def script(pilot):
+        await settle(pilot)
+        top = app.query_one(PanelTop)
+        above, border = top.render().plain.split("\n")
+        assert above == "   " + LOGO[0].plain
+        assert border.startswith("╭─ " + LOGO[1].plain + " ─") and border.endswith("─╮")
+        assert len(border) == top.size.width == app.size.width
+        assert str(app.query_one("#tagline", Static).content) == TAGLINE
+        assert str(app.query_one("#models", Static).content).startswith("Models: Chief Scientist "
+                                                                        "scripted-chief_scientist (scripted)")
+        assert str(app.query_one("#subagents", Static).content) == "No working sub-agents"
+        assert not app.query_one(DataTable).display  # no hypotheses yet: the panel stays, without a table
+
+    drive(app, script)
+
+
+def test_on_narrow_terminals_the_panel_stays_and_its_table_can_be_shown(system):
+    validated_run(system)
+    app = Sim2RealApp(system["chat"], refresh_seconds=3600, clock=lambda: NOW)
+
+    async def script(pilot):
+        await settle(pilot)
+        assert app.query_one("#panel").display and not app.query_one(DataTable).display
+        assert app.query_one(PanelTop).render().plain.split("\n")[1].endswith("╮")
+        await send(pilot, "/panel")
+        assert app.query_one(DataTable).display
+
+    drive(app, script, size=(80, 40))
+
+
+def test_a_slash_at_the_start_of_a_line_lists_the_matching_commands(system):
+    app = Sim2RealApp(system["chat"], refresh_seconds=3600, clock=lambda: NOW)
+
+    def shown() -> list[str]:
+        menu = app.query_one("#commands", OptionList)
+        if not app.menu_open:
+            return []
+        return [menu.get_option_at_index(i).prompt.plain.split("  ")[0] for i in range(menu.option_count)]
+
+    async def script(pilot):
+        await settle(pilot)
+        composer = app.query_one(Composer)
+        await pilot.press("slash", "e")
+        assert shown() == ["/exit"]
+        await pilot.press("x", "a")  # "/exa" matches nothing, so the menu goes
+        assert shown() == []
+        await pilot.press("backspace", "backspace", "backspace")
+        assert shown() == [c.usage for c in MENU_COMMANDS]
+        for line in ("hello /e", " /e", "e/"):  # only a line that starts with "/" gets suggestions
+            composer.value = line
+            await settle(pilot)
+            assert shown() == []
+
+        composer.value = "/a"
+        await settle(pilot)
+        assert shown() == ["/agents", "/approve agents", "/approve submit <calc>", "/approve inputs <calc>"]
+        await pilot.press("up")  # the arrows wrap around the menu
+        assert app.query_one("#commands", OptionList).highlighted == 3
+        await pilot.press("down", "down", "down", "tab")
+        assert composer.value == "/approve submit " and shown() == ["/approve submit <calc>"]
+        await pilot.press("escape")  # closed until the line changes
+        assert shown() == [] and app.focused is composer
+        await pilot.press("backspace")
+        assert shown() == ["/approve submit <calc>"]
+
+        # Enter completes a partial command; Enter on the complete command runs it.
+        composer.value = "/sta"
+        await settle(pilot)
+        await pilot.press("enter")
+        await settle(pilot)
+        assert composer.value == "/status" and "No investigation is open yet" not in conversation(app)
+        await pilot.press("enter")
+        await settle(pilot)
+        assert "No investigation is open yet" in conversation(app) and composer.value == "" and shown() == []
+
+        composer.value = "/ti"  # choosing with the mouse completes too
+        await settle(pilot)
+        app.query_one("#commands", OptionList).action_select()
+        await settle(pilot)
+        assert composer.value == "/timeline"
+
+        composer.value = ""  # with the menu closed, Tab leaves the input as before
+        await settle(pilot)
+        assert shown() == []
+        await pilot.press("tab")
+        assert app.focused is not composer
+
+    drive(app, script)
+
+
+def test_the_conversation_has_no_shortcut_keys(system):
+    validated_run(system)
+    app = Sim2RealApp(system["chat"], refresh_seconds=3600, clock=lambda: NOW)
+
+    async def script(pilot):
+        await settle(pilot)
+        main = app.screen
+        assert not main.query(Footer)
+        shown = app.query_one(DataTable).display
+        for key in ("f2", "f3", "f4", "f8", "ctrl+p"):  # commands are typed with "/" only
+            await pilot.press(key)
+            await settle(pilot)
+            assert app.screen is main and app.query_one(DataTable).display == shown
+        await send(pilot, "/notebook")
+        assert isinstance(app.screen, NotebookScreen)
 
     drive(app, script)

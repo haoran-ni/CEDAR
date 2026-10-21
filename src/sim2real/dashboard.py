@@ -9,7 +9,7 @@ progress.
 """
 
 from collections import Counter
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -18,6 +18,7 @@ from sim2real.contracts.examination import ExaminationVerdict
 from sim2real.contracts.plan import PermissionAction
 from sim2real.contracts.status import CalculationState, HypothesisStatus
 from sim2real.dispatch import Activity
+from sim2real.models.types import ModelSettings
 from sim2real.state.projection import (
     CalculationRecord,
     HypothesisRecord,
@@ -177,6 +178,53 @@ def dispatcher_status(heartbeat_age: float | None, activities: Sequence[Activity
             parts.append("the Chief Scientist's review")
         return f"dispatcher running {' and '.join(parts)}", False
     return f"dispatcher seen {age(heartbeat_age)} ago", False
+
+
+def subagent_status(state: InvestigationState | None, activities: Sequence[Activity], now: datetime) -> str:
+    """Which sub-agents (hypothesis agents and the Evidence Judge) are working on the investigation right now."""
+    mine = [a for a in activities if state is not None and a.investigation_id == state.investigation_id]
+    working = []
+    for activity in mine:
+        took = age((now - activity.started_at).total_seconds())
+        if activity.role == "hypothesis_agent":
+            agent = state.agents.get(activity.agent_id)
+            working.append(f"{agent.spec.role if agent else activity.agent_id} on {activity.hypothesis_id} ({took})")
+        elif activity.role == "evidence_judge":
+            working.append(f"Evidence Judge on {activity.hypothesis_id} ({took})")
+    text = f"Working sub-agents: {'; '.join(working)}" if working else "No working sub-agents"
+    if any(a.role == "chief_scientist" for a in mine):
+        text += " · the Chief Scientist is reviewing their reports"
+    return text
+
+
+MODEL_ROLES = (("chief_scientist", "Chief Scientist"), ("hypothesis_agent", "hypothesis agents"),
+               ("evidence_judge", "Evidence Judge"))
+
+
+def model_line(settings: Callable[[str], ModelSettings], state: InvestigationState | None) -> str:
+    """The model each agent role asks the provider for, and any other model that answered a role's latest run."""
+    configured = {}
+    for role, label in MODEL_ROLES:
+        try:
+            configured[label] = settings(role)
+        except KeyError:
+            continue
+    if not configured:
+        return "Model: none configured (sim2real models init)"
+
+    def name(s: ModelSettings) -> str:
+        return s.model + (f", effort {s.effort}" if s.effort else "")
+
+    if len({(s.provider, name(s)) for s in configured.values()}) == 1:
+        only = next(iter(configured.values()))
+        text = f"Model: {name(only)} ({only.provider})"
+    else:
+        text = "Models: " + " · ".join(f"{label} {name(s)} ({s.provider})" for label, s in configured.items())
+    for role, label in MODEL_ROLES:
+        runs = [r.run for r in state.agent_runs if r.role == role] if state is not None else []
+        if runs and any(m != runs[-1].requested_model for m in runs[-1].served_models):
+            text += f" · {label}: latest run answered by {', '.join(runs[-1].served_models)}"
+    return text
 
 
 def work_summary(state: InvestigationState) -> str:

@@ -51,6 +51,16 @@ class Protocol(ABC):
     @abstractmethod
     def code_version(self) -> str: ...
 
+    def describe(self) -> str:
+        """What an agent needs to know to request this protocol."""
+        lines = [f"Protocol {self.ref.name} {self.ref.version}",
+                 "Observables (request one exactly):"]
+        lines += [f"  - {o.name} [{o.unit}]: {o.definition}" for o in self.observables]
+        lines.append(f"Input files: {', '.join(self.input_files)} (structure file: {self.structure_file}; "
+                     f"job script: {', '.join(self.execution_files)}). Files you do not write are generated.")
+        lines.append(f"Outputs: {', '.join(self.output_files)}")
+        return "\n".join(lines)
+
     @abstractmethod
     def generate(
         self, task: ScientificTaskSpec, present: Mapping[str, bytes]

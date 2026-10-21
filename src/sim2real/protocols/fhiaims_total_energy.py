@@ -137,6 +137,27 @@ class FhiAimsTotalEnergy(Protocol):
         path = self._code.data_paths.get(SPECIES_ROLE)
         return Path(path) if path else None
 
+    def describe(self) -> str:
+        root = self._species_root
+        levels = sorted(d.name for d in root.iterdir() if d.is_dir()) if root and root.is_dir() else []
+        return "\n".join([
+            super().describe(),
+            f"Code: FHI-aims {self.code_version}",
+            "Variables are control.in keywords, named as in control.in, with their arguments as the value "
+            "(a string such as \"atomic_zora scalar\", a number, a list such as [4, 4, 1], true for a flag, "
+            "false for absent).",
+            f"  Physical (declare as intervention or control): {', '.join(sorted(PHYSICAL_KEYWORDS))}",
+            f"  Numerical (declare under numerical_settings): {', '.join(sorted(NUMERICAL_KEYWORDS))}, "
+            f"{SPECIES_DEFAULTS}",
+            f"  Convergence aids (may appear in control.in undeclared): {', '.join(sorted(CONVERGENCE_PATH_KEYWORDS))}",
+            f"  Forbidden: {', '.join(f'{k} ({v})' for k, v in FORBIDDEN_KEYWORDS.items())}",
+            f"Always declare: {', '.join(ALWAYS_DECLARED)}; and k_grid for a periodic structure.",
+            f"{SPECIES_DEFAULTS} levels available on this system: {', '.join(levels) or 'none found'}",
+            "If you write control.in yourself it must set exactly the declared physical and numerical keywords, "
+            "with species blocks copied unchanged from the declared level (changed blocks need user review). "
+            "Keywords the examiner does not know also need user review.",
+        ])
+
     # -- declared variables -----------------------------------------------------------
 
     def resolve(self, task: ScientificTaskSpec) -> tuple[dict[str, object], list[Finding]]:

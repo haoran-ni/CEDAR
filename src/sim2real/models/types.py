@@ -61,9 +61,15 @@ class ToolSpec(Contract):
 
 class Usage(Contract):
     input_tokens: int = 0
+    """Uncached input; cached input is counted separately below."""
     output_tokens: int = 0
     cache_read_tokens: int = 0
     cache_write_tokens: int = 0
+
+    @property
+    def total(self) -> int:
+        """Every token processed, cached or not."""
+        return self.input_tokens + self.output_tokens + self.cache_read_tokens + self.cache_write_tokens
 
 
 StopReason = Literal["end_turn", "tool_use", "max_tokens", "refusal", "other"]

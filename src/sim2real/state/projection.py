@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 
 from sim2real.contracts.base import ActorKind
 from sim2real.contracts.events import (
+    AgentRunRecorded,
     AssessmentRecorded,
     CalculationInputsExamined,
     CalculationLinked,
@@ -73,6 +74,7 @@ EVENT_ACTORS: dict[type, frozenset[ActorKind]] = {
     CalculationStateChanged: frozenset({_A.PROTOCOL_ENGINE, _A.JOB_MANAGER, _A.JOB_MONITOR, _A.VALIDATOR}),
     EvidenceRecorded: frozenset({_A.VALIDATOR, _A.HYPOTHESIS_AGENT, _A.USER}),
     AssessmentRecorded: frozenset({_A.EVIDENCE_JUDGE}),
+    AgentRunRecorded: frozenset({_A.CHIEF_SCIENTIST, _A.HYPOTHESIS_AGENT, _A.EVIDENCE_JUDGE}),
 }
 """Who may record each event type. Nobody but the computing services moves a calculation."""
 
@@ -184,6 +186,16 @@ class EvidenceRecord:
 
 
 @dataclass
+class AgentRunRecord:
+    session_id: str
+    role: str
+    actor_id: str
+    run: AgentRunRecorded
+    recorded_at: int
+    round: int
+
+
+@dataclass
 class InvestigationState:
     investigation_id: str
     spec: InvestigationSpec
@@ -198,10 +210,21 @@ class InvestigationState:
     predictions: dict[str, PredictionRecord] = field(default_factory=dict)
     calculations: dict[str, CalculationRecord] = field(default_factory=dict)
     evidence: dict[str, EvidenceRecord] = field(default_factory=dict)
+    agent_runs: list[AgentRunRecord] = field(default_factory=list)
 
     @property
     def plan(self) -> ResearchPlan:
         return self.plans[-1].plan
+
+    @property
+    def model_tokens_used(self) -> int:
+        return sum(r.run.input_tokens + r.run.output_tokens + r.run.cache_read_tokens + r.run.cache_write_tokens
+                   for r in self.agent_runs)
+
+    @property
+    def model_tokens_remaining(self) -> int | None:
+        budget = self.spec.constraints.model_token_budget
+        return None if budget is None else max(0, budget - self.model_tokens_used)
 
     @property
     def plan_version(self) -> int:
@@ -566,6 +589,10 @@ def _on_assessment(state: InvestigationState, event: RecordedEvent, p: Assessmen
     ))
 
 
+def _on_agent_run(state: InvestigationState, event: RecordedEvent, p: AgentRunRecorded) -> None:
+    state.agent_runs.append(AgentRunRecord(p.session_id, p.role, event.actor.id, p, event.stream_version, event.round))
+
+
 _HANDLERS = {
     InvestigationStatusChanged: _on_status_changed,
     ObservableAlignmentRecorded: _on_alignment,
@@ -581,6 +608,7 @@ _HANDLERS = {
     CalculationStateChanged: _on_calculation_state,
     EvidenceRecorded: _on_evidence,
     AssessmentRecorded: _on_assessment,
+    AgentRunRecorded: _on_agent_run,
 }
 
 __all__ = [

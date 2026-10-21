@@ -146,6 +146,26 @@ class CalculationStateChanged(Contract):
     """User intervention that authorizes this change, where one is required."""
 
 
+class AgentRunRecorded(Contract):
+    """One invocation of an agent: which model served it, what it used, how it ended."""
+
+    type: Literal["agent_run_recorded"] = "agent_run_recorded"
+    session_id: Identifier
+    role: Identifier
+    provider: NonEmptyStr
+    requested_model: NonEmptyStr
+    served_models: tuple[NonEmptyStr, ...] = ()
+    """Every model that answered; more than one means a fallback served part of the run."""
+    turns: int = Field(ge=0)
+    input_tokens: int = Field(ge=0)
+    output_tokens: int = Field(ge=0)
+    cache_read_tokens: int = Field(ge=0)
+    cache_write_tokens: int = Field(ge=0)
+    outcome: NonEmptyStr
+    report: str | None = None
+    """The agent's final message: its stated summary and justification, not hidden reasoning."""
+
+
 class EvidenceRecorded(Contract):
     type: Literal["evidence_recorded"] = "evidence_recorded"
     evidence_id: Identifier
@@ -177,7 +197,8 @@ EventPayload = Annotated[
     | CalculationInputsExamined
     | CalculationStateChanged
     | EvidenceRecorded
-    | AssessmentRecorded,
+    | AssessmentRecorded
+    | AgentRunRecorded,
     Field(discriminator="type"),
 ]
 

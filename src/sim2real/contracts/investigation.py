@@ -87,6 +87,8 @@ class InvestigationConstraints(Contract):
     external_retrieval: RetrievalPolicy = RetrievalPolicy.DISABLED
     submit_requires_approval: bool = True
     """Cancelling a submitted job always requires user authorization, independent of this."""
+    model_token_budget: int | None = Field(default=None, gt=0)
+    """Tokens the investigation's agents may process in total: input, cached input and output."""
 
 
 class InvestigationSpec(Contract):

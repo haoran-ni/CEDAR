@@ -12,6 +12,7 @@ from sim2real.contracts.base import (
     UncertaintyKind,
 )
 from sim2real.contracts.events import (
+    AgentRunRecorded,
     AssessmentRecorded,
     CalculationInputsExamined,
     CalculationLinked,
@@ -80,6 +81,7 @@ from sim2real.contracts.task import (
 )
 
 __all__ = [
+    "AgentRunRecorded",
     "Actor",
     "ActorKind",
     "AlignmentStatus",

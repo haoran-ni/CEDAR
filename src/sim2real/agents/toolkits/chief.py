@@ -262,7 +262,14 @@ def chief_tools(ctx: ChiefContext) -> list[AgentTool]:
         return investigation_summary(ctx.ledger.load(current()))
 
     def set_investigation_status(args: InvestigationStatusArgs) -> str:
-        record(InvestigationStatusChanged(status=InvestigationStatus(args.status), reason=args.reason))
+        state = ctx.ledger.load(current())
+        change = InvestigationStatusChanged(status=InvestigationStatus(args.status), reason=args.reason)
+        # Each stretch of investigating, after planning or after a review, is a new round.
+        if change.status is InvestigationStatus.INVESTIGATING and state.status in (InvestigationStatus.PLANNING,
+                                                                                  InvestigationStatus.REVIEWING):
+            record(RoundStarted(round=state.round + 1, reason=args.reason), change)
+            return f"Investigation is now {args.status}; round {state.round + 1} started."
+        record(change)
         return f"Investigation is now {args.status}."
 
     def record_alignment(args: AlignmentArgs) -> str:
@@ -364,7 +371,9 @@ def chief_tools(ctx: ChiefContext) -> list[AgentTool]:
                   "with the reason.", HypothesisStatusArgs, set_hypothesis_status),
         AgentTool("revise_plan", "Record a new plan version: priorities, objective or notes. Cite the researcher's "
                   "message when it asked for the change.", PlanArgs, revise_plan),
-        AgentTool("start_round", "Start a new investigation round.", ReasonArgs, start_round),
+        AgentTool("start_round", "Start a new round of tests without a review in between. A round also starts by "
+                  "itself whenever the investigation moves into INVESTIGATING. Each round gets its own page in the "
+                  "research notebook.", ReasonArgs, start_round),
         AgentTool("delegate", "Queue work for the hypothesis agent of an ACTIVE or PLANNING_TEST hypothesis.",
                   TaskArgs, lambda a: queue("hypothesis_agent", a)),
         AgentTool("request_judgement", "Queue an assessment of a hypothesis by the Evidence Judge.", TaskArgs,

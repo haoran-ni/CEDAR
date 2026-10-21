@@ -30,12 +30,12 @@ The project is being designed as a **general-purpose investigation framework**, 
 - Researcher-authorized jobs run under Slurm.
 - Agents read the outputs, and their cited readings are verified before they become evidence.
 - The Evidence Judge assesses hypotheses.
+- A research notebook in Markdown, generated from the event log, records each round: what was hypothesized and why, predicted, tested and observed, what changed, what remains unknown and what is next.
 
 The full path passes automated tests that use stand-ins for the models and the scheduler. On one Slurm cluster, with FHI-aims and Claude models, each step except the Evidence Judge has also run for real, though not yet together in one uninterrupted investigation.
 
 Not yet built:
 - the terminal dashboard
-- readable round reports
 - protocols beyond FHI-aims total energies
 - schedulers other than Slurm
 - model providers other than Anthropic
@@ -58,8 +58,9 @@ sim2real profile show mycluster
 sim2real profile approve mycluster      # nothing runs on the cluster until you approve a profile
 sim2real dispatch                       # keep running (e.g. in tmux): submits what you authorize, runs agents
 sim2real start                          # talk with the Chief Scientist; /help lists commands
+sim2real report                         # write the research notebook (the dispatcher also keeps it current)
 ```
 
-Calculations are submitted only after you type `/approve submit <calculation>` in the chat.
+Calculations are submitted only after you type `/approve submit <calculation>` in the chat. Each investigation's notebook is in the data directory, by default `~/.local/share/sim2real/notebooks/<investigation>/index.md`.
 
 For detailed implementation guidance, start with [`AGENTS.md`](AGENTS.md). Design documents and the record of decisions are in [`docs/`](docs/).

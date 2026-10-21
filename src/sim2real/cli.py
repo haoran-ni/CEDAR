@@ -239,7 +239,7 @@ def _workspace():
 
 
 def _start(args) -> int:
-    from sim2real.chat import HELP, ChatSession
+    from sim2real.chat import ChatSession
     from sim2real.dispatch import heartbeat_age
 
     workspace = _workspace()
@@ -282,6 +282,20 @@ def _investigations(args) -> int:
         state = workspace.ledger.load(investigation_id)
         print(f"{investigation_id}: {state.status.value}; {len(state.hypotheses)} hypotheses, "
               f"{len(state.calculations)} calculations; {state.spec.title}")
+    return 0
+
+
+def _report(args) -> int:
+    from sim2real.notebook import update_notebook
+
+    workspace = _workspace()
+    ids = workspace.store.investigation_ids()
+    if args.investigation and args.investigation not in ids:
+        print(f"No investigation {args.investigation}. See `sim2real investigations`.", file=sys.stderr)
+        return 1
+    for investigation_id in [args.investigation] if args.investigation else ids:
+        update = update_notebook(workspace, investigation_id)
+        print(f"{investigation_id}: {update.index} ({update.summary})")
     return 0
 
 
@@ -351,9 +365,12 @@ def main(argv: list[str] | None = None) -> int:
     start.add_argument("investigation", nargs="?", help="an existing investigation to continue")
     start.set_defaults(handler=_start)
     commands.add_parser("investigations", help="list investigations").set_defaults(handler=_investigations)
+    report = commands.add_parser("report", help="write the research notebook (Markdown) from the event log")
+    report.add_argument("investigation", nargs="?", help="one investigation (default: all)")
+    report.set_defaults(handler=_report)
     dispatch = commands.add_parser("dispatch", help="submit authorized work, follow jobs and run queued agents")
-    dispatch.add_argument("--once", action="store_true", help="do one round of work and exit")
-    dispatch.add_argument("--interval", type=float, default=60.0, help="seconds between rounds (default 60)")
+    dispatch.add_argument("--once", action="store_true", help="do one pass over all investigations and exit")
+    dispatch.add_argument("--interval", type=float, default=60.0, help="seconds between passes (default 60)")
     dispatch.set_defaults(handler=_dispatch)
 
     args = parser.parse_args(argv)

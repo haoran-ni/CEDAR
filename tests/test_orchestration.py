@@ -195,6 +195,13 @@ def test_full_loop(system):
     assert "Prediction pred-1" in dossier_view and "check citations_verified: passed" in dossier_view
     assert replay(workspace.store.read_stream(INV)) == state
 
+    # The dispatcher keeps the research notebook in step with the record.
+    notebook = workspace.notebook_dir(INV)
+    index = (notebook / "index.md").read_text()
+    assert f"| {calc} |" in index and f"| COMPLETED | {evidence.evidence_id}: VALIDATED, {ENERGY!r} eV |" in index
+    assert "NOT_TESTED → **INCONCLUSIVE** (partial)" in (notebook / "round-01.md").read_text()
+    assert chat.handle("/report").startswith(f"Research notebook (already up to date): {notebook / 'index.md'}")
+
 
 def test_commands_need_an_open_investigation_and_known_calculations(system):
     chat = system["chat"]
@@ -332,3 +339,7 @@ def test_cli_start_and_dispatch(system, monkeypatch, capsys, tmp_path):
     out = capsys.readouterr().out
     assert "Requested the PBE baseline" in out and "/approve submit calc_" in out
     assert cli.main(["start", "no-such-investigation"]) == 1
+
+    assert cli.main(["report"]) == 0
+    assert f"{INV}: {system['workspace'].notebook_dir(INV) / 'index.md'}" in capsys.readouterr().out
+    assert cli.main(["report", "no-such-investigation"]) == 1

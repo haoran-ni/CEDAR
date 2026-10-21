@@ -7,6 +7,9 @@ Each tick, for every open investigation:
 4. run queued agent tasks, within the investigation's token budget;
 5. record evidence, from the protocol's own reading, for finished runs no agent reported on.
 
+It then regenerates the research notebook of every investigation whose log grew, closed
+ones included.
+
 Only one dispatcher works on a data directory at a time (a lock file), and each tick
 leaves a heartbeat so the chat can warn when no dispatcher is running.
 """
@@ -29,6 +32,7 @@ from sim2real.engine.jobs import InputsChanged
 from sim2real.errors import RuleViolation
 from sim2real.hpc.profile import ProfileNotApproved, ProfileStore
 from sim2real.hpc.slurm import SchedulerBackend, SchedulerError
+from sim2real.notebook import update_notebook
 from sim2real.state.projection import AgentTaskRecord, authorization_for
 from sim2real.summaries import calculation_summary
 from sim2real.workspace import ModelClients, Services, Workspace, profile_for, services_for
@@ -56,6 +60,7 @@ class Dispatcher:
         self.deny = list(deny)
         self.limits = limits
         self.clock = clock
+        self._notebook_versions: dict[str, int] = {}
 
     def tick(self) -> list[str]:
         lock_path = self.workspace.root / "dispatcher.lock"
@@ -68,6 +73,7 @@ class Dispatcher:
                 notes = []
                 for investigation_id in self.workspace.store.investigation_ids():
                     notes += self._advance(investigation_id)
+                    notes += self._refresh_notebook(investigation_id)
                 (self.workspace.root / HEARTBEAT).write_text(self.clock().isoformat())
                 return notes
             finally:
@@ -165,6 +171,17 @@ class Dispatcher:
             outcome = self.run_task(investigation_id, task, services, limits)
             notes.append(f"{task.role} ran {task.task_id} for {task.hypothesis_id}: {outcome}")
         return notes
+
+    def _refresh_notebook(self, investigation_id: str) -> list[str]:
+        version = self.workspace.store.current_version(investigation_id)
+        if self._notebook_versions.get(investigation_id) == version:
+            return []
+        try:
+            update_notebook(self.workspace, investigation_id)
+        except Exception as exc:  # the notebook is a view of the log; never let it stop submissions and polling
+            return [f"{investigation_id}: could not update the research notebook: {exc!r}"]
+        self._notebook_versions[investigation_id] = version
+        return []
 
     def run_task(self, investigation_id: str, task: AgentTaskRecord, services: Services, limits: RunLimits) -> str:
         role = task.role

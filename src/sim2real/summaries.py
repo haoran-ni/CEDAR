@@ -33,19 +33,24 @@ def calculation_summary(state: InvestigationState, calc: CalculationRecord, *, f
     return "\n".join(lines)
 
 
-def pending_approvals(state: InvestigationState) -> list[str]:
-    """What waits for the researcher, with the command that grants it."""
+def approval_requests(state: InvestigationState) -> list[tuple[str, str]]:
+    """What waits for the researcher: the command that grants it, and what it concerns."""
     needs = []
     for calc in state.calculations.values():
         if (calc.state is CalculationState.SPECIFIED and calc.examination is not None
                 and calc.examination.verdict is ExaminationVerdict.NEEDS_REVIEW
                 and authorization_for(state, PermissionAction.APPROVE_INPUTS, calc.calculation_id) is None):
             reasons = "; ".join(f.message for f in calc.examination.findings if f.severity is FindingSeverity.REVIEW)
-            needs.append(f"/approve inputs {calc.calculation_id}  (needs review: {reasons})")
+            needs.append((f"/approve inputs {calc.calculation_id}", f"needs review: {reasons}"))
         if (calc.state is CalculationState.VALIDATED_INPUT and state.spec.constraints.submit_requires_approval
                 and authorization_for(state, PermissionAction.SUBMIT, calc.calculation_id) is None):
-            needs.append(f"/approve submit {calc.calculation_id}  ({calc.task.system_label}: {calc.task.estimand})")
+            needs.append((f"/approve submit {calc.calculation_id}", f"{calc.task.system_label}: {calc.task.estimand}"))
     return needs
+
+
+def pending_approvals(state: InvestigationState) -> list[str]:
+    """What waits for the researcher, with the command that grants it."""
+    return [f"{command}  ({note})" for command, note in approval_requests(state)]
 
 
 def investigation_summary(state: InvestigationState) -> str:

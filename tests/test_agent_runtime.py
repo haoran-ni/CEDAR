@@ -124,6 +124,11 @@ def test_tool_output_is_redacted(transcripts):
     assert KEY not in outcome.content
 
 
+def test_final_report_is_redacted_before_it_is_recorded(transcripts):
+    result, _ = run(transcripts, [reply(TextPart(text=f"Done; the key was {KEY}."))], secrets=[KEY])
+    assert result.final_text.startswith("Done; the key was ") and KEY not in result.final_text
+
+
 def test_waiting_tool_ends_the_run(transcripts):
     log = []
     result, model = run(transcripts, [reply(TextPart(text="Waiting for jobs."), call("wait", text="x"))], log)

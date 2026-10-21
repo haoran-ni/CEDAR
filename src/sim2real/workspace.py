@@ -33,6 +33,10 @@ class Workspace:
         return cls(root, store, ResearchLedger(store), ArtifactStore(root / "artifacts"),
                    TranscriptStore(root / "transcripts"))
 
+    def notebook_dir(self, investigation_id: str) -> Path:
+        """Where the investigation's research notebook (generated Markdown) lives."""
+        return self.root / "notebooks" / investigation_id
+
 
 @dataclass
 class Services:

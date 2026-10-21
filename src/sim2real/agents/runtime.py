@@ -101,7 +101,7 @@ class AgentRunner:
                         ToolResult(call_id=c.id, content=f"Not run: {result.error}.", is_error=True) for c in calls)))
                 return result
             if not calls:
-                result.final_text = reply.message.text
+                result.final_text = redact(reply.message.text, self._secrets)
                 return result
 
             results, end_run = [], False
@@ -117,7 +117,7 @@ class AgentRunner:
             self._append(session_id, history, Message(role="user", parts=tuple(results)))
             if end_run:
                 result.outcome = "waiting"
-                result.final_text = reply.message.text
+                result.final_text = redact(reply.message.text, self._secrets)
                 return result
 
     def _append(self, session_id: str, history: list[Message], message: Message) -> None:

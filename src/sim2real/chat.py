@@ -21,6 +21,7 @@ from sim2real.contracts.plan import Authorization, PermissionAction
 from sim2real.errors import RuleViolation
 from sim2real.hpc.profile import ProfileStore
 from sim2real.hpc.slurm import SchedulerBackend
+from sim2real.notebook import update_notebook
 from sim2real.summaries import investigation_summary, pending_approvals
 from sim2real.workspace import ModelClients, Workspace, profile_for, registry_for, services_for
 
@@ -31,6 +32,7 @@ HELP = """Commands:
   /approve submit <calc>       allow a calculation with approved inputs to be submitted
   /approve inputs <calc>       allow inputs the examiner could not verify
   /cancel <calc> <reason>      cancel a calculation, stopping its job if it has one
+  /report                      update the research notebook and show where it is
   /help                        this list
   /quit                        leave (queued work and jobs continue with the dispatcher)
 Anything else goes to the Chief Scientist."""
@@ -89,6 +91,10 @@ class ChatSession:
             return investigation_summary(state)
         if name == "/pending":
             return "\n".join(pending_approvals(state)) or "Nothing waits for your approval."
+        if name == "/report":
+            update = update_notebook(self.workspace, self.investigation_id)
+            return (f"Research notebook ({update.summary}): {update.index}\n"
+                    f"This round: {update.directory / f'round-{state.round:02d}.md'}")
         if name == "/approve" and len(args) == 2 and args[0] in ("submit", "inputs"):
             action = PermissionAction.SUBMIT if args[0] == "submit" else PermissionAction.APPROVE_INPUTS
             return self._authorize(action, args[1], line)

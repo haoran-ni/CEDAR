@@ -142,7 +142,6 @@ class OpenArgs(Contract):
     simulated_observable: ObservableArg
     measured_observable: ObservableArg
     compute_profile: Identifier | None = Field(default=None, description="An approved compute profile.")
-    model_token_budget: int | None = Field(default=None, gt=0, description="Total tokens agents may process.")
 
 
 class InvestigationStatusArgs(Contract):
@@ -301,8 +300,7 @@ def chief_tools(ctx: ChiefContext) -> list[AgentTool]:
             experiments=experiments,
             alignment=ObservableAlignment(simulated=observable(args.simulated_observable),
                                           measured=observable(args.measured_observable)),
-            constraints=InvestigationConstraints(compute_profile=args.compute_profile,
-                                                 model_token_budget=args.model_token_budget),
+            constraints=InvestigationConstraints(compute_profile=args.compute_profile),
         )
         ctx.ledger.record(args.investigation_id, [EventDraft(
             actor=ctx.actor, payload=InvestigationCreated(spec=spec, plan=ResearchPlan(objective=args.objective)),

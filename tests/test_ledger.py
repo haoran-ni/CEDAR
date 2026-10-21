@@ -59,6 +59,7 @@ from sim2real.contracts import (
     QualityCheck,
     RoundStarted,
     SchedulerState,
+    TokenBudgetChanged,
     UserInterventionRecorded,
 )
 from sim2real.errors import InvalidTransition, RuleViolation
@@ -626,3 +627,18 @@ class TestAnalyses:
         with pytest.raises(RuleViolation, match="failed checks"):
             ledger.record(inv, [draft(VALIDATOR, EvidenceRecorded(evidence_id="ev-x",
                                                                   evidence=analysis_evidence("an-1", calc)))])
+
+
+def test_only_the_researcher_sets_the_token_budget(ledger):
+    start_investigation(ledger, "inv-1", model_token_budget=500)
+    assert ledger.load("inv-1").model_token_budget == 500  # as it was opened
+    ledger.record("inv-1", [draft(USER, UserInterventionRecorded(intervention_id="msg-1", text="/budget 2M"))])
+    raised = TokenBudgetChanged(max_tokens=2_000_000, intervention_id="msg-1")
+    with pytest.raises(RuleViolation, match="may not record"):
+        ledger.record("inv-1", [draft(CHIEF, raised)])
+    with pytest.raises(RuleViolation, match="cites their recorded command"):
+        ledger.record("inv-1", [draft(USER, raised.model_copy(update={"intervention_id": "msg-7"}))])
+    ledger.record("inv-1", [draft(USER, raised)])
+    assert ledger.load("inv-1").model_tokens_remaining == 2_000_000
+    ledger.record("inv-1", [draft(USER, TokenBudgetChanged(intervention_id="msg-1"))])
+    assert (ledger.load("inv-1").model_token_budget, ledger.load("inv-1").model_tokens_remaining) == (None, None)

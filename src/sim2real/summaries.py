@@ -162,6 +162,6 @@ def investigation_summary(state: InvestigationState) -> str:
     if approvals:
         lines.append("Waiting for the researcher:")
         lines += [f"  {a}" for a in approvals]
-    budget = spec.constraints.model_token_budget
+    budget = state.model_token_budget
     lines.append(f"Model tokens used: {state.model_tokens_used}" + (f" of {budget}" if budget else ""))
     return "\n".join(lines)

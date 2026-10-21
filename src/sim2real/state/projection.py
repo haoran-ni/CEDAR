@@ -46,6 +46,7 @@ from sim2real.contracts.events import (
     RetrievalPolicyChanged,
     RoundStarted,
     RunChecked,
+    TokenBudgetChanged,
     UserInterventionRecorded,
 )
 from sim2real.contracts.evidence import EvidenceKind, EvidenceObject
@@ -86,6 +87,7 @@ EVENT_ACTORS: dict[type, frozenset[ActorKind]] = {
     NextActionsRecommended: frozenset({_A.CHIEF_SCIENTIST}),
     ModeChanged: frozenset({_A.USER, _A.SYSTEM}),
     RetrievalPolicyChanged: frozenset({_A.USER}),
+    TokenBudgetChanged: frozenset({_A.USER}),
     MaterialAttached: frozenset({_A.USER}),
     ApproverDecision: frozenset({_A.APPROVER}),
     ObservableAlignmentRecorded: frozenset({_A.USER, _A.CHIEF_SCIENTIST}),
@@ -297,6 +299,15 @@ class RetrievalRecord:
 
 
 @dataclass(frozen=True)
+class BudgetRecord:
+    """The researcher's setting of the investigation's total token budget; None for no limit."""
+
+    max_tokens: int | None
+    intervention_id: str
+    recorded_at: int
+
+
+@dataclass(frozen=True)
 class MaterialRecord:
     """A file the researcher attached for the agents to view."""
 
@@ -407,6 +418,7 @@ class InvestigationState:
     modes: list[ModeRecord] = field(default_factory=list)
     approvals: dict[str, ApprovalRecord] = field(default_factory=dict)
     retrieval_changes: list[RetrievalRecord] = field(default_factory=list)
+    budget_changes: list[BudgetRecord] = field(default_factory=list)
     materials: dict[str, MaterialRecord] = field(default_factory=dict)
 
     @property
@@ -476,8 +488,15 @@ class InvestigationState:
         return sum(_run_tokens(r.run) for r in self.agent_runs)
 
     @property
+    def model_token_budget(self) -> int | None:
+        """The total the researcher set with /budget, else the one the investigation opened with; None for none."""
+        if self.budget_changes:
+            return self.budget_changes[-1].max_tokens
+        return self.spec.constraints.model_token_budget
+
+    @property
     def model_tokens_remaining(self) -> int | None:
-        budget = self.spec.constraints.model_token_budget
+        budget = self.model_token_budget
         return None if budget is None else max(0, budget - self.model_tokens_used)
 
     @property
@@ -705,6 +724,13 @@ def _on_retrieval_policy(state: InvestigationState, event: RecordedEvent, p: Ret
         raise RuleViolation("the researcher's setting of web access cites their recorded command")
     state.retrieval_changes.append(RetrievalRecord(p.policy, p.allowed_domains, p.intervention_id,
                                                    event.stream_version))
+
+
+def _on_token_budget(state: InvestigationState, event: RecordedEvent, p: TokenBudgetChanged) -> None:
+    _require_open(state)
+    if p.intervention_id not in state.interventions:
+        raise RuleViolation("the researcher's token budget cites their recorded command")
+    state.budget_changes.append(BudgetRecord(p.max_tokens, p.intervention_id, event.stream_version))
 
 
 def _on_material(state: InvestigationState, event: RecordedEvent, p: MaterialAttached) -> None:
@@ -1221,6 +1247,7 @@ _HANDLERS = {
     ClosingProposed: _on_closing_proposed,
     ModeChanged: _on_mode_changed,
     RetrievalPolicyChanged: _on_retrieval_policy,
+    TokenBudgetChanged: _on_token_budget,
     MaterialAttached: _on_material,
     ApproverDecision: _on_approver_decision,
     NextActionsRecommended: _on_next_actions,
@@ -1249,7 +1276,7 @@ _HANDLERS = {
 
 __all__ = [
     "AgentRecord", "AnalysisRecord", "AssessmentEntry", "CalculationRecord", "ClosingRecord", "EvidenceRecord", "HypothesisRecord", "InterventionRecord",
-    "InvestigationState", "ApprovalRecord", "MaterialRecord", "ModeRecord", "PlanRecord", "RetrievalRecord", "PredictionRecord", "ProposalRecord",
+    "InvestigationState", "ApprovalRecord", "BudgetRecord", "MaterialRecord", "ModeRecord", "PlanRecord", "RetrievalRecord", "PredictionRecord", "ProposalRecord",
     "ProposalStatus", "RecommendationRecord", "agent_id_for", "apply",
     "authorization_for", "calculation_with_inputs", "evidence_owner", "hypothesis_evidence", "replay",
     "reusable_calculation", "review_deadline",

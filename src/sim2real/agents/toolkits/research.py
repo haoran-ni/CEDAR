@@ -235,7 +235,7 @@ def research_tools(ctx: ResearchContext) -> list[AgentTool]:
                          f"{p.falsified_if}.")
         for cid in hyp.calculation_ids:
             lines.append(_calculation_summary(ctx, state.calculations[cid], state))
-        if state.spec.constraints.model_token_budget is not None:
+        if state.model_token_budget is not None:
             lines.append(f"Model tokens remaining for this investigation: {state.model_tokens_remaining}")
         return "\n".join(lines)
 

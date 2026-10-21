@@ -19,17 +19,20 @@ Commands may run while the Chief Scientist is still working on an earlier messag
 terminal interface does this); every record they make is built from the state at the
 moment it is written.
 
-``/web`` sets whether the agents may use the web, and ``/attach`` gives them a file to view.
-Both work before the investigation exists: what they set is recorded, with the researcher's
-command, the moment it opens, and the Chief Scientist works under it meanwhile.
+``/web`` sets whether the agents may use the web, ``/attach`` gives them a file to view, and
+``/budget`` sets the investigation's total token budget, which also limits the Chief
+Scientist's answers here. All three work before the investigation exists: what they set is
+recorded, with the researcher's command, the moment it opens, and the Chief Scientist works
+under it meanwhile.
 """
 
 import getpass
 import mimetypes
+import re
 import shlex
 import time
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -49,6 +52,7 @@ from sim2real.contracts.events import (
     MaterialAttached,
     ModeChanged,
     RetrievalPolicyChanged,
+    TokenBudgetChanged,
     UserInterventionRecorded,
 )
 from sim2real.contracts.investigation import RetrievalPolicy
@@ -105,6 +109,9 @@ COMMANDS = (
     Command("/mode human-in-the-loop", "take your decisions back: agent proposals and submissions wait for you"),
     Command("/mode full-automation <core-hours> <tokens>", "while you are away, an approver decides on agents and "
             "submissions and the Evidence Judge assesses new evidence, within these limits"),
+    Command("/budget", "show the investigation's total token budget and what is used"),
+    Command("/budget <tokens>", "limit the tokens all its agents may process in total, e.g. 5M or 800k"),
+    Command("/budget off", "no total limit (the default)"),
     Command("/web", "show whether the agents may use the web"),
     Command("/web on", "let the Chief Scientist and the hypothesis agents search and read the web"),
     Command("/web only <domains>", "the same, limited to these domains, e.g. arxiv.org doi.org"),
@@ -163,11 +170,12 @@ class ChatSession:
     investigation_id: str | None = None
     user: Actor = field(default_factory=lambda: Actor(kind=ActorKind.USER, id=getpass.getuser()))
     backend: SchedulerBackend | None = None
-    limits: RunLimits = field(default_factory=lambda: RunLimits(max_turns=30, max_tokens=600_000))
+    limits: RunLimits = field(default_factory=lambda: RunLimits(max_turns=30))
+    """For each answer of the Chief Scientist; what the token budget has left also caps it."""
     clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc)
     _unrecorded: list[tuple] = field(default_factory=list)
     """What the researcher said and set before the investigation existed, in order: ("message", text),
-    ("web", line, policy, domains) and ("attach", line, Material)."""
+    ("web", line, policy, domains), ("attach", line, Material) and ("budget", line, max_tokens)."""
     _announced_materials: set[str] = field(default_factory=set)
     _unrecorded_runs: list[RunResult] = field(default_factory=list)
     _seen_runs: int = 0
@@ -232,6 +240,8 @@ class ChatSession:
         name, args = words[0], words[1:]
         if name == "/help":
             return HELP
+        if name == "/budget":
+            return self._budget(args, line)
         if name == "/web":
             return self._web(args, line)
         if name == "/attach":
@@ -360,6 +370,68 @@ class ChatSession:
                 f"{limits['max_tokens']:,} tokens from now. When the tokens are used up, the investigation switches "
                 "back to human-in-the-loop and pauses. /approve inputs, /approve close, /cancel and /halt stay yours; "
                 "/mode human-in-the-loop takes everything back.")
+
+    # -- the token budget ---------------------------------------------------------------------
+
+    def _tokens(self) -> tuple[int, int | None]:
+        """Tokens used and the total budget, None for none; before the investigation exists, the Chief
+        Scientist's answers so far and the researcher's latest /budget."""
+        if self.investigation_id is not None:
+            state = self.workspace.ledger.load(self.investigation_id)
+            return state.model_tokens_used, state.model_token_budget
+        budgets = [entry[2] for entry in self._unrecorded if entry[0] == "budget"]
+        return sum(r.usage.total for r in self._unrecorded_runs), budgets[-1] if budgets else None
+
+    def _tokens_left(self) -> int | None:
+        used, budget = self._tokens()
+        return None if budget is None else max(0, budget - used)
+
+    @staticmethod
+    def _token_count(text: str) -> int | None:
+        match = re.fullmatch(r"(\d+(?:\.\d+)?)([kKmM]?)", text.replace(",", "").replace("_", ""))
+        if match is None:
+            return None
+        count = float(match.group(1)) * {"": 1, "k": 1e3, "m": 1e6}[match.group(2).lower()]
+        return int(count) if count >= 1 else None
+
+    def _budget(self, args: list[str], line: str) -> str:
+        usage = "Usage: /budget, /budget <tokens> (e.g. 5M, 800k or 2,000,000), or /budget off"
+        used, budget = self._tokens()
+        if not args:
+            if budget is None:
+                return f"No token budget: agents may process any number of tokens. {used:,} used so far.\n{usage}"
+            return f"Token budget: {used:,} of {budget:,} used, {max(0, budget - used):,} left.\n{usage}"
+        if len(args) != 1:
+            return usage
+        if args[0].lower() == "off":
+            max_tokens = None
+        else:
+            max_tokens = self._token_count(args[0])
+            if max_tokens is None:
+                return usage
+        if self.investigation_id is None:
+            self._unrecorded.append(("budget", line, max_tokens))
+            recorded = "it is recorded when the investigation opens"
+        else:
+            try:
+                recorded = self._record_budget(line, max_tokens)
+            except RuleViolation as exc:
+                return f"The budget could not be changed: {exc}"
+        if max_tokens is None:
+            return f"No token budget from now on ({recorded}). {used:,} tokens used so far."
+        if used >= max_tokens:
+            return (f"Token budget {max_tokens:,} ({recorded}): {used:,} are already used, so no agent works and the "
+                    "Chief Scientist does not answer until you raise it.")
+        return (f"Token budget {max_tokens:,} ({recorded}): {used:,} used, {max_tokens - used:,} left for all agents "
+                "together, the Chief Scientist's answers included. Every token counts, cached input too.")
+
+    def _record_budget(self, line: str, max_tokens: int | None) -> str:
+        def build(state: InvestigationState) -> list[EventDraft]:
+            message = self._message_draft(state, line, ())
+            return [message, EventDraft(actor=self.user, payload=TokenBudgetChanged(
+                max_tokens=max_tokens, intervention_id=message.payload.intervention_id))]
+
+        return self.workspace.ledger.record_with(self.investigation_id, build).events[0].payload.intervention_id
 
     # -- the agents' web access and materials --------------------------------------------------
 
@@ -567,6 +639,13 @@ class ChatSession:
     # -- the Chief Scientist ------------------------------------------------------------------
 
     def _ask_chief(self, text: str, observer: Callable[[ToolCall, ToolOutcome], None] | None = None) -> str:
+        left = self._tokens_left()
+        if left == 0:
+            return ("Not sent: the investigation's token budget is used up. Raise it with /budget <tokens>, or remove "
+                    "it with /budget off.")
+        limits = self.limits
+        if left is not None:
+            limits = replace(limits, max_tokens=left if limits.max_tokens is None else min(left, limits.max_tokens))
         attached = self._newly_attached()
         if self.investigation_id is not None:
             message_id = self._record_message(text)
@@ -584,7 +663,7 @@ class ChatSession:
                              secrets=self.clients.secrets())
         tools = chief_tools(context) + material_tools(self._materials, self.workspace.artifacts)
         result = runner.run(self.chief_session, system=CHIEF_SCIENTIST, tools=tools, instruction=instruction,
-                            limits=self.limits, observer=observer,
+                            limits=limits, observer=observer,
                             web=web_access(self.web_setting(), "chief_scientist"))
         if self.investigation_id is None:
             self._unrecorded_runs.append(result)
@@ -632,6 +711,8 @@ class ChatSession:
                 recorded.append(self._record_message(entry[0]))
             elif kind == "web":
                 self._record_web(*entry)
+            elif kind == "budget":
+                self._record_budget(*entry)
             else:
                 line, material = entry
                 self._record_material(line, material.name, material.artifact, material.note)

@@ -54,6 +54,7 @@ from sim2real.contracts.events import (
     RecordedEvent,
     RetrievalPolicyChanged,
     RoundStarted,
+    TokenBudgetChanged,
     RunChecked,
     UserInterventionRecorded,
 )
@@ -388,6 +389,10 @@ def _web_change(p: RetrievalPolicyChanged) -> str:
     return f"Web access for the Chief Scientist and the hypothesis agents set {setting}"
 
 
+def _budget_change(max_tokens: int | None) -> str:
+    return "Token budget removed" if max_tokens is None else f"Token budget set to {max_tokens:,}"
+
+
 def _tokens(p: AgentRunRecorded) -> int:
     return p.input_tokens + p.output_tokens + p.cache_read_tokens + p.cache_write_tokens
 
@@ -489,6 +494,8 @@ def _why(rnd: _Round, state: InvestigationState) -> list[str]:
             lines.append(f"- {_mode_change(p)}, by {who}: {_said(p.reason)}")
         elif isinstance(p, RetrievalPolicyChanged):
             lines.append(f"- {_web_change(p)} by {who} ({p.intervention_id})")
+        elif isinstance(p, TokenBudgetChanged):
+            lines.append(f"- {_budget_change(p.max_tokens)} by {who} ({p.intervention_id})")
         elif isinstance(p, MaterialAttached):
             note = f": {_said(p.note)}" if p.note else ""
             lines.append(f"- {who} attached {p.material_id}, {ROOT.artifact(p.artifact, _flat(p.name))} "
@@ -835,8 +842,10 @@ def _index_page(state: InvestigationState, events: Sequence[RecordedEvent], roun
     model_usage = [f"- {role.replace('_', ' ')}: {runs[role]} run{'s' if runs[role] > 1 else ''}, {usage[role]:,} tokens"
                    + (f", {searches[role]} web searches, {fetches[role]} pages fetched"
                       if searches[role] or fetches[role] else "") for role in runs]
-    budget = spec.constraints.model_token_budget
+    budget = state.model_token_budget
     model_usage.append(f"- Total: {state.model_tokens_used:,} tokens" + (f" of a {budget:,} budget" if budget else ""))
+    model_usage += [f"- {_budget_change(b.max_tokens)} by the researcher's {b.intervention_id} (event #{b.recorded_at})"
+                    for b in state.budget_changes]
 
     agents = ["Each hypothesis has at most one agent at a time; agents see only their own hypothesis's work.", "",
               "| Agent | Hypothesis | Role | Started | Status | Runs | Tokens |", "|---|---|---|---|---|---|---|"]
@@ -949,6 +958,8 @@ def _describe(event: RecordedEvent) -> str:
             return f"{_mode_change(p)}: {_said(p.reason)}"
         case RetrievalPolicyChanged():
             return f"{_web_change(p)} ({p.intervention_id})"
+        case TokenBudgetChanged():
+            return f"{_budget_change(p.max_tokens)} ({p.intervention_id})"
         case MaterialAttached():
             return f"{p.material_id} attached ({p.intervention_id}): {_said(p.name)}"
         case ApproverDecision():

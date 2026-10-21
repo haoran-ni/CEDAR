@@ -26,6 +26,7 @@ from sim2real.hpc import ProfileStore
 from sim2real.hpc.fake import FakeScheduler
 from sim2real.models import ModelSettings, TextPart, ToolCall
 from sim2real.models.scripted import ScriptedModel, reply
+from sim2real.notebook import render_notebook
 from sim2real.state import replay
 from sim2real.workspace import Workspace
 
@@ -94,7 +95,7 @@ def call(name, **arguments):
 ROLE = "exchange-correlation specialist"
 
 
-def open_and_delegate(site, budget=1_000_000):
+def open_and_delegate(site):
     """The Chief opens the investigation, proposes and activates a hypothesis, and proposes its agent."""
     return reply(
         call("open_investigation", investigation_id=INV, title="CO/Cu(111) adsorption site (synthetic test)",
@@ -105,7 +106,7 @@ def open_and_delegate(site, budget=1_000_000):
                            "observable": {"name": "preferred site", "definition": "occupied site at low coverage"}}],
              simulated_observable={"name": "site energy difference", "definition": "E(atop) - E(fcc)", "unit": "eV"},
              measured_observable={"name": "preferred site", "definition": "occupied site at low coverage"},
-             compute_profile=site.name, model_token_budget=budget),
+             compute_profile=site.name),
         call("set_investigation_status", status="ALIGNING_OBSERVABLES", reason="start"),
         call("record_alignment", status="REQUIRES_FORWARD_MODEL",
              rationale=["an energy difference predicts a site preference only under a thermodynamic model"]),
@@ -123,10 +124,13 @@ def open_and_delegate(site, budget=1_000_000):
     )
 
 
-def open_and_start(system, budget=1_000_000, answer="ok"):
-    """The researcher describes the problem, the Chief opens the investigation, the researcher starts its agent."""
-    system["clients"].add("chief_scientist", open_and_delegate(system["site"], budget), reply(TextPart(text=answer)))
+def open_and_start(system, budget=None, answer="ok"):
+    """The researcher describes the problem, the Chief opens the investigation, the researcher sets a token budget
+    if one is given and starts its agent."""
+    system["clients"].add("chief_scientist", open_and_delegate(system["site"]), reply(TextPart(text=answer)))
     said = system["chat"].handle("Investigate CO on Cu(111).")
+    if budget is not None:
+        system["chat"].handle(f"/budget {budget}")
     assert system["chat"].handle("/approve agents").startswith(f"Started agent-{HYP} on {HYP}")
     return said
 
@@ -301,8 +305,50 @@ def test_spent_token_budget_leaves_queued_work_waiting(system):
     state = workspace.ledger.load(INV)
     assert state.model_tokens_remaining == 0 and len(state.pending_tasks) == 1
     notes = dispatcher.tick()
-    assert any("budget is spent" in n for n in notes)
+    assert any("budget is spent; queued agent work waits until the researcher raises it with /budget" in n
+               for n in notes)
     assert len(workspace.ledger.load(INV).pending_tasks) == 1
+    # Nor does the Chief Scientist answer: the message is not even sent.
+    calls = len(clients.models["chief_scientist"].calls)
+    assert chat.handle("Why is nothing running?").startswith("Not sent: the investigation's token budget is used up")
+    assert len(clients.models["chief_scientist"].calls) == calls
+    assert "Why is nothing running?" not in [i.text for i in workspace.ledger.load(INV).interventions.values()]
+
+    assert chat.handle("/budget off").startswith("No token budget from now on (msg-4). 30 tokens used so far.")
+    clients.add("hypothesis_agent", reply(TextPart(text="Planned.")))
+    assert any("hypothesis_agent ran" in n for n in dispatcher.tick())
+
+
+def test_no_token_limits_unless_the_researcher_sets_a_budget(system):
+    workspace, chat, clients = system["workspace"], system["chat"], system["clients"]
+    assert chat.limits.max_tokens is None and system["dispatcher"].limits.max_tokens is None
+    # Set before the investigation exists, the budget is recorded when it opens.
+    assert chat.handle("/budget").startswith("No token budget: agents may process any number of tokens. 0 used")
+    assert chat.handle("/budget 2.5M") == ("Token budget 2,500,000 (it is recorded when the investigation opens): 0 "
+                                           "used, 2,500,000 left for all agents together, the Chief Scientist's "
+                                           "answers included. Every token counts, cached input too.")
+    open_and_start(system)
+    state = workspace.ledger.load(INV)
+    assert state.model_token_budget == 2_500_000 and state.spec.constraints.model_token_budget is None
+    assert [i.text for i in state.interventions.values()][:2] == ["/budget 2.5M", "Investigate CO on Cu(111)."]
+
+    for typed, expected in (("800k", 800_000), ("1,200,000", 1_200_000), ("off", None)):
+        chat.handle(f"/budget {typed}")
+        assert workspace.ledger.load(INV).model_token_budget == expected
+    for bad in ("lots", "0", "5 M", "-3"):
+        assert chat.handle(f"/budget {bad}").startswith("Usage: /budget")
+    assert [b.max_tokens for b in workspace.ledger.load(INV).budget_changes] == [2_500_000, 800_000, 1_200_000, None]
+
+    # The Chief Scientist's answers stop at what the budget has left: 30 used, 10 left, and a reply costs 15.
+    chat.handle("/budget 40")
+    clients.add("chief_scientist", reply(ToolCall(id="c1", name="investigation_state", arguments={})),
+                reply(TextPart(text="never asked")))
+    assert "[the Chief Scientist stopped: token_limit]" in chat.handle("What is the state?")
+    assert chat.handle("/budget").startswith("Token budget: 45 of 40 used, 0 left.")
+    usage = render_notebook(workspace.store.read_stream(INV))["index.md"].split("## Model usage")[1]
+    assert "- Total: 45 tokens of a 40 budget" in usage
+    assert "- Token budget set to 2,500,000 by the researcher's msg-1 (event #" in usage
+    assert "- Token budget removed by the researcher's msg-6 (event #" in usage
 
 
 def test_the_dispatcher_checks_every_finished_run(system):

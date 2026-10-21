@@ -375,8 +375,8 @@ def main(argv: list[str] | None = None) -> int:
     setup.add_argument("--root", action="append", default=[], metavar="PATH",
                        help="another directory the agent may read (your home directory is always included)")
     setup.add_argument("--max-turns", type=int, default=60)
-    setup.add_argument("--max-tokens", type=int, default=2_000_000,
-                       help="stop after processing this many tokens, cached input included")
+    setup.add_argument("--max-tokens", type=int, default=None,
+                       help="stop after processing this many tokens, cached input included (default: no limit)")
     setup.add_argument("--resume", action="store_true", help="continue the last setup session for this name")
     setup.set_defaults(handler=_setup)
 

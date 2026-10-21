@@ -398,7 +398,7 @@ def mode_line(state: InvestigationState | None, web: RetrievalRecord | None = No
 
 
 def status_line(state: InvestigationState, now: datetime) -> str:
-    budget = state.spec.constraints.model_token_budget
+    budget = state.model_token_budget
     tokens = f"{state.model_tokens_used:,}" + (f" of {budget:,}" if budget else "")
     waiting = len(approval_requests(state))
     agents = sum(a.active for a in state.agents.values())

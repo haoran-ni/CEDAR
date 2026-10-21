@@ -43,6 +43,7 @@ from sim2real.contracts.events import (
     RecordedEvent,
     RetrievalPolicyChanged,
     RoundStarted,
+    TokenBudgetChanged,
     RunChecked,
     UserInterventionRecorded,
 )
@@ -161,6 +162,7 @@ __all__ = [
     "ModeChanged",
     "MaterialAttached",
     "RetrievalPolicyChanged",
+    "TokenBudgetChanged",
     "ApproverDecision",
     "InvestigationMode",
     "Observable",

@@ -172,7 +172,7 @@ class _Run:
 class Dispatcher:
     def __init__(self, workspace: Workspace, profiles: ProfileStore, clients: ModelClients, *,
                  backend: SchedulerBackend | None = None, deny: list[Path] = (),
-                 limits: RunLimits = RunLimits(max_turns=40, max_tokens=1_000_000), max_agents: int = 4,
+                 limits: RunLimits = RunLimits(max_turns=40), max_agents: int = 4,
                  analysis_slots: int = 2, chief_reviews: bool = True,
                  clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc)) -> None:
         """``max_agents`` agent runs at once; ``analysis_slots`` analysis scripts at once on this node."""
@@ -513,7 +513,8 @@ class Dispatcher:
                                                                                         automation_left)
         if investigation_left is not None:
             if investigation_left <= 0:
-                return None, "the model token budget is spent; queued agent work waits for a larger budget"
+                return None, ("the model token budget is spent; queued agent work waits until the researcher "
+                              "raises it with /budget")
             investigation_left -= sum(r.tokens or 0 for r in self._runs.values()
                                       if r.investigation_id == state.investigation_id)
             if investigation_left <= 0:

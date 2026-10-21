@@ -190,6 +190,8 @@ plan and cite that id. Never treat a preference as evidence. You cannot approve 
 submit, cancel, start agents early or close the investigation; when something waits for \
 the researcher, tell them the exact command (/approve submit <calculation>, /approve \
 inputs <calculation>, /cancel <calculation> <reason>, /approve agents, /approve close). \
+The investigation's total token budget is the researcher's too: there is none unless they \
+set one with /budget <tokens>; investigation_state shows what is used and left. \
 Running jobs keep running when priorities change.
 
 Answering: check investigation_state or agent_reports before describing progress. \

@@ -146,6 +146,17 @@ class RetrievalPolicyChanged(Contract):
         return self
 
 
+class TokenBudgetChanged(Contract):
+    """The researcher sets the investigation's total token budget, or removes it. Every token its agents have
+    processed since it opened counts, cached input included."""
+
+    type: Literal["token_budget_changed"] = "token_budget_changed"
+    max_tokens: int | None = Field(default=None, gt=0)
+    """None: no limit."""
+    intervention_id: Identifier
+    """The researcher's command."""
+
+
 MaterialName = Annotated[str, StringConstraints(min_length=1, max_length=255, pattern=r"^[^/\x00]+$")]
 
 
@@ -451,6 +462,7 @@ EventPayload = Annotated[
     | NextActionsRecommended
     | ModeChanged
     | RetrievalPolicyChanged
+    | TokenBudgetChanged
     | MaterialAttached
     | ApproverDecision
     | ObservableAlignmentRecorded

@@ -2,7 +2,7 @@
 
 <!--
 The layout of every round page in the research notebook. Pages are generated from the
-event log by src/sim2real/notebook.py and are never edited by hand. The "## " headings
+event log by src/cedar/notebook.py and are never edited by hand. The "## " headings
 below must match ROUND_SECTIONS in that file, in order; a test checks this.
 
 A round is one stretch of investigating. Round 0 is the setup before the first one. A new

@@ -4,7 +4,7 @@ import pytest
 from pydantic import ValidationError
 
 from factories import RAW_OUTPUT, SITE_ENERGY, alignment, computed_evidence, hypothesis_spec, task
-from sim2real.contracts import (
+from cedar.contracts import (
     Actor,
     ActorKind,
     AlignmentStatus,
@@ -180,7 +180,7 @@ class TestDiscrepancy:
 def test_recorded_event_round_trips_through_json():
     event = RecordedEvent(
         event_id="evt-1", investigation_id="inv-1", stream_version=2,
-        occurred_at=datetime(2026, 10, 19, tzinfo=timezone.utc),
+        occurred_at=datetime(2026, 10, 21, tzinfo=timezone.utc),
         actor=Actor(kind=ActorKind.VALIDATOR, id="v"), round=0, plan_version=1,
         payload={"type": "evidence_recorded", "evidence_id": "ev-1",
                  "evidence": computed_evidence("c1").model_dump(mode="json")},
@@ -191,7 +191,7 @@ def test_recorded_event_round_trips_through_json():
 
 def test_naive_timestamps_are_rejected():
     with pytest.raises(ValidationError):
-        RecordedEvent(event_id="e", investigation_id="i", stream_version=1, occurred_at=datetime(2026, 1, 1),
+        RecordedEvent(event_id="e", investigation_id="i", stream_version=1, occurred_at=datetime(2026, 10, 21),
                       actor=Actor(kind=ActorKind.USER, id="u"), round=0, plan_version=1,
                       payload={"type": "round_started", "round": 1, "reason": "r"})
 
@@ -199,7 +199,7 @@ def test_naive_timestamps_are_rejected():
 class TestExaminationContract:
     def test_verdict_must_follow_from_findings(self):
         from factories import examination
-        from sim2real.contracts import ExaminationVerdict, Finding, FindingSeverity, InputExamination
+        from cedar.contracts import ExaminationVerdict, Finding, FindingSeverity, InputExamination
 
         exam = examination("c1")
         with pytest.raises(ValidationError, match="does not follow"):
@@ -209,13 +209,13 @@ class TestExaminationContract:
 
     def test_input_hash_must_match_files(self):
         from factories import examination
-        from sim2real.contracts import InputExamination
+        from cedar.contracts import InputExamination
 
         with pytest.raises(ValidationError, match="input_hash"):
             InputExamination.model_validate({**examination("c1").model_dump(), "input_hash": "0" * 64})
 
     def test_job_scripts_do_not_change_scientific_identity(self):
-        from sim2real.contracts import ProtocolRef, scientific_input_hash
+        from cedar.contracts import ProtocolRef, scientific_input_hash
 
         protocol = ProtocolRef(name="p", version="1")
         control = RAW_OUTPUT
@@ -244,7 +244,7 @@ class TestCitations:
             computed_evidence("c1", checks=(QualityCheck(name="scf_converged", passed=True),))
 
     def test_line_range_is_ordered(self):
-        from sim2real.contracts import OutputCitation
+        from cedar.contracts import OutputCitation
 
         with pytest.raises(ValidationError):
             OutputCitation(artifact=RAW_OUTPUT, line_start=5, line_end=4, quote="x")

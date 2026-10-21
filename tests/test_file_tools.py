@@ -1,6 +1,6 @@
 import pytest
 
-from sim2real.agents.toolkits import FileAccess, file_tools
+from cedar.agents.toolkits import FileAccess, file_tools
 
 
 @pytest.fixture

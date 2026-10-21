@@ -11,9 +11,9 @@ from datetime import datetime, timedelta, timezone
 import pytest
 from sites import aims_output, co_on_cu111, declared, geometry_text
 
-from sim2real.agents.toolkits.chief import ChiefContext, chief_tools
-from sim2real.chat import CHIEF, ChatSession
-from sim2real.contracts import (
+from cedar.agents.toolkits.chief import ChiefContext, chief_tools
+from cedar.chat import CHIEF, ChatSession
+from cedar.contracts import (
     Assessment,
     CalculationState,
     EvidenceQuality,
@@ -21,18 +21,18 @@ from sim2real.contracts import (
     InvestigationStatus,
     SchedulerState,
 )
-from sim2real.dispatch import Dispatcher, current_activity, heartbeat_age
-from sim2real.hpc import ProfileStore
-from sim2real.hpc.fake import FakeScheduler
-from sim2real.models import ModelSettings, TextPart, ToolCall
-from sim2real.models.scripted import ScriptedModel, reply
-from sim2real.notebook import render_notebook
-from sim2real.state import replay
-from sim2real.workspace import Workspace
+from cedar.dispatch import Dispatcher, current_activity, heartbeat_age
+from cedar.hpc import ProfileStore
+from cedar.hpc.fake import FakeScheduler
+from cedar.models import ModelSettings, TextPart, ToolCall
+from cedar.models.scripted import ScriptedModel, reply
+from cedar.notebook import render_notebook
+from cedar.state import replay
+from cedar.workspace import Workspace
 
 ENERGY = -5000.123456789
 INV, HYP = "co-cu111-site", "xc-frontier-orbitals"
-NOW = datetime(2026, 10, 19, 12, 0, tzinfo=timezone.utc)
+NOW = datetime(2026, 10, 21, 12, 0, tzinfo=timezone.utc)
 
 
 class Clients:
@@ -375,8 +375,8 @@ def test_a_second_dispatcher_waits_for_the_first(system):
     lock = open(system["workspace"].root / "dispatcher.lock", "a")
     fcntl.lockf(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     try:
-        code = ("from sim2real.workspace import Workspace; from sim2real.dispatch import Dispatcher;"
-                "from sim2real.hpc import ProfileStore;"
+        code = ("from cedar.workspace import Workspace; from cedar.dispatch import Dispatcher;"
+                "from cedar.hpc import ProfileStore;"
                 f"d = Dispatcher(Workspace.open({str(system['workspace'].root)!r}), ProfileStore('/nonexistent'), None);"
                 "print(d.tick())")
         out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, check=True).stdout
@@ -414,21 +414,21 @@ def test_early_messages_get_ids_at_opening_and_delegation_waits_for_investigatin
 
 
 def test_cli_start_and_dispatch(system, monkeypatch, capsys, tmp_path):
-    from sim2real import cli
+    from cedar import cli
 
     clients = system["clients"]
-    monkeypatch.setenv("SIM2REAL_DATA_DIR", str(system["workspace"].root))
+    monkeypatch.setenv("CEDAR_DATA_DIR", str(system["workspace"].root))
     monkeypatch.setattr(cli, "_profiles", lambda: system["profiles"])
     monkeypatch.setattr(cli, "_model_clients", lambda: clients)
     clients.add("chief_scientist", open_and_delegate(system["site"]), reply(TextPart(text="Opened and delegated.")))
     started = []  # TEST DOUBLE for starting the background dispatcher
-    monkeypatch.setattr("sim2real.chat.start_background_dispatcher", lambda workspace: started.append(workspace) or 4242)
+    monkeypatch.setattr("cedar.chat.start_background_dispatcher", lambda workspace: started.append(workspace) or 4242)
     lines = iter(["Investigate CO on Cu(111).", "/approve agents", "/status", "/quit"])
     monkeypatch.setattr("builtins.input", lambda prompt: next(lines))
     assert cli.main(["start"]) == 0
     out = capsys.readouterr().out
     assert "Opened and delegated." in out and "no dispatcher has run recently" not in out
-    assert f"Investigation {INV}" in out and f"Resume with: sim2real start {INV}" in out
+    assert f"Investigation {INV}" in out and f"Resume with: cedar start {INV}" in out
     # The proposed agents needed a dispatcher to start them when their review window ends, so the chat started
     # one right after the Chief proposed them; once, although the approval gave it more work.
     assert [w.root for w in started] == [system["workspace"].root]
@@ -503,8 +503,8 @@ def test_reports_that_arrive_during_a_chief_turn_are_still_shown(system):
 def test_start_opens_the_full_screen_interface_only_where_it_can_work(system, monkeypatch, capsys):
     from argparse import Namespace
 
-    from sim2real import cli
-    from sim2real import tui
+    from cedar import cli
+    from cedar import tui
 
     monkeypatch.setattr("sys.stdin.isatty", lambda: True)
     monkeypatch.setattr("sys.stdout.isatty", lambda: True)
@@ -518,7 +518,7 @@ def test_start_opens_the_full_screen_interface_only_where_it_can_work(system, mo
     assert not cli._full_screen(Namespace(plain=False))
 
     monkeypatch.setattr("sys.stdout.isatty", lambda: True)
-    monkeypatch.setenv("SIM2REAL_DATA_DIR", str(system["workspace"].root))
+    monkeypatch.setenv("CEDAR_DATA_DIR", str(system["workspace"].root))
     monkeypatch.setattr(cli, "_profiles", lambda: system["profiles"])
     monkeypatch.setattr(cli, "_model_clients", lambda: system["clients"])
     opened = []
@@ -532,9 +532,9 @@ def test_the_chief_knows_whether_a_dispatcher_is_running(system):
     clients.add("chief_scientist", reply(call("investigation_state")), reply(TextPart(text="Start the dispatcher.")))
     chat.handle("Why are the agents not working?")
     seen = clients.models["chief_scientist"].calls[-1].messages[-1].parts[0].content
-    assert seen.endswith("the researcher starts it with `sim2real dispatch`): no dispatcher has run: start "
-                         "`sim2real dispatch`")
-    chat.auto_dispatch = True  # as `sim2real start` does: the Chief need not send the researcher to start one
+    assert seen.endswith("the researcher starts it with `cedar dispatch`): no dispatcher has run: start "
+                         "`cedar dispatch`")
+    chat.auto_dispatch = True  # as `cedar start` does: the Chief need not send the researcher to start one
     assert chat._dispatcher_status().startswith("none is running now; this chat starts one in the background by "
                                                 "itself right after your turn")
     system["dispatcher"].tick()

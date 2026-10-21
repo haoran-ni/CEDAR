@@ -11,11 +11,11 @@ from factories import AGENT
 from sites import aims_output
 from worlds import World
 
-from sim2real.contracts import AnalysisOutcome, EvidenceKind, EvidenceQuality, Observable, SchedulerState
-from sim2real.engine.analysis import AnalysisLimits, AnalysisRunner, examine_script
-from sim2real.engine.results import ANALYSIS_LIMITATION
-from sim2real.errors import RuleViolation
-from sim2real.state import replay
+from cedar.contracts import AnalysisOutcome, EvidenceKind, EvidenceQuality, Observable, SchedulerState
+from cedar.engine.analysis import AnalysisLimits, AnalysisRunner, examine_script
+from cedar.engine.results import ANALYSIS_LIMITATION
+from cedar.errors import RuleViolation
+from cedar.state import replay
 
 ENERGY = -1234.567890123
 EIGENVALUES = "# state occupation eigenvalue_eV\n1 2.0 -9.1\n2 2.0 -8.4\n3 0.0 -1.9\n4 0.0 -1.9\n"

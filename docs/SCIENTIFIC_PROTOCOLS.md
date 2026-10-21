@@ -61,7 +61,7 @@ Findings are `ERROR` (reject), `REVIEW` (needs user approval), `WARNING` or `INF
 - Relaxing a slab with no constrained atoms is a `WARNING`.
 - `k_grid` without a periodic cell is an `ERROR`.
 
-**Job script:** examined against the approved compute profile (see `DECISIONS.md`). The requested walltime and core-hours must also fit the task budget.
+**Job script:** examined against the approved compute profile. The requested walltime and core-hours must also fit the task budget.
 
 **Duplicates:** inputs identical to a reusable calculation's are an `ERROR`; the agent should link that calculation instead.
 

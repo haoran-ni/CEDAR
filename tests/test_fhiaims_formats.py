@@ -5,7 +5,7 @@ import pytest
 from ase.build import molecule
 from sites import aims_output, co_on_cu111, geometry_text
 
-from sim2real.codes.fhiaims import (
+from cedar.codes.fhiaims import (
     minimum_distance,
     parse_control,
     parse_geometry,
@@ -98,16 +98,16 @@ class TestOutput:
         assert parse_output(text).killed is not None
 
     def test_fortran_exponents(self):
-        from sim2real.codes.fhiaims.output import numbers_in
+        from cedar.codes.fhiaims.output import numbers_in
 
         assert numbers_in("| Total energy : -0.200529726686124E+07 eV and 1.5D-03") == [-2005297.26686124, 1.5e-3]
 
 
-@pytest.mark.skipif("SIM2REAL_REAL_AIMS_OUTPUTS" not in os.environ,
-                    reason="set SIM2REAL_REAL_AIMS_OUTPUTS to a directory of real finished aims.out files")
+@pytest.mark.skipif("CEDAR_REAL_AIMS_OUTPUTS" not in os.environ,
+                    reason="set CEDAR_REAL_AIMS_OUTPUTS to a directory of real finished aims.out files")
 def test_real_outputs_parse():
     """Optional check against real FHI-aims outputs available on the current machine."""
-    files = sorted(Path(os.environ["SIM2REAL_REAL_AIMS_OUTPUTS"]).rglob("aims.out"))
+    files = sorted(Path(os.environ["CEDAR_REAL_AIMS_OUTPUTS"]).rglob("aims.out"))
     assert files
     for path in files:
         out = parse_output(path.read_text(errors="replace"))

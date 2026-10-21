@@ -4,7 +4,7 @@ import stat
 
 import pytest
 
-from sim2real.contracts import ArtifactRef
+from cedar.contracts import ArtifactRef
 
 
 def test_content_is_stored_once_read_only_and_verifiable(artifacts):

@@ -1,8 +1,8 @@
 import pytest
 
-from sim2real.contracts import FindingSeverity
-from sim2real.hpc import JobResources, examine_job_script, render_job_script
-from sim2real.hpc.jobscript import format_walltime, parse_walltime
+from cedar.contracts import FindingSeverity
+from cedar.hpc import JobResources, examine_job_script, render_job_script
+from cedar.hpc.jobscript import format_walltime, parse_walltime
 
 RESOURCES = JobResources(partition="compute", nodes=1, ntasks=32, walltime_minutes=90)
 

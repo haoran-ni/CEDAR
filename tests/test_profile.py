@@ -3,10 +3,10 @@ from datetime import datetime, timezone
 import pytest
 from pydantic import ValidationError
 
-from sim2real.contracts import FindingSeverity
-from sim2real.hpc import ComputeProfile, ProfileNotApproved, ProfileStore, check_profile, file_source
+from cedar.contracts import FindingSeverity
+from cedar.hpc import ComputeProfile, ProfileNotApproved, ProfileStore, check_profile, file_source
 
-NOW = datetime(2026, 10, 19, tzinfo=timezone.utc)
+NOW = datetime(2026, 10, 21, tzinfo=timezone.utc)
 
 
 def with_template(site, template: str) -> dict:

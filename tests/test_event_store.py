@@ -4,8 +4,8 @@ from datetime import datetime, timezone
 import pytest
 
 from factories import USER
-from sim2real.contracts import RecordedEvent, RoundStarted
-from sim2real.store import ConcurrencyConflict, SQLiteEventStore
+from cedar.contracts import RecordedEvent, RoundStarted
+from cedar.store import ConcurrencyConflict, SQLiteEventStore
 
 
 def event(version: int, investigation_id: str = "inv-1", key: str | None = None) -> RecordedEvent:
@@ -13,7 +13,7 @@ def event(version: int, investigation_id: str = "inv-1", key: str | None = None)
         event_id=f"evt-{investigation_id}-{version}",
         investigation_id=investigation_id,
         stream_version=version,
-        occurred_at=datetime(2026, 10, 19, tzinfo=timezone.utc),
+        occurred_at=datetime(2026, 10, 21, tzinfo=timezone.utc),
         actor=USER,
         round=0,
         plan_version=1,

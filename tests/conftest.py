@@ -1,10 +1,10 @@
 import pytest
 from sites import build_site
 
-import sim2real.chat
+import cedar.chat
 
-from sim2real.state import ResearchLedger
-from sim2real.store import ArtifactStore, SQLiteEventStore
+from cedar.state import ResearchLedger
+from cedar.store import ArtifactStore, SQLiteEventStore
 
 
 @pytest.fixture(autouse=True)
@@ -14,14 +14,14 @@ def isolated(tmp_path, monkeypatch):
     A background dispatcher would run with the real configuration and keys of whoever runs the tests, so
     starting one fails here; a test that needs one says so and gives it an isolated configuration.
     """
-    monkeypatch.setenv("SIM2REAL_CONFIG_DIR", str(tmp_path / "isolated-config"))
-    monkeypatch.setenv("SIM2REAL_DATA_DIR", str(tmp_path / "isolated-data"))
+    monkeypatch.setenv("CEDAR_CONFIG_DIR", str(tmp_path / "isolated-config"))
+    monkeypatch.setenv("CEDAR_DATA_DIR", str(tmp_path / "isolated-data"))
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
 
     def refuse(workspace):
         raise AssertionError(f"a test tried to start a background dispatcher on {workspace.root}")
 
-    monkeypatch.setattr(sim2real.chat, "start_background_dispatcher", refuse)
+    monkeypatch.setattr(cedar.chat, "start_background_dispatcher", refuse)
 
 
 @pytest.fixture

@@ -11,15 +11,15 @@ from datetime import date
 import pytest
 from sites import JOB_TEMPLATE, aims_output, build_site
 
-from sim2real import cli
-from sim2real.agents import AgentRunner, TranscriptStore
-from sim2real.agents.prompts import ENVIRONMENT_SETUP
-from sim2real.agents.toolkits import FileAccess, file_tools
-from sim2real.agents.toolkits.environment import SetupSession, environment_tools
-from sim2real.hpc import ProfileStore
-from sim2real.hpc.queries import SchedulerQueries
-from sim2real.models import ModelSettings, TextPart, ToolCall
-from sim2real.models.scripted import ScriptedModel, reply
+from cedar import cli
+from cedar.agents import AgentRunner, TranscriptStore
+from cedar.agents.prompts import ENVIRONMENT_SETUP
+from cedar.agents.toolkits import FileAccess, file_tools
+from cedar.agents.toolkits.environment import SetupSession, environment_tools
+from cedar.hpc import ProfileStore
+from cedar.hpc.queries import SchedulerQueries
+from cedar.models import ModelSettings, TextPart, ToolCall
+from cedar.models.scripted import ScriptedModel, reply
 
 SETTINGS = ModelSettings(provider="scripted", model="scripted-model")
 KEY = "sk-ant-test-0123456789abcdefghij"
@@ -40,7 +40,7 @@ class TestSchedulerQueries:
     def queries(self, calls, **kwargs):
         return SchedulerQueries(user="someone", runner=fake_runner(calls), environ={"PATH": "/bin",
                                 "ANTHROPIC_API_KEY": KEY}, which=lambda c: f"/usr/bin/{c}" if c != "bsub" else None,
-                                today=lambda: date(2026, 10, 19), **kwargs)
+                                today=lambda: date(2026, 10, 21), **kwargs)
 
     def test_queries_are_fixed_commands_without_credentials(self):
         calls = []
@@ -51,7 +51,7 @@ class TestSchedulerQueries:
     def test_recent_jobs_use_a_fixed_window(self):
         calls = []
         self.queries(calls).run("slurm_recent_jobs")
-        assert calls[0][0][:7] == ["sacct", "-u", "someone", "-n", "-P", "-X", "-S"] and "2026-09-19" in calls[0][0]
+        assert calls[0][0][:7] == ["sacct", "-u", "someone", "-n", "-P", "-X", "-S"] and "2026-09-21" in calls[0][0]
 
     @pytest.mark.parametrize("query, argument", [("rm", None), ("slurm_node_cpus", None),
                                                  ("slurm_node_cpus", "a; rm -rf ~"), ("slurm_partitions", "x")])
@@ -80,7 +80,7 @@ def home(tmp_path, monkeypatch):
     (old_run / "aims.out").write_text(aims_output())
     config = tmp_path / "config"
     monkeypatch.setenv("HOME", str(home))
-    monkeypatch.setenv("SIM2REAL_CONFIG_DIR", str(config))
+    monkeypatch.setenv("CEDAR_CONFIG_DIR", str(config))
     return {"site": site, "home": home, "config": config, "old_run": old_run}
 
 
@@ -92,7 +92,7 @@ def proposal(home, **overrides):
         "cores_per_node": 64, "default_ntasks": 16, "max_nodes": 1, "default_walltime_minutes": 30,
         "max_walltime_minutes": 1440,
         "codes": {"fhi-aims": {"binary": code.binary, "version": "test-1.0", "data_paths": code.data_paths}},
-        "job_template": site.job_template, "runs_root": str(home["home"] / "sim2real_runs"),
+        "job_template": site.job_template, "runs_root": str(home["home"] / "cedar_runs"),
         "source_notes": {str(home["old_run"] / "submit.sh"): "template, binary, environment script"},
     }
     return {**args, **overrides}
@@ -107,7 +107,7 @@ def setup_script(home):
                                                               "pattern": "FHI-aims version"})),
         reply(ToolCall(id="4", name="inspect_path", arguments={"path": home["site"].codes["fhi-aims"].binary}),
               ToolCall(id="5", name="scheduler_query", arguments={"query": "slurm_partitions"})),
-        reply(ToolCall(id="6", name="ask_user", arguments={"question": "Which partitions may sim2real use?"})),
+        reply(ToolCall(id="6", name="ask_user", arguments={"question": "Which partitions may CEDAR use?"})),
         reply(ToolCall(id="7", name="propose_profile", arguments=proposal(
             home, job_template="#!/bin/bash\nmpirun {{binary}}\n"))),
         reply(ToolCall(id="8", name="propose_profile", arguments=proposal(home))),
@@ -134,7 +134,7 @@ def test_setup_agent_proposes_a_profile_with_sources(home):
     assert ("file", str(home["old_run"] / "submit.sh")) in kinds and ("file", str(home["old_run"] / "aims.out")) in kinds
     assert ("command_output", "sinfo -h -o %P|%a|%l|%D|%c|%m") in kinds
     answer = next(s for s in profile.sources if s.kind == "user_answer")
-    assert (answer.reference, answer.note) == ("Which partitions may sim2real use?", "only compute")
+    assert (answer.reference, answer.note) == ("Which partitions may CEDAR use?", "only compute")
     script_source = next(s for s in profile.sources if s.reference.endswith("submit.sh"))
     assert script_source.note == "template, binary, environment script" and len(script_source.sha256) == 64
 
@@ -150,13 +150,13 @@ def test_inspect_path_cannot_see_the_credentials_directory(home):
 
 def test_cli_setup_then_review_and_approve(home, monkeypatch, capsys):
     model = ScriptedModel(setup_script(home))
-    monkeypatch.setattr("sim2real.models.create_client", lambda settings, credentials: model)
-    monkeypatch.setattr("sim2real.hpc.queries.SchedulerQueries", lambda: SchedulerQueries(runner=fake_runner([])))
+    monkeypatch.setattr("cedar.models.create_client", lambda settings, credentials: model)
+    monkeypatch.setattr("cedar.hpc.queries.SchedulerQueries", lambda: SchedulerQueries(runner=fake_runner([])))
     monkeypatch.setattr(cli, "_ask_in_terminal", lambda question: "only compute")
     cli.main(["models", "init"])
     assert cli.main(["setup", "--name", "synthetic", "--root", str(home["site"].runs_root)]) == 0
     out = capsys.readouterr().out
-    assert "- read_file" in out and "! propose_profile" in out and "sim2real profile approve synthetic" in out
+    assert "- read_file" in out and "! propose_profile" in out and "cedar profile approve synthetic" in out
     log = json.loads((home["config"] / "setup_runs.jsonl").read_text().splitlines()[-1])
     assert log["profile"] == "synthetic" and log["outcome"] == "finished"
 
@@ -183,16 +183,16 @@ def test_cli_refuses_to_approve_a_failing_profile(home, monkeypatch, capsys):
 def test_setup_can_resume_with_its_sources(home, monkeypatch, capsys):
     script = setup_script(home)
     first = ScriptedModel(script[:4] + [reply(TextPart(text="I need your answer before proposing."))])
-    monkeypatch.setattr("sim2real.hpc.queries.SchedulerQueries", lambda: SchedulerQueries(runner=fake_runner([])))
+    monkeypatch.setattr("cedar.hpc.queries.SchedulerQueries", lambda: SchedulerQueries(runner=fake_runner([])))
     monkeypatch.setattr(cli, "_ask_in_terminal", lambda question: "")
-    monkeypatch.setattr("sim2real.models.create_client", lambda settings, credentials: first)
+    monkeypatch.setattr("cedar.models.create_client", lambda settings, credentials: first)
     cli.main(["models", "init"])
     assert cli.main(["setup", "--name", "synthetic"]) == 1
     assert "synthetic" not in ProfileStore(home["config"] / "profiles").names()
 
     second = ScriptedModel([script[3], script[5], script[6]])
     monkeypatch.setattr(cli, "_ask_in_terminal", lambda question: "only compute")
-    monkeypatch.setattr("sim2real.models.create_client", lambda settings, credentials: second)
+    monkeypatch.setattr("cedar.models.create_client", lambda settings, credentials: second)
     assert cli.main(["setup", "--name", "synthetic", "--resume"]) == 0
     assert "Continue where you stopped" in second.calls[0].messages[-1].text
     assert len(second.calls[0].messages) > 5  # the first session's history came along

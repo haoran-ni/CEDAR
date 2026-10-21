@@ -12,10 +12,10 @@ from factories import AGENT, authorize
 from sites import aims_output, co_on_cu111, declared, geometry_text
 from worlds import World
 
-from sim2real.agents import AgentRunner, TranscriptStore, record_agent_run
-from sim2real.agents.prompts import HYPOTHESIS_AGENT
-from sim2real.agents.toolkits import FileAccess, ResearchContext, file_tools, research_tools
-from sim2real.contracts import (
+from cedar.agents import AgentRunner, TranscriptStore, record_agent_run
+from cedar.agents.prompts import HYPOTHESIS_AGENT
+from cedar.agents.toolkits import FileAccess, ResearchContext, file_tools, research_tools
+from cedar.contracts import (
     CalculationState,
     EvidenceKind,
     EvidenceQuality,
@@ -23,8 +23,8 @@ from sim2real.contracts import (
     PermissionAction,
     SchedulerState,
 )
-from sim2real.models import ModelSettings, TextPart, ToolCall
-from sim2real.models.scripted import ScriptedModel, reply
+from cedar.models import ModelSettings, TextPart, ToolCall
+from cedar.models.scripted import ScriptedModel, reply
 
 SETTINGS = ModelSettings(provider="scripted", model="scripted-model")
 ENERGY = -4321.987654321

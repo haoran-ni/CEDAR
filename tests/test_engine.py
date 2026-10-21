@@ -10,7 +10,7 @@ from factories import AGENT, authorize, draft
 from sites import aims_output
 from worlds import World
 
-from sim2real.contracts import (
+from cedar.contracts import (
     CalculationState,
     CalculationStateChanged,
     EvidenceQuality,
@@ -23,10 +23,10 @@ from sim2real.contracts import (
     Quantity,
     SchedulerState,
 )
-from sim2real.engine import InputsChanged, job_name_for
-from sim2real.engine.jobs import JOB_MANAGER
-from sim2real.errors import RuleViolation
-from sim2real.state import replay
+from cedar.engine import InputsChanged, job_name_for
+from cedar.engine.jobs import JOB_MANAGER
+from cedar.errors import RuleViolation
+from cedar.state import replay
 
 ENERGY = -98765.432101234
 

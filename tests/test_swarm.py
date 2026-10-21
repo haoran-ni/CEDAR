@@ -28,12 +28,12 @@ from sites import aims_output
 from test_orchestration import HARTREE_SCRIPT, make_system
 from worlds import World
 
-from sim2real.agents import RunLimits
-from sim2real.agents.toolkits import ResearchContext, file_tools, research_tools
-from sim2real.agents.toolkits.chief import ChiefContext, chief_tools
-from sim2real.agents.toolkits.research import agent_file_access
-from sim2real.chat import ChatSession
-from sim2real.contracts import (
+from cedar.agents import RunLimits
+from cedar.agents.toolkits import ResearchContext, file_tools, research_tools
+from cedar.agents.toolkits.chief import ChiefContext, chief_tools
+from cedar.agents.toolkits.research import agent_file_access
+from cedar.chat import ChatSession
+from cedar.contracts import (
     Actor,
     ActorKind,
     AgentRetired,
@@ -57,15 +57,15 @@ from sim2real.contracts import (
     SchedulerState,
     UserInterventionRecorded,
 )
-from sim2real.contracts.hypothesis import Prediction
-from sim2real.dispatch import SYSTEM, Dispatcher
-from sim2real.errors import RuleViolation
-from sim2real.models import TextPart, ToolCall
-from sim2real.models.scripted import ScriptedModel, reply
-from sim2real.notebook import render_notebook, round_file
-from sim2real.state.projection import ProposalStatus
-from sim2real.summaries import calculation_summary
-from sim2real.swarm import CHIEF, REVIEW_INSTRUCTION, review_due, review_material, start_drafts
+from cedar.contracts.hypothesis import Prediction
+from cedar.dispatch import SYSTEM, Dispatcher
+from cedar.errors import RuleViolation
+from cedar.models import TextPart, ToolCall
+from cedar.models.scripted import ScriptedModel, reply
+from cedar.notebook import render_notebook, round_file
+from cedar.state.projection import ProposalStatus
+from cedar.summaries import calculation_summary
+from cedar.swarm import CHIEF, REVIEW_INSTRUCTION, review_due, review_material, start_drafts
 
 INV = "swarm-test"
 ENERGY = -4321.987654321
@@ -751,7 +751,7 @@ def test_closing_needs_the_chiefs_proposal_and_the_researchers_command(system):
 def test_closing_waits_for_jobs_the_dispatcher_still_follows(system):
     from test_orchestration import INV as OPEN
 
-    from sim2real.contracts import ClosingProposed
+    from cedar.contracts import ClosingProposed
 
     calc = halted_system(system)
     ledger = system["workspace"].ledger
@@ -765,9 +765,9 @@ def test_closing_waits_for_jobs_the_dispatcher_still_follows(system):
 
 
 def test_halt_still_stops_a_review_in_progress(tmp_path, site, monkeypatch):
-    import sim2real.chat
+    import cedar.chat
 
-    monkeypatch.setattr(sim2real.chat, "stop_dispatcher", lambda ws, timeout, force: "Stopped.")
+    monkeypatch.setattr(cedar.chat, "stop_dispatcher", lambda ws, timeout, force: "Stopped.")
     system = make_system(tmp_path, site, reviews=True)
     ledger, clients, dispatcher = system["workspace"].ledger, system["clients"], system["dispatcher"]
     chat = investigation(system, "hyp-a")
@@ -869,7 +869,7 @@ def test_agents_work_without_a_compute_profile(system):
 # -- the dispatcher starts when there is work -------------------------------------------------------
 
 def test_what_counts_as_work_for_a_dispatcher(system):
-    from sim2real.dispatch import needs_dispatcher
+    from cedar.dispatch import needs_dispatcher
 
     ledger = system["workspace"].ledger
     chat = investigation(system, "hyp-a")
@@ -893,7 +893,7 @@ def test_the_chat_starts_a_dispatcher_only_when_there_is_work_and_none_runs(syst
     import subprocess
     import sys
 
-    import sim2real.chat
+    import cedar.chat
 
     ledger, workspace = system["workspace"].ledger, system["workspace"]
     started = []
@@ -906,7 +906,7 @@ def test_the_chat_starts_a_dispatcher_only_when_there_is_work_and_none_runs(syst
     assert "stops by itself after 30 minutes with nothing to do" in note
     assert chat.ensure_dispatcher() is None and len(started) == 1  # not restarted within a minute
 
-    monkeypatch.setattr(sim2real.chat, "RESTART_SECONDS", 0)
+    monkeypatch.setattr(cedar.chat, "RESTART_SECONDS", 0)
     holder = subprocess.Popen(  # another process holds the lock, as a running dispatcher does
         [sys.executable, "-c", "import fcntl, sys; f = open(sys.argv[1], 'a'); fcntl.lockf(f, fcntl.LOCK_EX); "
          "print('locked', flush=True); sys.stdin.read()", str(workspace.root / "dispatcher.lock")],
@@ -950,10 +950,10 @@ def test_a_background_dispatcher_runs_detached_and_stops_on_request(tmp_path):
     """A real process, with the tests' isolated configuration and no API key."""
     import signal
 
-    from sim2real.dispatch import dispatcher_running, start_background_dispatcher, stop_dispatcher
-    from sim2real.models import write_starter
-    from sim2real.paths import config_dir
-    from sim2real.workspace import Workspace
+    from cedar.dispatch import dispatcher_running, start_background_dispatcher, stop_dispatcher
+    from cedar.models import write_starter
+    from cedar.paths import config_dir
+    from cedar.workspace import Workspace
 
     write_starter(config_dir() / "models.toml")
     workspace = Workspace.open(tmp_path / "background")
@@ -994,13 +994,13 @@ def halted_system(system):
 def test_halt_cancels_the_jobs_retires_the_agents_and_pauses(system, monkeypatch):
     from test_orchestration import HYP, INV as OPEN
 
-    import sim2real.chat
-    from sim2real.contracts import CalculationState
-    from sim2real.dispatch import needs_dispatcher
-    from sim2real.state.projection import ProposalStatus
+    import cedar.chat
+    from cedar.contracts import CalculationState
+    from cedar.dispatch import needs_dispatcher
+    from cedar.state.projection import ProposalStatus
 
     stops = []
-    monkeypatch.setattr(sim2real.chat, "stop_dispatcher", lambda ws, timeout, force: stops.append(force) or
+    monkeypatch.setattr(cedar.chat, "stop_dispatcher", lambda ws, timeout, force: stops.append(force) or
                         "Stopped the dispatcher (process 4242).")
     ledger, chat, scheduler = system["workspace"].ledger, system["chat"], system["scheduler"]
     calc = halted_system(system)
@@ -1047,17 +1047,17 @@ def test_a_paused_investigation_submits_nothing(system):
         status=InvestigationStatus.PAUSED, reason="test"))])
     assert not any("submitted" in n for n in system["dispatcher"].tick())
     assert system["scheduler"].submissions == []
-    from sim2real.dispatch import needs_dispatcher
+    from cedar.dispatch import needs_dispatcher
     assert not needs_dispatcher(system["workspace"].ledger.load(OPEN))  # authorized, but nothing to do while paused
 
 
 def test_halt_leaves_other_investigations_alone_and_halt_all_stops_everything(system, monkeypatch):
     from test_orchestration import INV as OPEN
 
-    import sim2real.chat
+    import cedar.chat
 
     stops = []
-    monkeypatch.setattr(sim2real.chat, "stop_dispatcher", lambda ws, timeout, force: stops.append(force) or
+    monkeypatch.setattr(cedar.chat, "stop_dispatcher", lambda ws, timeout, force: stops.append(force) or
                         "Stopped the dispatcher (process 4242).")
     ledger, chat = system["workspace"].ledger, system["chat"]
     halted_system(system)
@@ -1073,9 +1073,9 @@ def test_halt_leaves_other_investigations_alone_and_halt_all_stops_everything(sy
 
 
 def test_halt_stops_an_agent_run_in_progress_at_its_next_model_call(system, monkeypatch):
-    import sim2real.chat
+    import cedar.chat
 
-    monkeypatch.setattr(sim2real.chat, "stop_dispatcher", lambda ws, timeout, force: "Stopped.")
+    monkeypatch.setattr(cedar.chat, "stop_dispatcher", lambda ws, timeout, force: "Stopped.")
     ledger, dispatcher = system["workspace"].ledger, system["dispatcher"]
     chat = investigation(system, "hyp-a")
     propose(ledger, "p-1", "hyp-a")
@@ -1098,8 +1098,8 @@ def test_a_dispatcher_that_will_not_stop_is_killed_when_forced(tmp_path):
     import subprocess
     import sys
 
-    from sim2real.dispatch import dispatcher_running, stop_dispatcher
-    from sim2real.workspace import Workspace
+    from cedar.dispatch import dispatcher_running, stop_dispatcher
+    from cedar.workspace import Workspace
 
     workspace = Workspace.open(tmp_path / "stubborn")
     (workspace.root / "activity").mkdir()

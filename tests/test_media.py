@@ -7,9 +7,9 @@ import pytest
 from PIL import Image
 from pypdf import PdfReader, PdfWriter
 
-from sim2real.agents import ToolFailure
-from sim2real.agents.media import MAX_IMAGE_BYTES, MAX_PDF_PAGES, SCALED_SIDE, load_media, parse_pages, viewable
-from sim2real.agents.toolkits import FileAccess, file_tools
+from cedar.agents import ToolFailure
+from cedar.agents.media import MAX_IMAGE_BYTES, MAX_PDF_PAGES, SCALED_SIDE, load_media, parse_pages, viewable
+from cedar.agents.toolkits import FileAccess, file_tools
 
 
 def image_bytes(size=(64, 32), fmt="PNG", mode="RGB") -> bytes:

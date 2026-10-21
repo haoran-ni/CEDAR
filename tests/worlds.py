@@ -8,11 +8,11 @@ from pathlib import Path
 from factories import AGENT, add_hypothesis, authorize, start_investigation
 from sites import co_on_cu111, declared, geometry_text
 
-from sim2real.contracts import PermissionAction, ProtocolRef, SchedulerState, ScientificTaskSpec
-from sim2real.engine import JobManager, JobMonitor, ProtocolEngine, ResultValidator
-from sim2real.engine.analysis import AnalysisRunner
-from sim2real.hpc.fake import FakeScheduler
-from sim2real.protocols import TOTAL_ENERGY, FhiAimsRun, ProtocolRegistry
+from cedar.contracts import PermissionAction, ProtocolRef, SchedulerState, ScientificTaskSpec
+from cedar.engine import JobManager, JobMonitor, ProtocolEngine, ResultValidator
+from cedar.engine.analysis import AnalysisRunner
+from cedar.hpc.fake import FakeScheduler
+from cedar.protocols import TOTAL_ENERGY, FhiAimsRun, ProtocolRegistry
 
 
 class World:

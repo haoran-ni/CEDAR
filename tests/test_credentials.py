@@ -5,9 +5,9 @@ from subprocess import CompletedProcess
 
 import pytest
 
-from sim2real.hpc import SlurmBackend
-from sim2real.models import CredentialStore, InsecureCredentials, MissingCredential
-from sim2real.secrets import redact, scrubbed_environment
+from cedar.hpc import SlurmBackend
+from cedar.models import CredentialStore, InsecureCredentials, MissingCredential
+from cedar.secrets import redact, scrubbed_environment
 
 KEY = "sk-ant-test-0123456789abcdefghij"
 
@@ -39,7 +39,7 @@ def test_environment_variable_overrides_the_file(tmp_path):
 
 
 def test_missing_key_says_how_to_add_one(store):
-    with pytest.raises(MissingCredential, match="sim2real auth add anthropic"):
+    with pytest.raises(MissingCredential, match="cedar auth add anthropic"):
         store.get("anthropic")
 
 
@@ -90,5 +90,5 @@ def test_slurm_commands_run_without_credentials():
         return CompletedProcess(argv, 0, stdout="12345\n", stderr="")
 
     backend = SlurmBackend(user="someone", runner=runner, environ={"PATH": "/bin", "ANTHROPIC_API_KEY": KEY})
-    assert backend.submit(Path("/tmp/job.sh"), Path("/tmp"), "s2r-x") == "12345"
+    assert backend.submit(Path("/tmp/job.sh"), Path("/tmp"), "cedar-x") == "12345"
     assert seen == {"PATH": "/bin"}

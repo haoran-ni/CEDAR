@@ -34,7 +34,7 @@ from factories import (
     submit,
     task,
 )
-from sim2real.contracts import (
+from cedar.contracts import (
     AnalysisOutcome,
     AnalysisRecorded,
     Assessment,
@@ -62,10 +62,10 @@ from sim2real.contracts import (
     TokenBudgetChanged,
     UserInterventionRecorded,
 )
-from sim2real.errors import InvalidTransition, RuleViolation
-from sim2real.state import ResearchLedger, replay
-from sim2real.state.projection import hypothesis_evidence
-from sim2real.store import IdempotencyConflict, SQLiteEventStore
+from cedar.errors import InvalidTransition, RuleViolation
+from cedar.state import ResearchLedger, replay
+from cedar.state.projection import hypothesis_evidence
+from cedar.store import IdempotencyConflict, SQLiteEventStore
 
 
 def predict(ledger, inv, hyp, prediction_id="pred-1", calculation_ids=()):

@@ -5,7 +5,7 @@ Hypothesis agents take results from finished calculations in two ways:
 - **Readings.** A value the code printed is recorded with `submit_reading`, citing the file and lines. The validator finds the quote in the stored output before recording it.
 - **Analysis scripts.** Anything that must be computed is handled by a Python script the agent writes, run with `run_analysis`. Examples: a gap from an eigenvalue table, a distance from a geometry, a planar average, or a difference between runs. The agent then records a result with `record_result`.
 
-No quantity is built into sim2real. The FHI-aims protocol (`fhiaims.run`) checks that a run is healthy; what to take from it is the agent's decision.
+No quantity is built into CEDAR. The FHI-aims protocol (`fhiaims.run`) checks that a run is healthy; what to take from it is the agent's decision.
 
 ## How a script runs
 
@@ -14,7 +14,7 @@ No quantity is built into sim2real. The FHI-aims protocol (`fhiaims.run`) checks
    - calls `os.system`, `os.popen`, `os.exec*`, `os.spawn*`, `os.fork` or `os.kill`
    - uses `eval`, `exec`, `compile` or `__import__`
 2. **Staging.** For each calculation it names, which must be one of its own hypothesis's, the requested files are copied read-only to `inputs/<calculation_id>/` in a fresh working directory: by default the run's stored outputs and its input files, or any file of the run directory named by relative path. Each file is identified by its content hash, and a file the run check already stored must be that same file.
-3. **Execution.** The script runs on the login node with the Python environment sim2real runs in (NumPy, SciPy, ASE and matplotlib available), with:
+3. **Execution.** The script runs on the login node with the Python environment CEDAR runs in (NumPy, SciPy, ASE and matplotlib available), with:
    - a clean environment: no credentials, a private home and temporary directory, single-threaded numerical libraries
    - limits: 10 minutes of CPU, 15 minutes of wall-clock time, 4 GiB of memory, 200 MiB per file written; at most two scripts run at once, whichever agents started them
    - an audit hook that refuses to read anything but the staged inputs, the Python installation and system libraries; to write, delete or rename anything outside the working directory; to start any program; or to open a socket
@@ -81,8 +81,8 @@ The evidence record already keeps everything such a review needs: the script, th
 
 ## Where it is implemented
 
-- `src/sim2real/engine/analysis.py`: examination, staging, execution, collection
-- `src/sim2real/engine/analysis_guard.py`: limits and the audit hook, run in the child process
-- `src/sim2real/engine/results.py`: run checks, readings and analysis results as evidence
-- `src/sim2real/agents/toolkits/research.py`: the agent's `run_outputs`, `submit_reading`, `run_analysis` and `record_result` tools
-- `src/sim2real/agents/prompts.py`: the correctness and safety requirements given to agents
+- `src/cedar/engine/analysis.py`: examination, staging, execution, collection
+- `src/cedar/engine/analysis_guard.py`: limits and the audit hook, run in the child process
+- `src/cedar/engine/results.py`: run checks, readings and analysis results as evidence
+- `src/cedar/agents/toolkits/research.py`: the agent's `run_outputs`, `submit_reading`, `run_analysis` and `record_result` tools
+- `src/cedar/agents/prompts.py`: the correctness and safety requirements given to agents

@@ -1,7 +1,7 @@
 import pytest
 
 from factories import RAW_OUTPUT, task
-from sim2real.contracts import DifferenceKind, ScientificTaskSpec, compare_tasks
+from cedar.contracts import DifferenceKind, ScientificTaskSpec, compare_tasks
 
 
 def kinds(report):

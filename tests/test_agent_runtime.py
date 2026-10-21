@@ -5,12 +5,12 @@ import json
 import pytest
 from pydantic import Field
 
-from sim2real.agents import AgentRunner, AgentTool, RunLimits, ToolFailure, ToolOutcome, TranscriptStore
-from sim2real.agents.tools import plain_schema
-from sim2real.contracts.base import Contract
-from sim2real.agents.runtime import MAX_PAUSED_CONTINUATIONS
-from sim2real.models import MediaPart, ModelError, ModelSettings, TextPart, ToolCall, ToolResult, Usage, WebAccess
-from sim2real.models.scripted import ScriptedModel, reply
+from cedar.agents import AgentRunner, AgentTool, RunLimits, ToolFailure, ToolOutcome, TranscriptStore
+from cedar.agents.tools import plain_schema
+from cedar.contracts.base import Contract
+from cedar.agents.runtime import MAX_PAUSED_CONTINUATIONS
+from cedar.models import MediaPart, ModelError, ModelSettings, TextPart, ToolCall, ToolResult, Usage, WebAccess
+from cedar.models.scripted import ScriptedModel, reply
 
 SETTINGS = ModelSettings(provider="scripted", model="scripted-model")
 KEY = "sk-ant-test-0123456789abcdefghij"
@@ -176,7 +176,7 @@ def test_schemas_are_inlined_and_keep_title_properties():
 
 
 def test_cached_input_counts_toward_the_token_limit(transcripts):
-    from sim2real.models import Usage
+    from cedar.models import Usage
 
     cached = reply(call("echo", text="x")).model_copy(update={"usage": Usage(input_tokens=1, cache_read_tokens=50)})
     result, _ = run(transcripts, [cached, reply(TextPart(text="ok"))], limits=RunLimits(max_tokens=40))

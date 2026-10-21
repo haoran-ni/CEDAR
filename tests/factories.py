@@ -1,6 +1,6 @@
 """Builders for test data. All numbers here are synthetic and carry no scientific meaning."""
 
-from sim2real.contracts import (
+from cedar.contracts import (
     CITATIONS_VERIFIED,
     Actor,
     ActorKind,
@@ -51,9 +51,9 @@ from sim2real.contracts import (
     UserInterventionRecorded,
     scientific_input_hash,
 )
-from sim2real.contracts.analysis import as_evidence_check
-from sim2real.state import ResearchLedger
-from sim2real.state.projection import agent_id_for
+from cedar.contracts.analysis import as_evidence_check
+from cedar.state import ResearchLedger
+from cedar.state.projection import agent_id_for
 
 USER = Actor(kind=ActorKind.USER, id="researcher")
 CHIEF = Actor(kind=ActorKind.CHIEF_SCIENTIST, id="chief")

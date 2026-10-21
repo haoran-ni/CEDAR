@@ -12,7 +12,7 @@ from pydantic import ValidationError
 from test_orchestration import INV as OPENED, call, make_system, open_and_delegate
 from test_swarm import INV, agents_answer, investigation, propose, says
 
-from sim2real.contracts import (
+from cedar.contracts import (
     AgentTaskQueued,
     InvestigationConstraints,
     InvestigationStatus,
@@ -22,11 +22,11 @@ from sim2real.contracts import (
     RetrievalPolicyChanged,
     UserInterventionRecorded,
 )
-from sim2real.errors import RuleViolation
-from sim2real.models import WebAccess
-from sim2real.models.scripted import reply
-from sim2real.notebook import render_notebook, round_file
-from sim2real.paths import config_dir
+from cedar.errors import RuleViolation
+from cedar.models import WebAccess
+from cedar.models.scripted import reply
+from cedar.notebook import render_notebook, round_file
+from cedar.paths import config_dir
 
 
 @pytest.fixture
@@ -198,7 +198,7 @@ def test_the_notebook_shows_web_access_and_materials(system, tmp_path):
 
 
 def test_agents_view_materials_by_id(artifacts, tmp_path):
-    from sim2real.agents.toolkits.materials import Material, material_tools
+    from cedar.agents.toolkits.materials import Material, material_tools
 
     figure = artifacts.put_file(png(tmp_path / "fig.png"), media_type="image/png")
     table = artifacts.put_bytes(b"energy,intensity\n" + b"".join(f"{i},{i * i}\n".encode() for i in range(300)),

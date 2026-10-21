@@ -1,4 +1,4 @@
-# AGENTS.md — Sim2Real Scientist
+# AGENTS.md — CEDAR
 
 > **Status:** Design and engineering specification, not a claim of completed functionality.
 > **Audience:** Human contributors and coding agents implementing this repository.
@@ -12,7 +12,6 @@ This file is the **primary repository-wide implementation contract**. Read the s
 - [`docs/ANALYSIS_SCRIPTS.md`](docs/ANALYSIS_SCRIPTS.md): analysis scripts agents write: how they run, their guards, correctness requirements, and planned independent review.
 - [`docs/DEMO_AND_EVALUATION.md`](docs/DEMO_AND_EVALUATION.md): initial cases, offline blind evaluation, baselines, and presentation requirements.
 - [`docs/IMPLEMENTATION_PLAN.md`](docs/IMPLEMENTATION_PLAN.md): vertical-slice milestones and acceptance criteria.
-- [`docs/DECISIONS.md`](docs/DECISIONS.md): settled requirements versus provisional choices.
 
 ## 1. Non-negotiable project goals
 
@@ -140,7 +139,7 @@ Prioritize convergence of the **target difference/observable** rather than only 
 
 ### 4.3 Portability: no site-specific settings in code
 
-Sim2Real must run on any HPC system. Nothing about a particular cluster belongs in the code: code binaries and versions, species or pseudopotential locations, environment setup, launch commands, schedulers, partitions, resource limits, or "usual" numerical settings taken from one group's past runs.
+CEDAR must run on any HPC system. Nothing about a particular cluster belongs in the code: code binaries and versions, species or pseudopotential locations, environment setup, launch commands, schedulers, partitions, resource limits, or "usual" numerical settings taken from one group's past runs.
 
 - An **environment-setup agent** (the Chief Scientist or a dedicated subagent) works out how to run each code on the current system, by reading local files (existing job scripts, inputs, module files, installation directories) or by asking the user. It proposes a **compute profile**: the code installations, job-script template, approved environment-setup lines, scheduler type, allowed partitions and limits. Each value records where it came from (file and content hash, or the user's answer).
 - Deterministic checks verify the proposed profile (paths exist, the binary is executable, the template is well formed). The profile takes effect only after the user approves it, and changing it later needs another approval.
@@ -252,7 +251,7 @@ For a short presentation, show a genuine discrepancy, live hypotheses, actual co
 - **TUI:** Textual with fixed upper dashboard, conversation, and input.
 - **References:** tools such as AiiDA, atomate2, pymatgen and custodian offer tested ideas for workflows/provenance/handlers, but first implementation should be intentionally narrow.
 
-Architectural decisions are provisional where marked in [`docs/DECISIONS.md`](docs/DECISIONS.md). Choose tested APIs according to actual installed versions; no dependency version or code-specific feature should be invented.
+Choose tested APIs according to actual installed versions; no dependency version or code-specific feature should be invented.
 
 ## 11. Development instructions for coding agents
 
@@ -267,7 +266,7 @@ Architectural decisions are provisional where marked in [`docs/DECISIONS.md`](do
 - **Do not confuse public reasoning summaries with hidden chain of thought.** Persist concise scientific decision records, observation-based rationales and validation steps, not model-private deliberation.
 - **Do not add fake installation or usage claims to README** until working commands have been exercised and tested. Do not claim novelty, awards, final publication, or validated scientific performance without supporting evidence.
 - **Provide tests:** protocol schema and invalid-input cases; input examination of agent-written files (approved, rejected, needs review); citation checks for agent readings of outputs; intended-control vs uncontrolled-change cases; parser convergence/failure checks; resume/idempotency; replayed events; user plan versions; cancellation; UI reconnect; blinded evaluation leak checks; unit/reference consistency; record/source linking.
-- **Document implementation changes** in the relevant docs and update [`docs/DECISIONS.md`](docs/DECISIONS.md) when a provisional design becomes a concrete decision.
+- **Document implementation changes** in the relevant docs.
 
 ## 12. Definition of done — minimum credible prototype
 

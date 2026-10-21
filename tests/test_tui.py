@@ -25,12 +25,12 @@ from test_orchestration import (
 )
 from textual.widgets import Collapsible, DataTable, Footer, Markdown, OptionList, Static, TextArea
 
-from sim2real.contracts import Assessment, AssessmentRecorded, Completeness, EventDraft, SchedulerState
-from sim2real.dashboard import short_id
-from sim2real.dispatch import JUDGE
-from sim2real.models import TextPart
-from sim2real.models.scripted import reply
-from sim2real.tui import (
+from cedar.contracts import Assessment, AssessmentRecorded, Completeness, EventDraft, SchedulerState
+from cedar.dashboard import short_id
+from cedar.dispatch import JUDGE
+from cedar.models import TextPart
+from cedar.models.scripted import reply
+from cedar.tui import (
     LOGO,
     MENU_COMMANDS,
     TAGLINE,
@@ -38,7 +38,7 @@ from sim2real.tui import (
     FileScreen,
     NotebookScreen,
     PanelTop,
-    Sim2RealApp,
+    CedarApp,
 )
 
 
@@ -127,7 +127,7 @@ def validated_run(system) -> str:
 def test_conversation_live_panel_and_approval(system):
     clients, dispatcher = system["clients"], system["dispatcher"]
     clients.add("chief_scientist", open_and_delegate(system["site"]), reply(TextPart(text="Opened and **delegated**.")))
-    app = Sim2RealApp(system["chat"], refresh_seconds=3600, clock=lambda: NOW)
+    app = CedarApp(system["chat"], refresh_seconds=3600, clock=lambda: NOW)
 
     async def script(pilot):
         await settle(pilot)
@@ -189,7 +189,7 @@ def test_commands_answer_while_the_chief_works_and_messages_wait_their_turn(syst
         return reply(TextPart(text="First answer."))
 
     system["clients"].add("chief_scientist", slow, reply(TextPart(text="Second answer.")))
-    app = Sim2RealApp(system["chat"], refresh_seconds=3600, clock=lambda: NOW)
+    app = CedarApp(system["chat"], refresh_seconds=3600, clock=lambda: NOW)
 
     async def script(pilot):
         app.query_one(Composer).value = "First question"
@@ -218,7 +218,7 @@ def test_commands_answer_while_the_chief_works_and_messages_wait_their_turn(syst
 
 def test_notebook_pages_and_cited_output_open_in_place(system):
     calc = validated_run(system)
-    app = Sim2RealApp(system["chat"], refresh_seconds=3600, clock=lambda: NOW)
+    app = CedarApp(system["chat"], refresh_seconds=3600, clock=lambda: NOW)
 
     async def script(pilot):
         await settle(pilot)
@@ -262,7 +262,7 @@ def test_notebook_pages_and_cited_output_open_in_place(system):
 
 def test_new_results_raise_an_alert_once(system):
     validated_run(system)
-    app = Sim2RealApp(system["chat"], refresh_seconds=3600, clock=lambda: NOW)
+    app = CedarApp(system["chat"], refresh_seconds=3600, clock=lambda: NOW)
     alerts = []
     app.notify = lambda message, **_: alerts.append(message)
 
@@ -283,7 +283,7 @@ def test_new_results_raise_an_alert_once(system):
 
 def test_narrow_terminals_start_with_the_panel_hidden_and_a_summary_shown(system):
     validated_run(system)
-    app = Sim2RealApp(system["chat"], refresh_seconds=3600, clock=lambda: NOW)
+    app = CedarApp(system["chat"], refresh_seconds=3600, clock=lambda: NOW)
 
     async def script(pilot):
         await settle(pilot)
@@ -306,7 +306,7 @@ def test_the_chief_scientists_reviews_appear_as_its_messages(system):
     dispatcher.tick()
     dispatcher.chief_reviews = True
     clients.add("chief_scientist", reply(TextPart(text="The agent has **not requested** any calculation yet.")))
-    app = Sim2RealApp(system["chat"], refresh_seconds=3600, clock=lambda: NOW)
+    app = CedarApp(system["chat"], refresh_seconds=3600, clock=lambda: NOW)
 
     async def script(pilot):
         await settle(pilot)
@@ -322,7 +322,7 @@ def test_the_chief_scientists_reviews_appear_as_its_messages(system):
 
 
 def test_the_panel_is_always_there_with_the_logo_across_its_top_border(system):
-    app = Sim2RealApp(system["chat"], refresh_seconds=3600, clock=lambda: NOW)
+    app = CedarApp(system["chat"], refresh_seconds=3600, clock=lambda: NOW)
 
     async def script(pilot):
         await settle(pilot)
@@ -342,7 +342,7 @@ def test_the_panel_is_always_there_with_the_logo_across_its_top_border(system):
 
 def test_on_narrow_terminals_the_panel_stays_and_its_table_can_be_shown(system):
     validated_run(system)
-    app = Sim2RealApp(system["chat"], refresh_seconds=3600, clock=lambda: NOW)
+    app = CedarApp(system["chat"], refresh_seconds=3600, clock=lambda: NOW)
 
     async def script(pilot):
         await settle(pilot)
@@ -355,7 +355,7 @@ def test_on_narrow_terminals_the_panel_stays_and_its_table_can_be_shown(system):
 
 
 def test_a_slash_at_the_start_of_a_line_lists_the_matching_commands(system):
-    app = Sim2RealApp(system["chat"], refresh_seconds=3600, clock=lambda: NOW)
+    app = CedarApp(system["chat"], refresh_seconds=3600, clock=lambda: NOW)
 
     def shown() -> list[str]:
         menu = app.query_one("#commands", OptionList)
@@ -419,7 +419,7 @@ def test_each_table_shows_at_most_three_rows_and_scrolls_for_the_rest(system):
     open_and_start(system)
     for n in range(14):
         add_hypothesis(system["workspace"].ledger, INV, f"hyp-{n:02d}")
-    app = Sim2RealApp(system["chat"], refresh_seconds=3600, clock=lambda: NOW)
+    app = CedarApp(system["chat"], refresh_seconds=3600, clock=lambda: NOW)
 
     async def script(pilot):
         await settle(pilot)
@@ -435,7 +435,7 @@ def test_each_table_shows_at_most_three_rows_and_scrolls_for_the_rest(system):
 
 def test_the_panel_shows_the_mode_and_web_access_on_their_own_line(system):
     system["clients"].add("chief_scientist", open_and_delegate(system["site"]), reply(TextPart(text="Opened.")))
-    app = Sim2RealApp(system["chat"], refresh_seconds=3600, clock=lambda: NOW)
+    app = CedarApp(system["chat"], refresh_seconds=3600, clock=lambda: NOW)
 
     def mode():
         widget = app.query_one("#mode", Static)
@@ -462,7 +462,7 @@ def test_the_panel_shows_the_mode_and_web_access_on_their_own_line(system):
 
 
 def test_the_input_box_wraps_grows_and_takes_clicks(system):
-    app = Sim2RealApp(system["chat"], refresh_seconds=3600, clock=lambda: NOW)
+    app = CedarApp(system["chat"], refresh_seconds=3600, clock=lambda: NOW)
 
     async def script(pilot):
         await settle(pilot)
@@ -491,7 +491,7 @@ def test_the_input_box_wraps_grows_and_takes_clicks(system):
 
 def test_the_conversation_has_no_shortcut_keys(system):
     validated_run(system)
-    app = Sim2RealApp(system["chat"], refresh_seconds=3600, clock=lambda: NOW)
+    app = CedarApp(system["chat"], refresh_seconds=3600, clock=lambda: NOW)
 
     async def script(pilot):
         await settle(pilot)
@@ -515,12 +515,12 @@ def test_the_window_starts_a_dispatcher_when_work_waits_and_none_runs(system):
     started = []
     session = system["chat"]
     session.auto_dispatch, session.start_dispatcher = True, lambda workspace: started.append(workspace) or 4242
-    app = Sim2RealApp(session, refresh_seconds=3600, clock=lambda: NOW)
+    app = CedarApp(session, refresh_seconds=3600, clock=lambda: NOW)
 
     async def script(pilot):
         await settle(pilot)
         assert len(started) == 1 and "[dispatcher] Started in the background (process 4242)" in conversation(app)
-        assert "one starts by itself when there is work" in status(app) and "start `sim2real dispatch`" not in status(app)
+        assert "one starts by itself when there is work" in status(app) and "start `cedar dispatch`" not in status(app)
         await refresh(pilot)
         assert len(started) == 1  # not restarted within a minute
 

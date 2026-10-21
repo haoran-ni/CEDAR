@@ -4,7 +4,7 @@ import pytest
 from ase.build import molecule
 from sites import aims_output, co_on_cu111, declared, geometry_text
 
-from sim2real.contracts import (
+from cedar.contracts import (
     ExaminationVerdict,
     FindingSeverity,
     Observable,
@@ -13,8 +13,8 @@ from sim2real.contracts import (
     ScientificTaskSpec,
     verdict_for,
 )
-from sim2real.contracts.status import EvidenceQuality
-from sim2real.protocols import FhiAimsRun
+from cedar.contracts.status import EvidenceQuality
+from cedar.protocols import FhiAimsRun
 
 PROTOCOL = ProtocolRef(name="fhiaims.run", version="0.1")
 WORK_FUNCTION = Observable(name="work function", definition="vacuum level minus Fermi level", unit="eV")

@@ -5,7 +5,7 @@ import httpx2
 import pytest
 from anthropic.types.beta import BetaMessage
 
-from sim2real.models import (
+from cedar.models import (
     MediaPart,
     Message,
     ModelError,
@@ -16,7 +16,7 @@ from sim2real.models import (
     ToolSpec,
     WebAccess,
 )
-from sim2real.models.anthropic_client import AnthropicClient
+from cedar.models.anthropic_client import AnthropicClient
 
 KEY = "sk-ant-test-0123456789abcdefghij"
 SETTINGS = ModelSettings(provider="anthropic", model="claude-opus-5-5", effort="high")

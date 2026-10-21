@@ -24,7 +24,7 @@ from factories import (
     task,
 )
 
-from sim2real.contracts import (
+from cedar.contracts import (
     AgentRetired,
     AgentRunRecorded,
     AgentSpec,
@@ -41,7 +41,7 @@ from sim2real.contracts import (
     SchedulerState,
     UserInterventionRecorded,
 )
-from sim2real.dashboard import (
+from cedar.dashboard import (
     age,
     agent_rows,
     dispatcher_status,
@@ -53,9 +53,9 @@ from sim2real.dashboard import (
     swarm_rows,
     work_summary,
 )
-from sim2real.models import ModelSettings
-from sim2real.dispatch import Activity
-from sim2real.workspace import Workspace
+from cedar.models import ModelSettings
+from cedar.dispatch import Activity
+from cedar.workspace import Workspace
 
 LATER = datetime.now(timezone.utc) + timedelta(minutes=5)
 
@@ -210,7 +210,7 @@ def test_the_agents_table_shows_every_agent_and_what_it_is_doing(workspace):
 
 def test_dispatcher_status_and_status_line(ledger):
     now = LATER
-    assert dispatcher_status(None, [], now) == ("no dispatcher has run: start `sim2real dispatch`", True)
+    assert dispatcher_status(None, [], now) == ("no dispatcher has run: start `cedar dispatch`", True)
     assert dispatcher_status(601, [], now)[1] and "silent for 10 min" in dispatcher_status(601, [], now)[0]
     assert dispatcher_status(30, [], now) == ("dispatcher seen 30 s ago", False)
 
@@ -265,7 +265,7 @@ def test_the_panel_names_the_models_in_use(ledger):
     def missing(role):
         raise KeyError(role)
 
-    assert model_line(missing, None) == "Model: none configured (sim2real models init)"
+    assert model_line(missing, None) == "Model: none configured (cedar models init)"
     mixed = {"hypothesis_agent": ModelSettings(provider="anthropic", model="claude-sonnet-5-5")}
     assert model_line(lambda role: mixed.get(role, opus), None) == (
         "Models: Chief Scientist claude-opus-5-5, effort high (anthropic) · hypothesis agents claude-sonnet-5-5 "
@@ -289,7 +289,7 @@ def test_the_panel_says_when_queued_work_waits_for_a_dispatcher(ledger):
                                                     agent_id=AGENT.id, instruction="test it"))])
     state = ledger.load(inv)
     assert subagent_status(state, [], LATER, dispatcher_running=False) == (
-        "No working sub-agents · 1 task queued, waiting for a dispatcher: start `sim2real dispatch`")
+        "No working sub-agents · 1 task queued, waiting for a dispatcher: start `cedar dispatch`")
     assert subagent_status(state, [], LATER) == "No working sub-agents · 1 task queued"
     working = Activity(investigation_id=inv, task_id="t-1", role="hypothesis_agent", hypothesis_id=hyp,
                        agent_id=AGENT.id, started_at=LATER)

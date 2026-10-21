@@ -21,7 +21,7 @@ from test_orchestration import (
     open_and_start,
 )
 
-from sim2real.contracts import (
+from cedar.contracts import (
     ActorKind,
     AgentRunRecorded,
     AgentsStarted,
@@ -32,14 +32,14 @@ from sim2real.contracts import (
     PermissionAction,
     SchedulerState,
 )
-from sim2real.contracts.base import Actor
-from sim2real.dashboard import mode_line
-from sim2real.dispatch import SYSTEM
-from sim2real.errors import RuleViolation
-from sim2real.models import TextPart
-from sim2real.models.scripted import reply
-from sim2real.notebook import render_notebook
-from sim2real.summaries import approval_requests, investigation_summary
+from cedar.contracts.base import Actor
+from cedar.dashboard import mode_line
+from cedar.dispatch import SYSTEM
+from cedar.errors import RuleViolation
+from cedar.models import TextPart
+from cedar.models.scripted import reply
+from cedar.notebook import render_notebook
+from cedar.summaries import approval_requests, investigation_summary
 
 APPROVER = Actor(kind=ActorKind.APPROVER, id="approver")
 
@@ -120,9 +120,9 @@ def test_in_full_automation_the_approver_and_the_judge_carry_the_investigation(t
 
 
 def test_the_researcher_switches_modes_and_sees_which_one_is_on(system, monkeypatch):
-    import sim2real.chat
+    import cedar.chat
 
-    monkeypatch.setattr(sim2real.chat, "stop_dispatcher", lambda ws, timeout, force: "Stopped.")
+    monkeypatch.setattr(cedar.chat, "stop_dispatcher", lambda ws, timeout, force: "Stopped.")
     ledger, chat = system["workspace"].ledger, system["chat"]
     open_and_start(system)  # msg-1 and msg-2
     usage = "Usage: /mode, /mode human-in-the-loop, or /mode full-automation <core-hours> <tokens>"
@@ -150,8 +150,8 @@ def test_the_researcher_switches_modes_and_sees_which_one_is_on(system, monkeypa
 
 
 def test_the_approver_decides_only_in_full_automation_and_within_its_core_hours(system):
-    from sim2real.automation import approver_due
-    from sim2real.state.projection import authorization_for
+    from cedar.automation import approver_due
+    from cedar.state.projection import authorization_for
 
     ledger, chat, dispatcher, scheduler = (system["workspace"].ledger, system["chat"], system["dispatcher"],
                                            system["scheduler"])

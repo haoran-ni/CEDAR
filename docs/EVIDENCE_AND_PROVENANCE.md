@@ -1,8 +1,7 @@
 # Evidence and provenance
 
-How Sim2Real Scientist records what happened in an investigation, and how a claim in a
-report can be traced back to the files it rests on. [`DECISIONS.md`](DECISIONS.md) lists the
-rules the record enforces; this document describes the structures.
+How CEDAR records what happened in an investigation, and how a claim in a
+report can be traced back to the files it rests on.
 
 ## Two layers
 
@@ -17,8 +16,8 @@ regenerated from the log.
 
 ## What lives where
 
-Under the data directory (`$SIM2REAL_DATA_DIR`, else `$XDG_DATA_HOME/sim2real`, else
-`~/.local/share/sim2real`):
+Under the data directory (`$CEDAR_DATA_DIR`, else `$XDG_DATA_HOME/cedar`, else
+`~/.local/share/cedar`):
 
 | Path | Contents |
 |---|---|
@@ -119,6 +118,6 @@ Rules the pages follow:
 - **No hidden reasoning.** The notebook contains the agents' stated summaries and the reasons they recorded, never model-internal reasoning. Secrets never reach the log, so they cannot reach the notebook.
 
 The dispatcher regenerates the notebook of every investigation whose log grew, on each
-tick. `/report` in the chat and `sim2real report` regenerate it on demand. Writers take a
+tick. `/report` in the chat and `cedar report` regenerate it on demand. Writers take a
 lock and render from the log as it is once they hold it, and only pages whose content
 changed are rewritten, each atomically.

@@ -1,6 +1,6 @@
 import pytest
 
-from sim2real.contracts.status import (
+from cedar.contracts.status import (
     CALCULATION_MACHINE,
     HYPOTHESIS_MACHINE,
     INVESTIGATION_MACHINE,
@@ -8,7 +8,7 @@ from sim2real.contracts.status import (
     HypothesisStatus as H,
     InvestigationStatus as I,
 )
-from sim2real.errors import InvalidTransition
+from cedar.errors import InvalidTransition
 
 
 def walk(machine, start, *targets):

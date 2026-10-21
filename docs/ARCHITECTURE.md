@@ -4,7 +4,7 @@
 
 ## 1. System model
 
-Sim2Real Scientist is a **persistent research investigation service** whose individual LLM invocations and scientific tasks are ephemeral. It combines (a) an always-available conversational control plane, (b) an asynchronously executed hypothesis investigation graph, (c) a restricted scientific computation plane, and (d) an append-oriented evidence and provenance store.
+CEDAR is a **persistent research investigation service** whose individual LLM invocations and scientific tasks are ephemeral. It combines (a) an always-available conversational control plane, (b) an asynchronously executed hypothesis investigation graph, (c) a restricted scientific computation plane, and (d) an append-oriented evidence and provenance store.
 
 ```mermaid
 flowchart TB
@@ -160,7 +160,7 @@ If the user asks to pause a mechanism, do not throw away its evidence. Distingui
 The **Textual** TUI is an independent client. The upper region stays fixed; only chat and optional detail panes scroll.
 
 ```text
-┌─ Sim2Real Scientist ─ CO/Cu(111) ─ Plan v3 ─ Round 2 ─────┐
+┌─ CEDAR ─ CO/Cu(111) ─ Plan v3 ─ Round 2 ──────────────────┐
 │ HYPOTHESIS SWARM                           [expand]       │
 │ XC mechanism       │ waiting: Slurm #...  │ inconclusive │
 │ Coverage / packing │ analyzing evidence   │ open         │

@@ -26,8 +26,8 @@ from factories import (
     task,
 )
 
-from sim2real.agents.toolkits.chief import ChiefContext, chief_tools
-from sim2real.contracts import (
+from cedar.agents.toolkits.chief import ChiefContext, chief_tools
+from cedar.contracts import (
     AgentRunRecorded,
     Assessment,
     AssessmentRecorded,
@@ -46,8 +46,8 @@ from sim2real.contracts import (
     SchedulerState,
     UserInterventionRecorded,
 )
-from sim2real.notebook import ROUND_SECTIONS, render_notebook, update_notebook
-from sim2real.workspace import Workspace
+from cedar.notebook import ROUND_SECTIONS, render_notebook, update_notebook
+from cedar.workspace import Workspace
 
 TEMPLATE = Path(__file__).resolve().parents[1] / "templates" / "ROUND_REPORT.md"
 REPORT_WITH_HEADING = "Baseline done.\n## What is next?\nRun the hybrid functional."

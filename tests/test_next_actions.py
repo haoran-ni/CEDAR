@@ -9,8 +9,8 @@ from pydantic import ValidationError
 from test_orchestration import make_system
 from test_swarm import INV, investigation, propose
 
-from sim2real.agents.toolkits.chief import ChiefContext, chief_tools
-from sim2real.contracts import (
+from cedar.agents.toolkits.chief import ChiefContext, chief_tools
+from cedar.contracts import (
     AgentsProposed,
     AgentSpec,
     CandidateAction,
@@ -19,10 +19,10 @@ from sim2real.contracts import (
     NextActionsRecommended,
     PredictionRegistered,
 )
-from sim2real.contracts.hypothesis import Prediction
-from sim2real.errors import RuleViolation
-from sim2real.notebook import render_notebook, round_file
-from sim2real.summaries import calculation_summary, investigation_summary
+from cedar.contracts.hypothesis import Prediction
+from cedar.errors import RuleViolation
+from cedar.notebook import render_notebook, round_file
+from cedar.summaries import calculation_summary, investigation_summary
 
 
 @pytest.fixture

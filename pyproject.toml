@@ -3,9 +3,9 @@ requires = ["setuptools>=64"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "sim2real"
+name = "cedar"
 version = "0.0.1"
-description = "Hypothesis-driven agent swarm for simulation-experiment discrepancies (pre-alpha)."
+description = "Autonomous Scientific Agent Swarm for Computation-Experiment Discrepancies"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = ["pydantic>=2.14,<3", "ase>=3.29", "numpy>=2", "anthropic>=1.15,<2", "textual>=8.2,<9", "pypdf>=6",
@@ -15,7 +15,7 @@ dependencies = ["pydantic>=2.14,<3", "ase>=3.29", "numpy>=2", "anthropic>=1.15,<
 dev = ["pytest>=9.1"]
 
 [project.scripts]
-sim2real = "sim2real.cli:main"
+cedar = "cedar.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

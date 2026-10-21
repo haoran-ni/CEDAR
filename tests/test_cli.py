@@ -2,16 +2,16 @@ import stat
 
 import pytest
 
-from sim2real import __version__, cli
-from sim2real.models.scripted import ScriptedModel, reply
-from sim2real.models.types import TextPart
+from cedar import __version__, cli
+from cedar.models.scripted import ScriptedModel, reply
+from cedar.models.types import TextPart
 
 KEY = "sk-ant-test-0123456789abcdefghij"
 
 
 @pytest.fixture(autouse=True)
 def isolated_config(tmp_path, monkeypatch):
-    monkeypatch.setenv("SIM2REAL_CONFIG_DIR", str(tmp_path / "config"))
+    monkeypatch.setenv("CEDAR_CONFIG_DIR", str(tmp_path / "config"))
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     return tmp_path / "config"
 
@@ -20,7 +20,7 @@ def test_version_flag(capsys):
     with pytest.raises(SystemExit) as exit_info:
         cli.main(["--version"])
     assert exit_info.value.code == 0
-    assert capsys.readouterr().out.strip() == f"sim2real {__version__}"
+    assert capsys.readouterr().out.strip() == f"cedar {__version__}"
 
 
 def test_auth_add_status_remove(monkeypatch, capsys, isolated_config):
@@ -47,7 +47,7 @@ def test_models_init_show(capsys, isolated_config):
 def test_models_check_reports_the_serving_model(monkeypatch, capsys):
     cli.main(["models", "init"])
     model = ScriptedModel([reply(TextPart(text="ready"), model="claude-opus-5-5")])
-    monkeypatch.setattr("sim2real.models.create_client", lambda settings, credentials: model)
+    monkeypatch.setattr("cedar.models.create_client", lambda settings, credentials: model)
     assert cli.main(["models", "check"]) == 0
     assert "answered with claude-opus-5-5" in capsys.readouterr().out
     assert model.calls[0].settings.max_output_tokens == 1024

@@ -10,7 +10,7 @@ from pathlib import Path
 from ase import Atoms
 from ase.build import add_adsorbate, fcc111
 
-from sim2real.hpc.profile import CodeInstallation, ComputeProfile, ProfileSource, SchedulerLimits
+from cedar.hpc.profile import CodeInstallation, ComputeProfile, ProfileSource, SchedulerLimits
 
 ELEMENTS = {"H": 1, "C": 6, "O": 8, "Cu": 29}
 VERSION = "test-1.0"

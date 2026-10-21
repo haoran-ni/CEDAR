@@ -49,15 +49,29 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from sim2real.agents import AgentRunner, RunLimits, record_agent_run
-from sim2real.agents.prompts import CHIEF_SCIENTIST, EVIDENCE_JUDGE, HYPOTHESIS_AGENT
+from sim2real.agents.prompts import APPROVER, CHIEF_SCIENTIST, EVIDENCE_JUDGE, HYPOTHESIS_AGENT
 from sim2real.agents.toolkits import ResearchContext, file_tools, research_tools
+from sim2real.agents.toolkits.approver import ApproverContext, approver_tools, decisions_text
 from sim2real.agents.toolkits.chief import ChiefContext, chief_tools
 from sim2real.agents.toolkits.judge import JudgeContext, judge_tools
 from sim2real.agents.toolkits.research import agent_file_access
 from sim2real.contracts.base import Actor, ActorKind, new_id
-from sim2real.contracts.events import AgentTaskQueued, EventDraft, HypothesisStatusChanged
+from sim2real.automation import approver_due, judgements_due
+from sim2real.contracts.events import (
+    AgentTaskQueued,
+    EventDraft,
+    HypothesisStatusChanged,
+    InvestigationStatusChanged,
+    ModeChanged,
+)
 from sim2real.contracts.plan import PermissionAction, Priority
-from sim2real.contracts.status import INVESTIGATION_MACHINE, CalculationState, HypothesisStatus, InvestigationStatus
+from sim2real.contracts.status import (
+    INVESTIGATION_MACHINE,
+    CalculationState,
+    HypothesisStatus,
+    InvestigationMode,
+    InvestigationStatus,
+)
 from sim2real.engine.jobs import InputsChanged
 from sim2real.errors import RuleViolation
 from sim2real.hpc.profile import ProfileNotApproved, ProfileStore
@@ -71,6 +85,7 @@ from sim2real.workspace import ModelClients, Services, Workspace, profile_for, r
 
 SYSTEM = Actor(kind=ActorKind.SYSTEM, id="dispatcher")
 JUDGE = Actor(kind=ActorKind.EVIDENCE_JUDGE, id="evidence-judge")
+APPROVER_ACTOR = Actor(kind=ActorKind.APPROVER, id="approver")
 _ENDED = frozenset({CalculationState.SCHEDULER_TERMINAL, CalculationState.PARSING, CalculationState.QUALITY_ASSESSED,
                     CalculationState.REJECTED, CalculationState.CANCELLED})
 _ORDER = {Priority.HIGH: 0, Priority.NORMAL: 1, Priority.LOW: 2, Priority.ON_HOLD: 3}
@@ -89,14 +104,17 @@ _LIVE = frozenset({CalculationState.SUBMISSION_PENDING, CalculationState.SUBMITT
 
 def needs_dispatcher(state: InvestigationState) -> bool:
     """Whether the investigation has work only a dispatcher carries out: a proposal waiting out its review
-    window, agent work that can run, a review that is due, or a calculation authorized, at the scheduler or
-    waiting for its run check."""
+    window, agent work that can run, a review that is due, in full automation a decision or an assessment to
+    queue (or its allowance to end), or a calculation authorized, at the scheduler or waiting for its run check."""
     if state.status in INVESTIGATION_MACHINE.terminal:
         return False
     proposal = state.pending_proposal
     if proposal is not None and not proposal.feedback_ids:
         return True
     if any(Dispatcher._runnable(state, t) for t in state.pending_tasks) or review_due(state):
+        return True
+    if state.automation is not None and (approver_due(state) or judgements_due(state)
+                                         or state.automation_tokens_left <= 0):
         return True
     for calc in state.calculations.values():
         if calc.state in _LIVE:
@@ -282,8 +300,11 @@ class Dispatcher:
             notes += self._submit(investigation_id, services)
             notes += self._poll(investigation_id, services)
             notes += self._check_runs(investigation_id, services)
+        notes += self._end_spent_automation(investigation_id)
         notes += self._start_proposed(investigation_id)
         notes += self._wake(investigation_id)
+        notes += self._queue_judgements(investigation_id)
+        notes += self._queue_approver(investigation_id)
         notes += self._queue_review(investigation_id)
         notes += self._launch(investigation_id, services)
         return [f"{investigation_id}: {n}" for n in notes]
@@ -339,8 +360,8 @@ class Dispatcher:
         state = self.workspace.ledger.load(investigation_id)
         proposal = state.pending_proposal
         if (proposal is None or proposal.feedback_ids or state.status is not InvestigationStatus.INVESTIGATING
-                or self.clock() < review_deadline(state, proposal)):
-            return []
+                or state.automation is not None or self.clock() < review_deadline(state, proposal)):
+            return []  # in full automation the approver decides instead
 
         def build(current: InvestigationState) -> list[EventDraft]:
             waiting = current.pending_proposal
@@ -385,6 +406,55 @@ class Dispatcher:
             notes.append(f"woke the agent for {hyp.hypothesis_id}")
         return notes
 
+    def _end_spent_automation(self, investigation_id: str) -> list[str]:
+        """Once full automation's token allowance is used up, switch back to human-in-the-loop and pause."""
+        state = self.workspace.ledger.load(investigation_id)
+        if state.automation is None or state.automation_tokens_left > 0:
+            return []
+        reason = (f"full automation's allowance of {state.automation.max_tokens:,} tokens is used up; the "
+                  "investigation waits for the researcher")
+
+        def build(current: InvestigationState) -> list[EventDraft]:
+            if current.automation is None or current.automation_tokens_left > 0:
+                return []
+            drafts = [EventDraft(actor=SYSTEM, payload=ModeChanged(mode=InvestigationMode.HUMAN_IN_THE_LOOP,
+                                                                   reason=reason))]
+            if current.status not in INVESTIGATION_MACHINE.suspend | INVESTIGATION_MACHINE.terminal:
+                drafts.append(EventDraft(actor=SYSTEM, payload=InvestigationStatusChanged(
+                    status=InvestigationStatus.PAUSED, reason=reason)))
+            return drafts
+
+        result = self.workspace.ledger.record_with(investigation_id, build)
+        return [] if result.deduplicated or not result.events else [f"{reason}: back to human-in-the-loop, paused"]
+
+    def _queue_judgements(self, investigation_id: str) -> list[str]:
+        """In full automation, the Evidence Judge assesses every hypothesis that has new evidence, before the Chief
+        Scientist's review."""
+        due = judgements_due(self.workspace.ledger.load(investigation_id))
+        if not due:
+            return []
+
+        def build(state: InvestigationState) -> list[EventDraft]:
+            return [EventDraft(actor=SYSTEM, payload=AgentTaskQueued(
+                task_id=new_id("task"), role="evidence_judge", hypothesis_id=hypothesis_id,
+                instruction=f"Assess {hypothesis_id}: evidence {', '.join(evidence)} was recorded since it was last "
+                            "assessed. The investigation is in full automation, so your assessment is the check of "
+                            "these results against the hypothesis's predictions before the Chief Scientist decides "
+                            "what follows.")) for hypothesis_id, evidence in judgements_due(state)]
+
+        result = self.workspace.ledger.record_with(investigation_id, build)
+        return [f"queued the Evidence Judge on {e.payload.hypothesis_id}" for e in result.events]
+
+    def _queue_approver(self, investigation_id: str) -> list[str]:
+        """In full automation, wake the approver for decisions it has not been offered yet."""
+        if not approver_due(self.workspace.ledger.load(investigation_id)):
+            return []
+        result = self.workspace.ledger.record_with(investigation_id, lambda state: [EventDraft(
+            actor=SYSTEM, payload=AgentTaskQueued(
+                task_id=new_id("task"), role="approver",
+                instruction="Decide, on the researcher's behalf, what waits for you."))] if approver_due(state) else [])
+        return [] if result.deduplicated or not result.events else ["queued the approver's decisions"]
+
     def _queue_review(self, investigation_id: str) -> list[str]:
         """Fan-in: once every agent given work has reported, the Chief Scientist reviews what came in."""
         if not self.chief_reviews or not review_due(self.workspace.ledger.load(investigation_id)):
@@ -407,6 +477,8 @@ class Dispatcher:
         state = self.workspace.ledger.load(investigation_id)
         if task.agent_id is not None and not state.agents[task.agent_id].active:
             return f"{task.agent_id} was retired"
+        if task.role == "approver" and state.automation is None:
+            return "the investigation is no longer in full automation"
         allowed = _WORKING if task.role != "hypothesis_agent" else (InvestigationStatus.INVESTIGATING,)
         if state.status not in allowed:
             return f"the investigation is {state.status.value}"
@@ -418,11 +490,17 @@ class Dispatcher:
             return False
         if task.role == "hypothesis_agent":
             return state.status is InvestigationStatus.INVESTIGATING
+        if task.role == "approver" and state.automation is None:
+            return False
         return state.status in (InvestigationStatus.INVESTIGATING, InvestigationStatus.REVIEWING)
 
     def _limits(self, state: InvestigationState, task: AgentTaskRecord) -> tuple[RunLimits | None, str | None]:
         """The run's limits, within what the investigation and the agent have left; or why it must wait."""
         investigation_left = state.model_tokens_remaining
+        automation_left = state.automation_tokens_left
+        if automation_left is not None:  # full automation's allowance caps every run, like a budget
+            investigation_left = automation_left if investigation_left is None else min(investigation_left,
+                                                                                        automation_left)
         if investigation_left is not None:
             if investigation_left <= 0:
                 return None, "the model token budget is spent; queued agent work waits for a larger budget"
@@ -447,7 +525,7 @@ class Dispatcher:
 
         def order(task: AgentTaskRecord) -> tuple:
             priority = state.plan.priority(task.hypothesis_id) if task.hypothesis_id else Priority.HIGH
-            return task.role != "chief_scientist", _ORDER[priority], task.queued_at
+            return task.role != "approver", task.role != "chief_scientist", _ORDER[priority], task.queued_at
 
         notes = []
         for task in sorted(state.pending_tasks, key=order):
@@ -471,7 +549,7 @@ class Dispatcher:
 
     def _execute(self, run: _Run, services: Services | None, limits: RunLimits) -> None:
         task = run.task
-        about = task.hypothesis_id or "the review"
+        about = task.hypothesis_id or ("the decisions" if task.role == "approver" else "the review")
         try:
             outcome = self.run_task(run.investigation_id, task, services, limits)
             run.note = f"{run.investigation_id}: {task.role} ran {task.task_id} for {about}: {outcome}"
@@ -521,6 +599,12 @@ class Dispatcher:
             tools = judge_tools(JudgeContext(ledger=self.workspace.ledger, investigation_id=investigation_id,
                                              actor=actor, artifacts=self.workspace.artifacts))
             system, session = EVIDENCE_JUDGE, f"{investigation_id}.judge"
+        elif role == "approver":
+            actor = APPROVER_ACTOR
+            tools = approver_tools(ApproverContext(ledger=self.workspace.ledger, investigation_id=investigation_id,
+                                                   actor=actor))
+            system, session = APPROVER, f"{investigation_id}.approver"
+            instruction += "\n\n" + decisions_text(state)
         else:
             actor = CHIEF
             tools = chief_tools(ChiefContext(

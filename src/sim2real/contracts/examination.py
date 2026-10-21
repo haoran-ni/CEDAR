@@ -84,6 +84,8 @@ class InputExamination(Contract):
     input_hash: Sha256Hex
     findings: tuple[Finding, ...] = ()
     verdict: ExaminationVerdict
+    requested_core_hours: float | None = Field(default=None, ge=0)
+    """What the job script asks of the scheduler (tasks times walltime), if the protocol can read it."""
 
     @model_validator(mode="after")
     def _consistent(self) -> "InputExamination":

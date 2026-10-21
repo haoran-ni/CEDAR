@@ -18,10 +18,11 @@ from sim2real.contracts.events import (
     AgentTaskQueued,
     EventDraft,
     InvestigationStatusChanged,
+    ModeChanged,
     ProposalWithdrawn,
 )
 from sim2real.contracts.plan import Priority
-from sim2real.contracts.status import INVESTIGATION_MACHINE, InvestigationStatus
+from sim2real.contracts.status import INVESTIGATION_MACHINE, InvestigationMode, InvestigationStatus
 from sim2real.state.projection import (
     AgentRecord,
     AgentTaskRecord,
@@ -91,10 +92,14 @@ def close_drafts(state: InvestigationState, closing: ClosingRecord, actor: Actor
         status=closing.status, reason=reason, authorization_id=authorization_id))]
 
 
-def halt_drafts(state: InvestigationState, actor: Actor, reason: str) -> list[EventDraft]:
-    """Withdraw a waiting proposal, retire every agent and pause the investigation; a run in progress stops at its
-    next model call, and nothing new starts until the investigation is resumed."""
+def halt_drafts(state: InvestigationState, actor: Actor, reason: str,
+                intervention_id: str | None = None) -> list[EventDraft]:
+    """Withdraw a waiting proposal, retire every agent, switch full automation off and pause the investigation; a
+    run in progress stops at its next model call, and nothing new starts until the investigation is resumed."""
     drafts = _wind_down(state, actor, reason)
+    if state.automation is not None:
+        drafts.append(EventDraft(actor=actor, payload=ModeChanged(
+            mode=InvestigationMode.HUMAN_IN_THE_LOOP, reason=reason, intervention_id=intervention_id)))
     if state.status not in INVESTIGATION_MACHINE.suspend | INVESTIGATION_MACHINE.terminal:
         drafts.append(EventDraft(actor=actor, payload=InvestigationStatusChanged(
             status=InvestigationStatus.PAUSED, reason=reason)))
@@ -167,19 +172,23 @@ def blocking_tasks(state: InvestigationState) -> list[AgentTaskRecord]:
 
 
 def review_due(state: InvestigationState) -> bool:
-    """Whether agents reported since the last review, none of them has work left in hand, and no proposed agents
-    are about to start: those are reviewed together with the rest. A proposal the researcher's reply holds does not
-    hold the review back, nor one that cannot start because the investigation is not INVESTIGATING."""
+    """Whether agents reported, or the approver declined something, since the last review, none of them has work
+    left in hand, and no proposed agents are about to start: those are reviewed together with the rest. A proposal
+    the researcher's reply holds does not hold the review back, nor one that cannot start because the investigation
+    is not INVESTIGATING."""
     if state.status not in (InvestigationStatus.INVESTIGATING, InvestigationStatus.REVIEWING):
         return False
     reviews = _reviews(state)
     if any(t.completed_by is None for t in reviews) or blocking_tasks(state):
         return False
+    if any(t.role == "approver" and t.completed_by is None and t.dropped_at is None for t in state.tasks.values()):
+        return False  # its decisions are part of what is reviewed
     proposal = state.pending_proposal
     if proposal is not None and not proposal.feedback_ids and state.status is InvestigationStatus.INVESTIGATING:
         return False
     since = reviews[-1].queued_at if reviews else 0
-    return any(r.role in REVIEW_ROLES and r.recorded_at > since for r in state.agent_runs)
+    return (any(r.role in REVIEW_ROLES and r.recorded_at > since for r in state.agent_runs)
+            or any(not a.approved and a.recorded_at > since for a in state.approvals.values()))
 
 
 REVIEW_INSTRUCTION = ("Review the agents' reports: the hypothesis agents and the Evidence Judge have finished the work "
@@ -213,7 +222,15 @@ def review_material(state: InvestigationState, task: AgentTaskRecord) -> str:
     before = [t for t in reviews if t.queued_at < task.queued_at]
     since = before[-1].queued_at if before else 0
     lines = ["This is a background review: the researcher is not in this conversation, but sees your final message "
-             "in the chat. Reports since your last review, in the agents' own words:"]
+             "in the chat."]
+    automation = state.automation
+    if automation is not None:
+        lines.append(f"The investigation is in full automation ({automation.intervention_id or 'switched on'}): the "
+                     "researcher is away. An approver decides on your agent proposals and on submissions, within "
+                     f"{automation.max_core_hours:g} core-hours and {automation.max_tokens:,} tokens from the switch; "
+                     "inputs needing review and closing wait for the researcher. Do not wait for answers from the "
+                     "researcher.")
+    lines.append("Reports since your last review, in the agents' own words:")
     for run in state.agent_runs:
         if run.role not in REVIEW_ROLES or not since < run.recorded_at <= task.queued_at:
             continue
@@ -233,6 +250,12 @@ def review_material(state: InvestigationState, task: AgentTaskRecord) -> str:
         lines += ["", "The Evidence Judge's assessments since your last review:"]
         lines += [f"- {h}: {a.assessment.value} ({a.completeness.value.lower()}), citing "
                   f"{', '.join(a.evidence_ids) or 'no evidence'}: {a.rationale}" for h, a in assessments]
+    decisions = [a for a in state.approvals.values() if since < a.recorded_at <= task.queued_at]
+    if decisions:
+        lines += ["", "The approver's decisions since your last review:"]
+        lines += [f"- {'approved' if a.approved else 'declined'} "
+                  f"{'starting the agents of' if a.action.value == 'start_agents' else 'submitting'} {a.target_id}: "
+                  f"{a.reason}" for a in decisions]
     messages = [i for i in state.interventions.values() if since < i.recorded_at <= task.queued_at]
     if messages:
         lines += ["", "The researcher's messages meanwhile:"]

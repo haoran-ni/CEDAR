@@ -27,13 +27,14 @@ from sim2real.contracts.examination import InputExamination
 from sim2real.contracts.hypothesis import HypothesisSpec, Prediction
 from sim2real.contracts.investigation import InvestigationSpec, ObservableAlignment
 from sim2real.contracts.next_actions import CandidateAction
-from sim2real.contracts.plan import Authorization, ResearchPlan
+from sim2real.contracts.plan import Authorization, PermissionAction, ResearchPlan
 from sim2real.contracts.status import (
     Assessment,
     CalculationState,
     Completeness,
     EvidenceQuality,
     HypothesisStatus,
+    InvestigationMode,
     InvestigationStatus,
     SchedulerState,
 )
@@ -98,6 +99,52 @@ class NextActionsRecommended(Contract):
             raise ValueError("candidate ids must be unique")
         if len(set(self.chosen)) != len(self.chosen) or not set(self.chosen) <= set(ids):
             raise ValueError("chosen names distinct candidates of this recommendation")
+        return self
+
+
+class ModeChanged(Contract):
+    """The researcher switches the investigation between human-in-the-loop and full automation; the system
+    switches it back, and pauses it, once full automation's token allowance is used up."""
+
+    type: Literal["mode_changed"] = "mode_changed"
+    mode: InvestigationMode
+    reason: NonEmptyStr
+    max_core_hours: float | None = Field(default=None, gt=0)
+    """Full automation: the core-hours the approver may approve from now on, as job scripts request them."""
+    max_tokens: int | None = Field(default=None, gt=0)
+    """Full automation: the model tokens all agents together may process from now on."""
+    intervention_id: Identifier | None = None
+    """The researcher's command, when it was the researcher who switched."""
+
+    @model_validator(mode="after")
+    def _limits_only_for_automation(self) -> "ModeChanged":
+        automated = self.mode is InvestigationMode.FULL_AUTOMATION
+        if automated != (self.max_core_hours is not None) or automated != (self.max_tokens is not None):
+            raise ValueError("full automation needs a core-hour and a token limit; human-in-the-loop takes none")
+        return self
+
+
+APPROVER_ACTIONS = frozenset({PermissionAction.START_AGENTS, PermissionAction.SUBMIT})
+"""What the approver decides in full automation. Inputs needing review, cancellations and closing stay with the
+researcher."""
+
+
+class ApproverDecision(Contract):
+    """In full automation, the approver's decision on the researcher's behalf: whether proposed agents start, or a
+    calculation is submitted."""
+
+    type: Literal["approver_decision"] = "approver_decision"
+    decision_id: Identifier
+    action: PermissionAction
+    target_id: Identifier
+    """The proposal or calculation decided on."""
+    approved: bool
+    reason: NonEmptyStr
+
+    @model_validator(mode="after")
+    def _approver_action(self) -> "ApproverDecision":
+        if self.action not in APPROVER_ACTIONS:
+            raise ValueError(f"the approver does not decide {self.action.value}; that stays with the researcher")
         return self
 
 
@@ -284,20 +331,20 @@ class AgentRetired(Contract):
     reason: NonEmptyStr
 
 
-AGENT_TASK_ROLES = ("hypothesis_agent", "evidence_judge", "chief_scientist")
+AGENT_TASK_ROLES = ("hypothesis_agent", "evidence_judge", "chief_scientist", "approver")
 
 
 class AgentTaskQueued(Contract):
     """Work for an agent, run by the dispatcher outside any conversation.
 
     A hypothesis agent's task names the agent and its hypothesis; the Evidence Judge's names
-    the hypothesis to assess; the Chief Scientist's (a review of the agents' reports) names
-    neither.
+    the hypothesis to assess; the Chief Scientist's (a review of the agents' reports) and the
+    approver's (decisions waiting in full automation) name neither.
     """
 
     type: Literal["agent_task_queued"] = "agent_task_queued"
     task_id: Identifier
-    role: Literal["hypothesis_agent", "evidence_judge", "chief_scientist"]
+    role: Literal["hypothesis_agent", "evidence_judge", "chief_scientist", "approver"]
     hypothesis_id: Identifier | None = None
     agent_id: Identifier | None = None
     instruction: NonEmptyStr
@@ -307,7 +354,7 @@ class AgentTaskQueued(Contract):
     @model_validator(mode="after")
     def _names_what_its_role_needs(self) -> "AgentTaskQueued":
         needs = {"hypothesis_agent": (True, True), "evidence_judge": (True, False),
-                 "chief_scientist": (False, False)}[self.role]
+                 "chief_scientist": (False, False), "approver": (False, False)}[self.role]
         if (self.hypothesis_id is not None, self.agent_id is not None) != needs:
             raise ValueError(f"a {self.role} task names "
                              + {(True, True): "its agent and hypothesis", (True, False): "a hypothesis and no agent",
@@ -360,6 +407,8 @@ EventPayload = Annotated[
     | InvestigationStatusChanged
     | ClosingProposed
     | NextActionsRecommended
+    | ModeChanged
+    | ApproverDecision
     | ObservableAlignmentRecorded
     | UserInterventionRecorded
     | PlanRevised

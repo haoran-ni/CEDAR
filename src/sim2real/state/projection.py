@@ -15,6 +15,7 @@ from sim2real.contracts.agents import AgentSpec
 from sim2real.contracts.analysis import SCRIPT_CHECK_PREFIX, AnalysisOutcome, AnalysisRun, as_evidence_check
 from sim2real.contracts.base import Actor, ActorKind
 from sim2real.contracts.events import (
+    APPROVER_ACTIONS,
     AgentRetired,
     AgentRunRecorded,
     AgentsProposed,
@@ -22,6 +23,7 @@ from sim2real.contracts.events import (
     AgentTaskQueued,
     ProposalWithdrawn,
     AnalysisRecorded,
+    ApproverDecision,
     AssessmentRecorded,
     CalculationInputsExamined,
     CalculationLinked,
@@ -34,6 +36,7 @@ from sim2real.contracts.events import (
     HypothesisStatusChanged,
     InvestigationCreated,
     InvestigationStatusChanged,
+    ModeChanged,
     NextActionsRecommended,
     ObservableAlignmentRecorded,
     PlanRevised,
@@ -63,6 +66,7 @@ from sim2real.contracts.status import (
     Completeness,
     EvidenceQuality,
     HypothesisStatus,
+    InvestigationMode,
     InvestigationStatus,
     SchedulerState,
 )
@@ -77,6 +81,8 @@ EVENT_ACTORS: dict[type, frozenset[ActorKind]] = {
     InvestigationStatusChanged: frozenset({_A.USER, _A.CHIEF_SCIENTIST, _A.SYSTEM}),
     ClosingProposed: frozenset({_A.CHIEF_SCIENTIST}),
     NextActionsRecommended: frozenset({_A.CHIEF_SCIENTIST}),
+    ModeChanged: frozenset({_A.USER, _A.SYSTEM}),
+    ApproverDecision: frozenset({_A.APPROVER}),
     ObservableAlignmentRecorded: frozenset({_A.USER, _A.CHIEF_SCIENTIST}),
     UserInterventionRecorded: frozenset({_A.USER}),
     PlanRevised: frozenset({_A.USER, _A.CHIEF_SCIENTIST}),
@@ -92,12 +98,12 @@ EVENT_ACTORS: dict[type, frozenset[ActorKind]] = {
     AnalysisRecorded: frozenset({_A.ANALYSIS_RUNNER}),
     EvidenceRecorded: frozenset({_A.VALIDATOR, _A.HYPOTHESIS_AGENT, _A.USER}),
     AssessmentRecorded: frozenset({_A.EVIDENCE_JUDGE}),
-    AgentRunRecorded: frozenset({_A.CHIEF_SCIENTIST, _A.HYPOTHESIS_AGENT, _A.EVIDENCE_JUDGE}),
-    AgentTaskQueued: frozenset({_A.USER, _A.CHIEF_SCIENTIST, _A.SYSTEM}),
+    AgentRunRecorded: frozenset({_A.CHIEF_SCIENTIST, _A.HYPOTHESIS_AGENT, _A.EVIDENCE_JUDGE, _A.APPROVER}),
+    AgentTaskQueued: frozenset({_A.USER, _A.CHIEF_SCIENTIST, _A.SYSTEM, _A.APPROVER}),
     AgentsProposed: frozenset({_A.CHIEF_SCIENTIST}),
-    AgentsStarted: frozenset({_A.USER, _A.SYSTEM}),
+    AgentsStarted: frozenset({_A.USER, _A.SYSTEM, _A.APPROVER}),
     AgentRetired: frozenset({_A.USER, _A.CHIEF_SCIENTIST}),
-    ProposalWithdrawn: frozenset({_A.USER, _A.CHIEF_SCIENTIST}),
+    ProposalWithdrawn: frozenset({_A.USER, _A.CHIEF_SCIENTIST, _A.APPROVER}),
 }
 """Who may record each event type. Nobody but the computing services moves a calculation."""
 
@@ -262,6 +268,33 @@ class ClosingRecord:
 
 
 @dataclass(frozen=True)
+class ModeRecord:
+    """A switch between human-in-the-loop and full automation."""
+
+    mode: InvestigationMode
+    reason: str
+    actor: Actor
+    recorded_at: int
+    max_core_hours: float | None = None
+    max_tokens: int | None = None
+    intervention_id: str | None = None
+
+
+@dataclass(frozen=True)
+class ApprovalRecord:
+    """The approver's decision, in full automation, on proposed agents or a submission."""
+
+    decision_id: str
+    action: PermissionAction
+    target_id: str
+    approved: bool
+    reason: str
+    recorded_at: int
+    core_hours: float | None = None
+    """For an approved submission: the core-hours its job script requests, counted against the allowance."""
+
+
+@dataclass(frozen=True)
 class RecommendationRecord:
     """The Chief Scientist's candidate next steps and its choice among them."""
 
@@ -343,6 +376,42 @@ class InvestigationState:
     pending_closing: ClosingRecord | None = None
     """A proposal to close the investigation that waits for the researcher's /approve close."""
     recommendations: dict[str, RecommendationRecord] = field(default_factory=dict)
+    modes: list[ModeRecord] = field(default_factory=list)
+    approvals: dict[str, ApprovalRecord] = field(default_factory=dict)
+
+    @property
+    def mode(self) -> InvestigationMode:
+        return self.modes[-1].mode if self.modes else InvestigationMode.HUMAN_IN_THE_LOOP
+
+    @property
+    def automation(self) -> ModeRecord | None:
+        """The current stretch of full automation, with its limits; None in human-in-the-loop."""
+        return self.modes[-1] if self.mode is InvestigationMode.FULL_AUTOMATION else None
+
+    @property
+    def automation_tokens_left(self) -> int | None:
+        automation = self.automation
+        if automation is None:
+            return None
+        used = sum(_run_tokens(r.run) for r in self.agent_runs if r.recorded_at > automation.recorded_at)
+        return automation.max_tokens - used
+
+    @property
+    def automation_core_hours_left(self) -> float | None:
+        automation = self.automation
+        if automation is None:
+            return None
+        approved = sum(a.core_hours or 0 for a in self.approvals.values()
+                       if a.approved and a.action is PermissionAction.SUBMIT and a.recorded_at > automation.recorded_at)
+        return automation.max_core_hours - approved
+
+    def decided_now(self, target_id: str) -> ApprovalRecord | None:
+        """The approver's decision on a proposal or calculation in the current stretch of full automation."""
+        automation = self.automation
+        if automation is None:
+            return None
+        return next((a for a in reversed(list(self.approvals.values()))
+                     if a.target_id == target_id and a.recorded_at > automation.recorded_at), None)
 
     @property
     def pending_tasks(self) -> list[AgentTaskRecord]:
@@ -524,19 +593,40 @@ def _calculation(state: InvestigationState, calculation_id: str) -> CalculationR
 
 
 def authorization_for(state: InvestigationState, action: PermissionAction, target_id: str) -> str | None:
-    """The most recent user intervention authorizing ``action`` on ``target_id``, if any."""
+    """The most recent authorization of ``action`` on ``target_id``: the researcher's own command, or, in full
+    automation, the approver's approval in the current stretch; None if there is neither."""
     for record in reversed(list(state.interventions.values())):
         if any(a.action is action and target_id in a.target_ids for a in record.authorizations):
             return record.intervention_id
+    for approval in reversed(list(state.approvals.values())):
+        if approval.action is action and approval.target_id == target_id and _approval_counts(state, approval):
+            return approval.decision_id
     return None
+
+
+def _approval_counts(state: InvestigationState, approval: ApprovalRecord) -> bool:
+    """An approver's approval counts in the stretch of full automation it was given in. A submission it allowed
+    that is already under way is still recorded, so switching modes never strands a job at the scheduler."""
+    if not approval.approved:
+        return False
+    calc = state.calculations.get(approval.target_id)
+    if approval.action is PermissionAction.SUBMIT and calc is not None and calc.state is _C.SUBMISSION_PENDING:
+        return True
+    automation = state.automation
+    return automation is not None and approval.recorded_at > automation.recorded_at
 
 
 def _require_authorization(
     state: InvestigationState, authorization_id: str | None, action: PermissionAction, target_id: str
 ) -> None:
     intervention = state.interventions.get(authorization_id) if authorization_id else None
-    if intervention is None or not any(
+    if intervention is not None and any(
         a.action is action and target_id in a.target_ids for a in intervention.authorizations
+    ):
+        return
+    approval = state.approvals.get(authorization_id) if authorization_id else None
+    if approval is None or approval.action is not action or approval.target_id != target_id or not _approval_counts(
+        state, approval
     ):
         raise RuleViolation(f"{action} of {target_id} requires a user authorization naming it")
 
@@ -558,6 +648,54 @@ def _on_status_changed(state: InvestigationState, event: RecordedEvent, p: Inves
         raise RuleViolation("only closing the investigation carries the researcher's authorization")
     state.status, state.resume_to = INVESTIGATION_MACHINE.advance(state.status, p.status, state.resume_to)
     state.pending_closing = None  # closed as proposed; any other change withdraws the proposal
+
+
+def _on_mode_changed(state: InvestigationState, event: RecordedEvent, p: ModeChanged) -> None:
+    _require_open(state)
+    if event.actor.kind is ActorKind.USER:
+        if p.intervention_id not in state.interventions:
+            raise RuleViolation("the researcher's switch of mode cites their recorded command")
+    elif p.mode is not InvestigationMode.HUMAN_IN_THE_LOOP:
+        raise RuleViolation("only the researcher switches full automation on")
+    state.modes.append(ModeRecord(p.mode, p.reason, event.actor, event.stream_version, p.max_core_hours,
+                                  p.max_tokens, p.intervention_id))
+
+
+def _on_approver_decision(state: InvestigationState, event: RecordedEvent, p: ApproverDecision) -> None:
+    _require_open(state)
+    if state.automation is None:
+        raise RuleViolation("the approver decides only while the investigation is in full automation")
+    if p.decision_id in state.approvals:
+        raise RuleViolation(f"decision {p.decision_id} already exists")
+    if state.decided_now(p.target_id) is not None:
+        raise RuleViolation(f"the approver has already decided on {p.target_id} in this stretch of full automation")
+    core_hours = None
+    if p.action is PermissionAction.START_AGENTS:
+        proposal = state.pending_proposal
+        if proposal is None or proposal.proposal_id != p.target_id:
+            raise RuleViolation(f"proposal {p.target_id} is not waiting to start")
+        if proposal.feedback_ids:
+            raise RuleViolation(f"the researcher replied ({', '.join(proposal.feedback_ids)}); proposal "
+                                f"{p.target_id} waits for them")
+    else:
+        calc = state.calculations.get(p.target_id)
+        if calc is None or calc.state is not _C.VALIDATED_INPUT:
+            raise RuleViolation(f"calculation {p.target_id} is not waiting to be submitted")
+        if not state.spec.constraints.submit_requires_approval or authorization_for(
+                state, PermissionAction.SUBMIT, p.target_id) is not None:
+            raise RuleViolation(f"calculation {p.target_id} needs no decision")
+        if p.approved:
+            core_hours = calc.examination.requested_core_hours
+            if core_hours is None:
+                raise RuleViolation(f"the core-hours {p.target_id} requests are not known; it waits for the "
+                                    "researcher")
+            left = state.automation_core_hours_left
+            if core_hours > left:
+                raise RuleViolation(f"{p.target_id} requests {core_hours:g} core-hours; {max(left, 0):g} of full "
+                                    f"automation's {state.automation.max_core_hours:g} remain, so it waits for the "
+                                    "researcher")
+    state.approvals[p.decision_id] = ApprovalRecord(p.decision_id, p.action, p.target_id, p.approved, p.reason,
+                                                    event.stream_version, core_hours)
 
 
 def _on_next_actions(state: InvestigationState, event: RecordedEvent, p: NextActionsRecommended) -> None:
@@ -595,7 +733,7 @@ def _on_intervention(state: InvestigationState, event: RecordedEvent, p: UserInt
         p.intervention_id, p.text, p.authorizations, event.actor.id, event.stream_version
     )
     proposal = state.pending_proposal
-    if proposal is not None and not p.authorizations:
+    if proposal is not None and not p.authorizations and not p.text.startswith("/"):  # a reply, not a command
         proposal.feedback_ids.append(p.intervention_id)
 
 
@@ -908,9 +1046,12 @@ def _on_agent_task(state: InvestigationState, event: RecordedEvent, p: AgentTask
     _require_open(state)
     if p.task_id in state.tasks:
         raise RuleViolation(f"task {p.task_id} already exists")
-    if p.role == "chief_scientist":
+    if p.role in ("chief_scientist", "approver"):
         if event.actor.kind is not ActorKind.SYSTEM:
-            raise RuleViolation("only the dispatcher queues the Chief Scientist's reviews")
+            raise RuleViolation("only the dispatcher queues " + ("the Chief Scientist's reviews" if p.role ==
+                                                                 "chief_scientist" else "the approver's work"))
+        if p.role == "approver" and state.automation is None:
+            raise RuleViolation("the approver works only while the investigation is in full automation")
     else:
         _hypothesis(state, p.hypothesis_id)
     if p.agent_id is not None:
@@ -971,9 +1112,13 @@ def _on_agents_started(state: InvestigationState, event: RecordedEvent, p: Agent
         raise RuleViolation(f"proposal {p.proposal_id} is not waiting to start")
     if state.status is not InvestigationStatus.INVESTIGATING:
         raise RuleViolation(f"agents start while INVESTIGATING, not {state.status}")
-    if event.actor.kind is ActorKind.USER:
+    if event.actor.kind in (ActorKind.USER, ActorKind.APPROVER):
         _require_authorization(state, p.authorization_id, PermissionAction.START_AGENTS, p.proposal_id)
+        if event.actor.kind is ActorKind.APPROVER and proposal.feedback_ids:
+            raise RuleViolation(f"the researcher replied; proposal {p.proposal_id} waits for them")
     else:
+        if state.automation is not None:
+            raise RuleViolation("in full automation the approver, not the review window, starts proposed agents")
         if p.authorization_id is not None:
             raise RuleViolation("only the researcher's own command starts agents early")
         if proposal.feedback_ids:
@@ -998,6 +1143,10 @@ def _on_proposal_withdrawn(state: InvestigationState, event: RecordedEvent, p: P
     proposal = state.proposals.get(p.proposal_id)
     if proposal is None or proposal.status is not ProposalStatus.PENDING:
         raise RuleViolation(f"proposal {p.proposal_id} is not waiting to start")
+    if event.actor.kind is ActorKind.APPROVER:
+        decision = state.decided_now(p.proposal_id)
+        if decision is None or decision.approved:
+            raise RuleViolation(f"the approver withdraws only a proposal it declined; {p.proposal_id} was not")
     proposal.status, proposal.closed_at = ProposalStatus.WITHDRAWN, event.stream_version
 
 
@@ -1014,6 +1163,8 @@ def _on_agent_retired(state: InvestigationState, event: RecordedEvent, p: AgentR
 _HANDLERS = {
     InvestigationStatusChanged: _on_status_changed,
     ClosingProposed: _on_closing_proposed,
+    ModeChanged: _on_mode_changed,
+    ApproverDecision: _on_approver_decision,
     NextActionsRecommended: _on_next_actions,
     ObservableAlignmentRecorded: _on_alignment,
     UserInterventionRecorded: _on_intervention,
@@ -1040,7 +1191,8 @@ _HANDLERS = {
 
 __all__ = [
     "AgentRecord", "AnalysisRecord", "AssessmentEntry", "CalculationRecord", "ClosingRecord", "EvidenceRecord", "HypothesisRecord", "InterventionRecord",
-    "InvestigationState", "PlanRecord", "PredictionRecord", "ProposalRecord", "ProposalStatus", "RecommendationRecord", "agent_id_for", "apply",
+    "InvestigationState", "ApprovalRecord", "ModeRecord", "PlanRecord", "PredictionRecord", "ProposalRecord",
+    "ProposalStatus", "RecommendationRecord", "agent_id_for", "apply",
     "authorization_for", "calculation_with_inputs", "evidence_owner", "hypothesis_evidence", "replay",
     "reusable_calculation", "review_deadline",
 ]

@@ -32,9 +32,12 @@ from sim2real.agents.tools import ToolOutcome
 from sim2real.agents.prompts import CHIEF_SCIENTIST
 from sim2real.agents.toolkits.chief import ChiefContext, chief_tools
 from sim2real.contracts.base import Actor, ActorKind
-from sim2real.contracts.events import EventDraft, UserInterventionRecorded
+from pydantic import ValidationError
+
+from sim2real.automation import mode_summary
+from sim2real.contracts.events import EventDraft, ModeChanged, UserInterventionRecorded
 from sim2real.contracts.plan import Authorization, PermissionAction
-from sim2real.contracts.status import INVESTIGATION_MACHINE, CalculationState
+from sim2real.contracts.status import INVESTIGATION_MACHINE, CalculationState, InvestigationMode
 from sim2real.errors import RuleViolation
 from sim2real.hpc.profile import ProfileStore
 from sim2real.hpc.profile import ProfileNotApproved
@@ -80,6 +83,10 @@ COMMANDS = (
     Command("/approve submit <calc>", "allow a calculation with approved inputs to be submitted"),
     Command("/approve inputs <calc>", "allow inputs the examiner could not verify"),
     Command("/approve close", "close the investigation for good, as the Chief Scientist proposes"),
+    Command("/mode", "show the mode: human-in-the-loop, or full automation and what it has left"),
+    Command("/mode human-in-the-loop", "take your decisions back: agent proposals and submissions wait for you"),
+    Command("/mode full-automation <core-hours> <tokens>", "while you are away, an approver decides on agents and "
+            "submissions and the Evidence Judge assesses new evidence, within these limits"),
     Command("/cancel <calc> <reason>", "cancel a calculation, stopping its job if it has one"),
     Command("/report", "update the research notebook and show where it is"),
     Command("/halt <reason>", "stop this investigation now: cancel its jobs, retire its agents, pause it (reason "
@@ -211,6 +218,8 @@ class ChatSession:
             return self._start_agents(line)
         if name == "/approve" and args == ["close"]:
             return self._close(line)
+        if name == "/mode":
+            return self._mode(args, line)
         if name == "/pending":
             return "\n".join(pending_approvals(state)) or "Nothing waits for your approval."
         if name == "/report":
@@ -277,6 +286,46 @@ class ChatSession:
         return (f"Started {', '.join(f'{a} on {h}' for h, a in started.items())} ({message_id}). The dispatcher runs "
                 "their first tasks.")
 
+    def _mode(self, args: list[str], line: str) -> str:
+        usage = "Usage: /mode, /mode human-in-the-loop, or /mode full-automation <core-hours> <tokens>"
+        if not args:
+            state = self.workspace.ledger.load(self.investigation_id)
+            return f"{self.investigation_id} is in {mode_summary(state)}.\n{usage}"
+        wanted, limits = args[0].lower(), {}
+        if wanted == "human-in-the-loop" and len(args) == 1:
+            mode = InvestigationMode.HUMAN_IN_THE_LOOP
+        elif wanted == "full-automation" and len(args) == 3:
+            mode = InvestigationMode.FULL_AUTOMATION
+            try:
+                limits = {"max_core_hours": float(args[1].replace(",", "")),
+                          "max_tokens": int(float(args[2].replace(",", "")))}
+            except ValueError:
+                return usage
+        else:
+            return usage
+
+        def build(state: InvestigationState) -> list[EventDraft]:
+            message = self._message_draft(state, line, ())
+            message_id = message.payload.intervention_id
+            return [message, EventDraft(actor=self.user, payload=ModeChanged(
+                mode=mode, reason=f"switched by the researcher ({message_id})", intervention_id=message_id,
+                **limits))]
+
+        try:
+            result = self.workspace.ledger.record_with(self.investigation_id, build)
+        except (RuleViolation, ValidationError) as exc:
+            return f"The mode could not be changed: {str(exc).splitlines()[0]}\n{usage}"
+        message_id = result.events[0].payload.intervention_id
+        if mode is InvestigationMode.HUMAN_IN_THE_LOOP:
+            return (f"{self.investigation_id} is in human-in-the-loop ({message_id}): agent proposals and submissions "
+                    "wait for you again.")
+        return (f"{self.investigation_id} is in full automation ({message_id}). While you are away, an approver "
+                "decides on agent proposals and submissions, and the Evidence Judge assesses new evidence before each "
+                f"review of the Chief Scientist, within {limits['max_core_hours']:g} core-hours and "
+                f"{limits['max_tokens']:,} tokens from now. When the tokens are used up, the investigation switches "
+                "back to human-in-the-loop and pauses. /approve inputs, /approve close, /cancel and /halt stay yours; "
+                "/mode human-in-the-loop takes everything back.")
+
     def _close(self, line: str) -> str:
         found = []
 
@@ -328,7 +377,7 @@ class ChatSession:
                                                                       target_ids=live),) if live else ())
             why = f"halted by the researcher ({message.payload.intervention_id})" + (f": {reason}" if reason else "")
             found[:] = [message.payload.intervention_id, why, live]
-            return [message, *halt_drafts(state, self.user, why)]
+            return [message, *halt_drafts(state, self.user, why, message.payload.intervention_id)]
 
         result = self.workspace.ledger.record_with(investigation_id, build)
         message_id, why, live = found
@@ -343,6 +392,8 @@ class ChatSession:
         if retired:
             lines.append(f"  - retired {', '.join(retired)}; a run in progress stops at its next model call")
         lines += [f"  - withdrew the proposal {p.proposal_id}" for p in done if p.type == "proposal_withdrawn"]
+        if any(p.type == "mode_changed" for p in done):
+            lines.append("  - switched full automation off")
         paused = any(p.type == "investigation_status_changed" for p in done)
         lines.append("  - paused: nothing new starts until you ask the Chief Scientist to resume it" if paused else
                      f"  - left {self.workspace.ledger.load(investigation_id).status.value}, so nothing new starts")
@@ -464,6 +515,8 @@ class ChatSession:
         fresh = [r for r in state.agent_runs if r.recorded_at > self._seen_runs
                  and (r.role != "chief_scientist" or _is_review(r))]
         recommended = [r for r in state.recommendations.values() if r.recorded_at > self._seen_runs]
+        decided = [a for a in state.approvals.values() if a.recorded_at > self._seen_runs]
+        ended = [m for m in state.modes if m.recorded_at > self._seen_runs and m.actor.kind is not ActorKind.USER]
         self._seen_runs = state.version
         notices = []
         for agent in state.agents.values():  # the researcher's own /approve agents already said who started
@@ -481,6 +534,13 @@ class ChatSession:
             report = (run.run.report or "(no report)").strip().splitlines()[0][:300]
             notices.append(Notice(f"[{who}: {run.run.outcome}] {report}"))
         notices += [Notice(f"[{recommendation_text(r)}]") for r in recommended]
+        for a in decided:
+            what = (f"the agents of {a.target_id}" if a.action is PermissionAction.START_AGENTS else
+                    f"submitting {a.target_id}" + (f" ({a.core_hours:g} core-hours)" if a.core_hours else ""))
+            notices.append(Notice(f"[approver, full automation] {'approved' if a.approved else 'declined'} {what}: "
+                                  f"{a.reason}"))
+        notices += [Notice(f"[full automation ended] {m.reason}. It is paused: ask the Chief Scientist to resume it, "
+                           "or switch full automation on again with /mode.") for m in ended]
         for command, note in approval_requests(state):
             if f"{command} {note}" not in self._shown_approvals:
                 self._shown_approvals.add(f"{command} {note}")

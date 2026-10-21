@@ -76,6 +76,9 @@ class ActorKind(StrEnum):
     JOB_MONITOR = "job_monitor"
     VALIDATOR = "validator"
     ANALYSIS_RUNNER = "analysis_runner"
+    APPROVER = "approver"
+    """Decides on the researcher's behalf, in full automation only, whether proposed agents start and
+    calculations are submitted."""
     SYSTEM = "system"
 
 

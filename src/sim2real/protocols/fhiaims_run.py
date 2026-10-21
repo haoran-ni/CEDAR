@@ -306,6 +306,13 @@ class FhiAimsRun(Protocol):
                 findings += self._examine_budget(task, script.resources)
         return findings
 
+    def requested_core_hours(self, files: Mapping[str, bytes]) -> float | None:
+        if "job.sh" not in files:
+            return None
+        script = examine_job_script(files["job.sh"].decode(errors="replace"), self._profile, self._code,
+                                    output_file="aims.out")
+        return script.resources.core_hours if script.resources is not None else None
+
     def _examine_geometry(self, geometry: Geometry, values: Mapping[str, object]) -> list[Finding]:
         f = "geometry.in"
         findings = [Finding(severity=_E, code="malformed_geometry", file=f, line=line or None,

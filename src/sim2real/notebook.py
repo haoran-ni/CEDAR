@@ -33,6 +33,7 @@ from sim2real.contracts.events import (
     AgentTaskQueued,
     ProposalWithdrawn,
     AnalysisRecorded,
+    ApproverDecision,
     AssessmentRecorded,
     CalculationInputsExamined,
     CalculationLinked,
@@ -44,6 +45,7 @@ from sim2real.contracts.events import (
     HypothesisStatusChanged,
     InvestigationCreated,
     InvestigationStatusChanged,
+    ModeChanged,
     NextActionsRecommended,
     ObservableAlignmentRecorded,
     PlanRevised,
@@ -57,12 +59,14 @@ from sim2real.contracts.evidence import EvidenceObject
 from sim2real.contracts.examination import FindingSeverity
 from sim2real.contracts.hypothesis import HypothesisSpec, Quantifiability
 from sim2real.contracts.investigation import AlignmentStatus
+from sim2real.contracts.plan import PermissionAction
 from sim2real.contracts.status import (
     Assessment,
     CalculationState,
     Completeness,
     EvidenceQuality,
     HypothesisStatus,
+    InvestigationMode,
     SchedulerState,
 )
 from sim2real.state.projection import (
@@ -457,7 +461,9 @@ def _why(rnd: _Round, state: InvestigationState) -> list[str]:
             lines += [f"  - {ROOT.hyp(a.hypothesis_id)}: {_flat(a.role)}; first task: {_said(a.brief)}"
                       for a in p.agents]
         elif isinstance(p, AgentsStarted):
-            how = (f"by the researcher's {p.authorization_id}" if p.authorization_id else
+            how = (f"by the approver ({p.authorization_id}), in full automation"
+                   if event.actor.kind is ActorKind.APPROVER else
+                   f"by the researcher's {p.authorization_id}" if p.authorization_id else
                    "after the researcher's review window passed without a reply")
             lines.append(f"- Agents of {p.proposal_id} started {how}: "
                          + ", ".join(f"{a} on {ROOT.hyp(h)}" for h, a in p.agent_ids.items()))
@@ -465,7 +471,23 @@ def _why(rnd: _Round, state: InvestigationState) -> list[str]:
             lines.append(f"- {p.agent_id} retired by {who}: {_said(p.reason)}")
         elif isinstance(p, ProposalWithdrawn):
             lines.append(f"- Proposal {p.proposal_id} withdrawn by {who}: {_said(p.reason)}")
+        elif isinstance(p, ModeChanged):
+            lines.append(f"- {_mode_change(p)}, by {who}: {_said(p.reason)}")
+        elif isinstance(p, ApproverDecision):
+            lines.append(f"- The approver {_decided(p)} ({p.decision_id}): {_said(p.reason)}")
     return lines or ["No decisions were recorded this round."]
+
+
+def _mode_change(p: ModeChanged) -> str:
+    if p.mode is InvestigationMode.HUMAN_IN_THE_LOOP:
+        return "Back to human-in-the-loop"
+    return f"Full automation, within {p.max_core_hours:g} core-hours and {p.max_tokens:,} tokens"
+
+
+def _decided(p: ApproverDecision) -> str:
+    verdict = "approved" if p.approved else "declined"
+    return (f"{verdict} starting the agents of {p.target_id}" if p.action is PermissionAction.START_AGENTS else
+            f"{verdict} submitting {p.target_id}")
 
 
 def _prediction_lines(event: RecordedEvent, p: PredictionRegistered, here: _Here) -> list[str]:
@@ -655,7 +677,9 @@ def _hypothesis_page(hyp: HypothesisRecord, state: InvestigationState, events: S
     statement = [_flat(spec.statement), "", f"- Rationale: {_said(spec.rationale)}", *_spec_details(spec)]
     agents = []
     for agent in (a for a in state.agents.values() if a.hypothesis_id == hyp.hypothesis_id):
-        how = (f"by the researcher's {agent.authorization_id}" if agent.authorization_id else
+        how = (f"by the approver ({agent.authorization_id}), in full automation"
+               if agent.started_by.kind is ActorKind.APPROVER else
+               f"by the researcher's {agent.authorization_id}" if agent.authorization_id else
                "after the review window passed without a reply")
         agents.append(f"- **{agent.agent_id}**, {_flat(agent.spec.role)}: started {how} (event #{agent.started_at}, "
                       f"proposal {agent.proposal_id})" + (f"; retired: {_said(agent.retire_reason)}"
@@ -796,7 +820,8 @@ def _index_page(state: InvestigationState, events: Sequence[RecordedEvent], roun
               "| Agent | Hypothesis | Role | Started | Status | Runs | Tokens |", "|---|---|---|---|---|---|---|"]
     for agent in state.agents.values():
         mine = [r for r in state.agent_runs if r.actor_id == agent.agent_id]
-        started = agent.authorization_id or "review window passed"
+        started = (f"approver ({agent.authorization_id})" if agent.started_by.kind is ActorKind.APPROVER else
+                   agent.authorization_id or "review window passed")
         status = "active" if agent.active else f"retired: {_short(agent.retire_reason or '', 80)}"
         limit = f" of {agent.spec.token_budget:,}" if agent.spec.token_budget else ""
         agents.append(f"| {agent.agent_id} | {ROOT.hyp(agent.hypothesis_id)} | {_cell(agent.spec.role)} | {started} | "
@@ -887,6 +912,10 @@ def _describe(event: RecordedEvent) -> str:
             following = f" (carrying out {p.recommendation_id})" if p.recommendation_id else ""
             return (f"{p.proposal_id}: agents proposed{following}: "
                     + ", ".join(f"{a.role} on {a.hypothesis_id}" for a in p.agents))
+        case ModeChanged():
+            return f"{_mode_change(p)}: {_said(p.reason)}"
+        case ApproverDecision():
+            return f"{p.decision_id}: the approver {_decided(p)}: {_said(p.reason)}"
         case NextActionsRecommended():
             taken = ", ".join(p.chosen) or "none for now"
             return (f"{p.recommendation_id}: {len(p.candidates)} next steps compared; taking {taken}: "

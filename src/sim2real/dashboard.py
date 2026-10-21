@@ -114,6 +114,8 @@ def agent_status(state: InvestigationState, hyp: HypothesisRecord, times: dict[i
         if spec is not None:
             if proposal.feedback_ids:
                 return f"proposed {_role(spec.role)}; held for your reply"
+            if state.automation is not None:
+                return f"proposed {_role(spec.role)}; for the approver"
             left = minutes_left(state, proposal, now)
             return f"proposed {_role(spec.role)}; " + (f"starts in {age(left * 60)}" if left > 0 else "starting")
         retired = [a for a in state.agents.values() if a.hypothesis_id == hid]
@@ -179,6 +181,8 @@ def dispatcher_status(heartbeat_age: float | None, activities: Sequence[Activity
             parts.append("the Evidence Judge")
         if roles["chief_scientist"]:
             parts.append("the Chief Scientist's review")
+        if roles["approver"]:
+            parts.append("the approver")
         return f"dispatcher running {' and '.join(parts)}", False
     return f"dispatcher seen {age(heartbeat_age)} ago", False
 
@@ -196,6 +200,8 @@ def subagent_status(state: InvestigationState | None, activities: Sequence[Activ
             working.append(f"{agent.spec.role if agent else activity.agent_id} on {activity.hypothesis_id} ({took})")
         elif activity.role == "evidence_judge":
             working.append(f"Evidence Judge on {activity.hypothesis_id} ({took})")
+        elif activity.role == "approver":
+            working.append(f"approver deciding ({took})")
     text = f"Working sub-agents: {'; '.join(working)}" if working else "No working sub-agents"
     running = {a.task_id for a in mine}
     queued = [t for t in state.pending_tasks if t.task_id not in running] if state is not None else []
@@ -210,7 +216,7 @@ def subagent_status(state: InvestigationState | None, activities: Sequence[Activ
 
 
 MODEL_ROLES = (("chief_scientist", "Chief Scientist"), ("hypothesis_agent", "hypothesis agents"),
-               ("evidence_judge", "Evidence Judge"))
+               ("evidence_judge", "Evidence Judge"), ("approver", "approver"))
 
 
 def model_line(settings: Callable[[str], ModelSettings], state: InvestigationState | None) -> str:
@@ -257,13 +263,17 @@ def status_line(state: InvestigationState, now: datetime) -> str:
     tokens = f"{state.model_tokens_used:,}" + (f" of {budget:,}" if budget else "")
     waiting = len(approval_requests(state))
     agents = sum(a.active for a in state.agents.values())
-    parts = [state.investigation_id, state.status.value, "setup" if state.round == 0 else f"round {state.round}",
+    automation = state.automation
+    mode = ("human-in-the-loop" if automation is None else
+            f"FULL AUTOMATION ({max(state.automation_core_hours_left, 0):g}/{automation.max_core_hours:g} core-h, "
+            f"{max(state.automation_tokens_left, 0):,}/{automation.max_tokens:,} tokens left)")
+    parts = [state.investigation_id, mode, state.status.value, "setup" if state.round == 0 else f"round {state.round}",
              f"plan v{state.plan_version}", f"{agents} agent{'' if agents == 1 else 's'}", f"{tokens} tokens"]
     proposal = state.pending_proposal
     if proposal is not None:
         n = len(proposal.agents)
         left = minutes_left(state, proposal, now)
-        when = ("held for your reply" if proposal.feedback_ids else
+        when = ("held for your reply" if proposal.feedback_ids else "for the approver" if automation is not None else
                 f"start in {age(left * 60)} unless you reply" if left > 0 else "starting")
         parts.append(f"{n} agent{'s' if n > 1 else ''} proposed: {when} (/agents)")
     if waiting:

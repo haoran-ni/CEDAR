@@ -82,7 +82,7 @@ class ProtocolEngine:
         verdict = verdict_for(findings)
         examination = InputExamination(protocol=protocol.ref, code_version=protocol.code_version, files=refs,
                                        execution_files=execution, input_hash=input_hash, findings=tuple(findings),
-                                       verdict=verdict)
+                                       verdict=verdict, requested_core_hours=protocol.requested_core_hours(files))
         workdir = f"{investigation_id}/{calculation_id}"
         if verdict is not ExaminationVerdict.REJECTED:
             self._write_run_directory(self._runs_root / workdir, files)

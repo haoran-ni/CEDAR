@@ -61,6 +61,7 @@ Chief Scientist and research orchestrator are separate concerns. The LLM supervi
 | Job monitor | Observe scheduler status with permitted polling/callback mechanism | Treat missing `squeue` rows as proof of success |
 | Result validator | Check run health and convergence; verify values agents quote against the cited raw output; record analysis results | Convert nonconverged numbers, unverified readings or values no analysis reported into validated evidence |
 | Evidence Judge | Critique/evaluate evidence, interactions and uncertainty | Average agents' confidence guesses or decide by vote |
+| Approver (full automation only) | Decide on the researcher's behalf whether proposed agents start and examined calculations are submitted, within the researcher's core-hour and token limits | Act outside full automation; approve inputs needing review, cancel, close or halt; record its decisions as the researcher's |
 | Research recorder | Immutable events, readable round reports and provenance links | Rewrite prior evidence in response to later conclusions |
 
 ## 3. Two independent execution channels

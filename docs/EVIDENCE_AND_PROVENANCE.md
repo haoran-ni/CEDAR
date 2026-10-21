@@ -39,7 +39,7 @@ the data directory.
 Each event is an envelope around one typed payload. The envelope records:
 
 - `event_id`, `investigation_id`, and `stream_version` (contiguous from 1 per investigation)
-- `occurred_at` (UTC) and the `actor`: its kind (user, Chief Scientist, hypothesis agent, Evidence Judge, protocol engine, job manager, job monitor, validator, analysis runner, system) and id. A hypothesis agent's id, such as `agent-hyp-xc`, names the one hypothesis it works on
+- `occurred_at` (UTC) and the `actor`: its kind (user, Chief Scientist, hypothesis agent, Evidence Judge, approver, protocol engine, job manager, job monitor, validator, analysis runner, system) and id. A hypothesis agent's id, such as `agent-hyp-xc`, names the one hypothesis it works on
 - `round` and `plan_version` at the time of recording
 - an optional `idempotency_key`, so a retried write is recorded once
 - an optional `causation_id`
@@ -49,7 +49,7 @@ Payloads cover the whole research process:
 | Area | Events |
 |---|---|
 | Problem | `investigation_created`, `investigation_status_changed` (closing carries the researcher's authorization), `closing_proposed` (by the Chief Scientist; only the researcher closes), `observable_alignment_recorded` |
-| Direction | `user_intervention_recorded` (the researcher's words, verbatim, with any authorization), `plan_revised` (with the message that prompted it), `round_started`, `next_actions_recommended` (the Chief Scientist's candidate next steps, compared, and its choice; delegations and agent proposals cite it) |
+| Direction | `user_intervention_recorded` (the researcher's words, verbatim, with any authorization), `plan_revised` (with the message that prompted it), `round_started`, `next_actions_recommended` (the Chief Scientist's candidate next steps, compared, and its choice; delegations and agent proposals cite it), `mode_changed` (human-in-the-loop or full automation, with its limits), `approver_decision` (in full automation, the approver's approval or refusal of starting agents or a submission, with its reason) |
 | Hypotheses | `hypothesis_proposed`, `hypothesis_status_changed`, `prediction_registered` |
 | Computation | `calculation_requested`, `calculation_linked`, `calculation_inputs_examined`, `calculation_state_changed`, `run_checked` (the run's health checks and stored outputs) |
 | Results | `analysis_recorded` (a script an agent ran: the script, its hashed inputs, output and results), `evidence_recorded`, `assessment_recorded` |

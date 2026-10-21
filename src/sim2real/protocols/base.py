@@ -74,6 +74,10 @@ class Protocol(ABC):
     def examine(self, task: ScientificTaskSpec, files: Mapping[str, bytes]) -> list[Finding]:
         """Check the complete set of files against the declared task and this protocol's policy."""
 
+    def requested_core_hours(self, files: Mapping[str, bytes]) -> float | None:
+        """Core-hours the examined job script asks for, if this protocol can read them."""
+        return None
+
     @abstractmethod
     def check_run(
         self,

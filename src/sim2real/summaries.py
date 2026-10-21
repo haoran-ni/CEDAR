@@ -4,6 +4,7 @@ These summarize the record; they never add to it. Job status and scientific stat
 always shown separately.
 """
 
+from sim2real.automation import mode_summary, pending_decisions
 from sim2real.contracts.examination import ExaminationVerdict, FindingSeverity
 from sim2real.contracts.plan import PermissionAction
 from sim2real.contracts.status import CalculationState
@@ -85,10 +86,12 @@ def task_owner(task) -> str:
 
 
 def approval_requests(state: InvestigationState) -> list[tuple[str, str]]:
-    """What waits for the researcher: the command that grants it, and what it concerns."""
+    """What waits for the researcher: the command that grants it, and what it concerns. In full automation, what
+    the approver may still decide is not the researcher's to wait on."""
     needs = []
+    for_approver = {d.target_id for d in pending_decisions(state)}
     proposal = state.pending_proposal
-    if proposal is not None:
+    if proposal is not None and proposal.proposal_id not in for_approver:
         needs.append(("/approve agents", proposal_note(state, proposal)))
     for calc in state.calculations.values():
         if (calc.state is CalculationState.SPECIFIED and calc.examination is not None
@@ -97,6 +100,7 @@ def approval_requests(state: InvestigationState) -> list[tuple[str, str]]:
             reasons = "; ".join(f.message for f in calc.examination.findings if f.severity is FindingSeverity.REVIEW)
             needs.append((f"/approve inputs {calc.calculation_id}", f"needs review: {reasons}"))
         if (calc.state is CalculationState.VALIDATED_INPUT and state.spec.constraints.submit_requires_approval
+                and calc.calculation_id not in for_approver
                 and authorization_for(state, PermissionAction.SUBMIT, calc.calculation_id) is None):
             needs.append((f"/approve submit {calc.calculation_id}", f"{calc.task.system_label}: {calc.task.estimand}"))
     closing = state.pending_closing
@@ -117,6 +121,7 @@ def investigation_summary(state: InvestigationState) -> str:
         f"Investigation {state.investigation_id}: {spec.title}",
         f"  status {state.status.value}; round {state.round}; plan v{state.plan_version}; "
         f"compute profile {spec.constraints.compute_profile or 'none'}",
+        f"  mode: {mode_summary(state)}",
         f"  question: {spec.question}",
         f"  observables: simulated '{state.alignment.simulated.name}' vs measured '{state.alignment.measured.name}' "
         f"({state.alignment.status.value})",

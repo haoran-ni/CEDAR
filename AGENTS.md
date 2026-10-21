@@ -101,7 +101,11 @@ The Judge:
 - Separates `SUPPORTED`, `CHALLENGED`, `INCONCLUSIVE`, `NOT_TESTED`, and `NOT_COMPARABLE` conclusions from the **quality of each computational evidence object**.
 - Reports residual discrepancies and estimates only what is actually identifiable. No fabricated mechanism probabilities, percentages, uncertainty bars, or literature citations.
 
-### 3.5 Next-best-action planner
+### 3.5 Approver (full automation only)
+
+When the researcher switches an investigation to full automation, a separate approver agent takes their routine decisions in their place: whether proposed agents start and whether examined calculations are submitted, within a core-hour and a token limit the researcher sets and code enforces. It records its decisions as its own, with reasons, never as the researcher's. Inputs needing review, cancellations, closing and halting stay with the researcher. It is separate from the Evidence Judge, so that the Judge never assesses results of calculations it approved; in full automation the Judge assesses new evidence every round.
+
+### 3.6 Next-best-action planner
 
 Evaluate candidate next calculations/measurements by expected discriminatory power/information gain, scientific relevance, resource cost, likelihood of completion, and available protocols. Bayesian experimental design or decision-theoretic methods may be used **only if predictive outcome distributions and priors are actually defined**. Otherwise label ranking as a qualitative, justified priority rather than numeric expected information gain. The system can suggest an experimental measurement without pretending to execute a laboratory experiment.
 

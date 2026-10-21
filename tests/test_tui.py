@@ -132,7 +132,7 @@ def test_conversation_live_panel_and_approval(system):
         await refresh(pilot)
         (row,) = panel(app)
         assert row[0] == HYP and row[1] == "ACTIVE" and row[2] == f"proposed {ROLE}; starts in 10 min"
-        assert status(app).startswith(f"{INV} · INVESTIGATING · round 1 · plan v1 · 0 agents")
+        assert status(app).startswith(f"{INV} · human-in-the-loop · INVESTIGATING · round 1 · plan v1 · 0 agents")
         assert "1 agent proposed: start in 10 min unless you reply (/agents)" in status(app)
         assert "[waiting for you] /approve agents" in conversation(app)
 

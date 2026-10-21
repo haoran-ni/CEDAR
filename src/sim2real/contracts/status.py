@@ -91,6 +91,13 @@ class Assessment(StrEnum):
     NOT_COMPARABLE = "NOT_COMPARABLE"
 
 
+class InvestigationMode(StrEnum):
+    """Who takes the researcher's routine decisions: the researcher, or, while they are away, the approver."""
+
+    HUMAN_IN_THE_LOOP = "human-in-the-loop"
+    FULL_AUTOMATION = "full-automation"
+
+
 class Completeness(StrEnum):
     PARTIAL = "PARTIAL"
     FINAL = "FINAL"

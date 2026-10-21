@@ -5,14 +5,16 @@ A job neither command reports is UNKNOWN, never assumed finished.
 """
 
 import getpass
+import os
 import subprocess
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Protocol
 
 from sim2real.contracts.status import SchedulerState
+from sim2real.secrets import scrubbed_environment
 
 _STATE_MAP = {
     "PENDING": SchedulerState.PENDING,
@@ -65,13 +67,17 @@ Runner = Callable[..., subprocess.CompletedProcess]
 
 
 class SlurmBackend:
-    def __init__(self, *, user: str | None = None, runner: Runner = subprocess.run, timeout: float = 60.0) -> None:
+    def __init__(self, *, user: str | None = None, runner: Runner = subprocess.run, timeout: float = 60.0,
+                 environ: Mapping[str, str] = os.environ) -> None:
         self._user = user or getpass.getuser()
         self._run = runner
         self._timeout = timeout
+        self._environ = environ
 
     def _call(self, argv: list[str]) -> str:
-        result = self._run(argv, capture_output=True, text=True, timeout=self._timeout, check=False)
+        # sbatch exports the caller's environment into the job: never pass credentials along.
+        result = self._run(argv, capture_output=True, text=True, timeout=self._timeout, check=False,
+                           env=scrubbed_environment(self._environ))
         if result.returncode != 0:
             raise SchedulerError(f"{argv[0]} failed ({result.returncode}): {result.stderr.strip()}")
         return result.stdout

@@ -439,7 +439,7 @@ class FhiAimsTotalEnergy(Protocol):
                          detail=f"'Have a nice day.' at line {end.line}" if end else
                          (f"killed (line {out.killed.line})" if out.killed else "no normal end of run")),
             QualityCheck(name="scf_converged", passed=bool(out.scf_converged) and not out.scf_failures,
-                         detail=f"{len(out.scf_converged)} converged SCF cycles"
+                         detail=f"'Self-consistency cycle converged.' appears {len(out.scf_converged)} time(s)"
                                 + (f"; failure at line {out.scf_failures[0].line}" if out.scf_failures else "")),
         ]
         if relax:

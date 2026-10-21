@@ -12,18 +12,23 @@ flowchart TB
     UI <-->|chat + state APIs| C[Chief Scientist: planning & supervision only]
     C <-->|read / version plans| DB[(Investigation State + Event Store)]
     C --> O[Research Orchestrator]
+    C --> ENV[Environment Setup Agent: reads local files / asks user]
+    ENV --> PROF[(Compute Profile: user-approved)]
+    PROF --> Q
+    PROF --> J
     O --> HG[Hypothesis Generation & Screening]
     HG --> AF[Dynamic Agent Factory]
     AF --> H1[Hypothesis Agent 1]
     AF --> H2[Hypothesis Agent 2]
     AF --> Hn[Hypothesis Agent N]
-    H1 & H2 & Hn --> T[Typed Scientific Task API]
+    H1 & H2 & Hn --> T[Task request: declared intent + agent-written or generated inputs]
     T --> P[Versioned Protocol Registry]
-    P --> Q[Preflight Gate & Parameter Generator]
+    P --> Q[Input Examination: approve / reject / needs user review]
     Q --> J[Job Manager: Slurm]
     J --> HPC[HPC: FHI-aims / other registered engines]
     HPC --> MON[Job Monitor & Event Dispatcher]
-    MON --> VAL[Parser & Scientific Quality Gates]
+    HPC -. raw outputs .-> H1 & H2 & Hn
+    MON --> VAL[Run Health Checks & Verification of Agent Readings]
     VAL --> EV[(Evidence Store)]
     MON --> DB
     EV --> S[Evidence Judge]
@@ -46,11 +51,12 @@ Chief Scientist and research orchestrator are separate concerns. The LLM supervi
 | TUI client | Chat, control requests, live agent/job state, report browsing | Hold sole authoritative state; launch DFT directly |
 | Conversation API / Chief Scientist | Scientific planning, delegations, user coordination, query state | Run scientific computation or arbitrary remote shell |
 | Orchestrator | Durable plan/task graph, worker scheduling, retries, dependency resolution | Pretend a job is scientifically valid from Slurm status alone |
-| Hypothesis agent | Commit hypotheses/predictions, request tests, interpret accepted evidence | Circumvent protocol policy |
-| Protocol registry | Resolve allowable methods, compute inputs and required validations | Assert universal physical applicability |
-| Job manager | Create deterministic manifests, submit / track / control authorized jobs | Fabricate Slurm IDs, skip deduplication |
+| Hypothesis agent | Commit hypotheses/predictions, write or request inputs and job scripts, read raw outputs, interpret evidence | Submit anything that has not passed input examination; claim values it cannot cite |
+| Protocol registry | Resolve allowable methods; examine agent-written or generated inputs and job scripts against the declared task; optionally generate inputs; define output checks | Approve content it cannot verify; assert universal physical applicability |
+| Environment setup agent | Work out how to run codes on this system from local files or user answers; propose a compute profile with sources | Activate a profile without user approval; hard-code site settings |
+| Job manager | Create deterministic manifests, submit / track / control authorized jobs through the scheduler adapter | Fabricate scheduler IDs, skip deduplication |
 | Job monitor | Observe scheduler status with permitted polling/callback mechanism | Treat missing `squeue` rows as proof of success |
-| Result validator | Parse code output, check observable convergence and consistency | Convert nonconverged numbers to final evidence |
+| Result validator | Check run health and convergence; verify values agents quote against the cited raw output | Convert nonconverged numbers or unverified readings to validated evidence |
 | Evidence Judge | Critique/evaluate evidence, interactions and uncertainty | Average agents' confidence guesses or decide by vote |
 | Research recorder | Immutable events, readable round reports and provenance links | Rewrite prior evidence in response to later conclusions |
 
@@ -105,8 +111,8 @@ sequenceDiagram
     participant M as Job Monitor
     participant V as Validator
     participant R as Agent Dispatcher
-    A->>P: Typed test request (with controls and plan version)
-    P->>P: Resolve protocol + preflight + deduplicate
+    A->>P: Test request (declared intent + agent-written or generated inputs, plan version)
+    P->>P: Resolve protocol + examine inputs + deduplicate
     P->>S: sbatch approved script
     S-->>P: Slurm job id
     P->>D: Persist task/job manifest and await state
@@ -118,11 +124,13 @@ sequenceDiagram
         M->>D: Store changed states/events
     end
     M->>V: Scheduler-terminal task + output location
-    V->>V: Parse code outputs + scientific quality tests
+    V->>V: Run health checks + scientific quality tests
     V->>D: Write Evidence Object and completion/failure event
     D-->>R: Dispatch only appropriate continuation
     R->>D: Restore context + plan version + evidence
     R->>A: Resume next reasoning step
+    A->>V: Reading of the raw output, citing file and lines
+    V->>D: Evidence with verified citations
 ```
 
 **Robustness requirements:** after `sbatch` is accepted, a crash before DB commit can otherwise lose the ID and trigger duplicate work. A task manifest with stable identity, submission receipts/journal, reconciliation against scheduler job names/comments (if permitted) and outbox/recovery policy must address this crash window. Never assume a single DB write can make remote Slurm submission atomic. Cache reuse requires scientifically equivalent full input manifests, not just matching material names.
@@ -169,7 +177,7 @@ The UI can subscribe to a local event stream or poll at a restrained interval fo
 
 ## 8. Trust, permission, and isolation boundaries
 
-- Restrict computational tools to typed, allowlisted protocols; user- or LLM-supplied freeform shell, arbitrary file paths, executable URLs or Slurm scripts must not be passed unchecked to subprocess or SSH.
+- LLM-written inputs and Slurm scripts are allowed, but only after input examination (and user approval where the verdict is `NEEDS_REVIEW`). Nothing LLM- or user-supplied is passed unchecked to subprocess or SSH, and agents never execute commands on the cluster themselves.
 - Use distinct permissions for `read`, `prepare`, `submit`, `cancel`, `delete`, or expensive compute. Default to limits and explicit authorization for potentially destructive operations.
 - Mark literature and file content as *untrusted external data*, not executable instructions. Tool output must never override task policies or trigger arbitrary commands.
 - Persist exact reference data provenance, checksum artifacts when practicable, and make access policies explicit in offline/blind tests.
@@ -181,8 +189,8 @@ The UI can subscribe to a local event stream or poll at a restrained interval fo
 See [`IMPLEMENTATION_PLAN.md`](IMPLEMENTATION_PLAN.md). Prefer:
 
 - First: typed contracts + local replayable research state.
-- Next: one FHI-aims adsorption protocol + real parser/validator + basic Slurm manager.
+- Next: one FHI-aims protocol with input examination, run health checks and verification of agent readings, plus a basic Slurm manager.
 - Then: durable async resume + independently responsive Chief Scientist + agent fan-out/judge.
 - Finally: TUI polish, blind tests, uncertainty-aware next-action recommendations and broader method registry.
 
-An initial demo can use a **clearly marked prerecorded/archived calculation** for a long compute step while still running the actual parser, result-quality checks and agent continuation. Do not portray replayed data as newly computed results.
+An initial demo can use a **clearly marked prerecorded/archived calculation** for a long compute step while still running the actual run health checks, result-quality checks, verification of agent readings and agent continuation. Do not portray replayed data as newly computed results.

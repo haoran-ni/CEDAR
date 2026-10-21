@@ -10,7 +10,7 @@ Computational models and experimental measurements often disagree. The disagreem
 
 - **Hypotheses first:** Investigations create specialized agents for the actual scientific problem, not a fixed collection of agents for every run.
 - **Human in control:** Researchers can converse with the Chief Scientist and change priorities while independent investigations continue.
-- **Validated computation:** Agents specify *what* to test; versioned scientific protocols control *how* calculations are prepared, run, and checked.
+- **Examined computation:** Agents may write their own DFT inputs and job scripts and read raw outputs directly. Versioned protocol tools examine every input and job script before it runs, and verify the values agents read from outputs before they count as evidence.
 - **Asynchronous HPC:** Long-running DFT and related calculations are submitted to schedulers such as Slurm. Agents release their runtime while jobs execute and resume when results arrive.
 - **Evidence before conclusions:** Reports distinguish quantified contributions, model-dependent estimates, unresolved mechanisms, and non-identifiable explanations. The system can conclude that the evidence is insufficient.
 - **Research provenance:** Every meaningful hypothesis, planned test, executed action, result, revision, and human intervention is recorded in a concise, auditable research notebook.

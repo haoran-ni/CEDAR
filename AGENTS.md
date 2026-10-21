@@ -19,7 +19,7 @@ This file is the **primary repository-wide implementation contract**. Read the s
 2. **Generate multiple causal explanations.** Construct a set of competing or compatible, physically motivated, *falsifiable* hypotheses. Do not assume that one explanation must win or that additive contributions are identifiable.
 3. **Instantiate a dynamic hypothesis swarm.** Allocate investigation agents by hypothesis; their count, specialization, tools, and lifetimes depend on the question and budget. No predefined XC/temperature/coverage swarm is mandatory.
 4. **Run independent, parallel investigations.** Agents propose predictions and tests, gather evidence, challenge their own claims, and return structured reports; deliberate cross-examination can follow initial independent assessment.
-5. **Use a verified scientific computing layer.** Language models NEVER create an unconstrained executable DFT job. They request typed scientific actions; validated protocols prepare inputs, enforce controls, submit jobs, verify outcomes, and return traceable evidence.
+5. **Examine everything agents write before it runs.** Agents may write DFT inputs and job scripts themselves, or ask protocol tools to generate them. Nothing runs unexamined: deterministic protocol tools check every input file and job script against the declared task and the protocol's policy before submission, and anything the tools cannot verify requires explicit user approval. Agents may also read raw output files directly to interpret results; every value they take from an output must cite the file and lines it came from, and it becomes validated evidence only after protocol tools have verified the citation and the run's health.
 6. **Support durable asynchronous computation.** Hypothesis agents should relinquish their runtime after submitting long-running jobs. An independent monitor and event dispatcher resume work when jobs finish; an open chat or terminal is NOT required for jobs to progress.
 7. **Keep a continuously accessible Chief Scientist conversation.** The Chief Scientist plans, supervises, explains, accepts real-time user instructions, and coordinates research. It does not personally execute DFT, phonons, MLIP, shell commands, or other scientific calculations.
 8. **Select next actions intelligently.** Recommend or launch permitted computations/measurements that best discriminate among hypotheses, respecting information quality, resource cost, feasibility, and authorization; do not fabricate information-gain scores.
@@ -60,7 +60,7 @@ Responsibilities:
 - Consult Evidence Judge for scientific synthesis and Research Recorder for traceable history.
 - Accept user intervention without resetting unrelated work, e.g., “pause new coverage tests, prioritize XC” while active calculations remain unless explicitly cancelled.
 
-Hard constraints: no direct DFT execution, arbitrary shell execution, unchecked job submission, fabricated job status, or unilateral promotion of a user's preference to scientific evidence. Chief Scientist can **request** computation through task orchestration but only verified backends execute it. A continuously accessible chat **does not imply** a continuously running LLM inference process.
+Hard constraints: no direct DFT execution or shell execution, no job submission that bypasses input examination, no fabricated job status, and no unilateral promotion of a user's preference to scientific evidence. Chief Scientist can **request** computation (and may draft inputs) through task orchestration, but only the job manager executes it, and only after examination. A continuously accessible chat **does not imply** a continuously running LLM inference process.
 
 ### 3.2 Hypothesis generation / review
 
@@ -81,9 +81,10 @@ For each investigation cycle:
 1. **Formulate:** state one precise, falsifiable hypothesis with rationale and assumptions.
 2. **Predict:** commit expected observations and conditions **before** seeing test results (immutable preregistration).
 3. **Plan:** choose a discriminating, safe, scientifically comparable test, including controls and cost.
-4. **Execute or delegate:** call registered read/analysis tools or request validated computation. Submit no arbitrary shell strings. Long tasks return identifiers rather than blocking.
-5. **Challenge:** identify counterevidence, alternative hypotheses, confounders and failure of method applicability.
-6. **Report:** emit a typed, evidence-linked report with uncertainty, conclusion status, limitations, and next recommendations.
+4. **Execute or delegate:** read data and raw outputs directly, call analysis tools, and request computation, either by writing the DFT inputs and job script itself or by asking protocol tools to generate them. Everything goes through input examination before submission; the agent never runs commands on the cluster itself. Long tasks return identifiers rather than blocking.
+5. **Interpret:** read the raw outputs that came back, citing file and line ranges for every quantitative reading so the reading can be verified.
+6. **Challenge:** identify counterevidence, alternative hypotheses, confounders and failure of method applicability.
+7. **Report:** emit a typed, evidence-linked report with uncertainty, conclusion status, limitations, and next recommendations.
 
 Agents initially investigate independently; after their first reports, a structured critique/debate round may expose confounders, contradictions, or mechanisms that interact. All useful updates persist. Agents must not simply repeat their prior textual conclusions as evidence.
 
@@ -104,16 +105,16 @@ Evaluate candidate next calculations/measurements by expected discriminatory pow
 
 ## 4. Verified Scientific Computing Engine
 
-A **deterministic, versioned protocol library**, not a free-form LLM text-to-input-file system, controls all production calculations. The LLM declares intent in a validated scientific task specification (observable, system, variable, comparisons, fidelity/accuracy goal, budget). The engine maps it to registered scientific methods and checked parameter generators.
+Agents may write calculation inputs and job scripts, but a **deterministic, versioned protocol library** examines them before any production calculation runs. Every request declares its intent in a scientific task specification (observable, system, variables, comparisons, fidelity/accuracy goal, budget) and either attaches agent-written files or asks the protocol's generator to write them. The examination checks that the files actually implement the declared intent and follow the protocol's policy; generated files go through the same examination.
 
 Minimum workflow:
 
 1. **Protocol resolution:** ensure a supported protocol exists and inputs, physical assumptions and execution rights are adequate; unsupported methods return a structured rejection or research gap.
-2. **Parameter generation:** derive code-specific inputs from tested templates/policies; use structure-aware sampling/convergence settings rather than universal fixed integers.
-3. **Preflight quality gate:** validate structures, geometry, stoichiometry, cell/PBC, vacuum, charge, spin, magnetism, occupation/smearing, dispersion, XC, basis, k sampling, units, energy/reference definitions, supported code/version, control variables, and resource allocations.
-4. **Execution:** submit via a constrained job manager to Slurm; persist calculation identity, input hashes, manifest, job ID and task linkage atomically as far as the backend permits.
+2. **Input authoring:** the agent writes the code inputs and job script, or the protocol generates them from tested templates/policies. Generators use structure-aware sampling/convergence settings rather than universal fixed integers.
+3. **Input examination (second layer):** deterministic tools parse the files and check them against the declared task and the protocol's policy: structures, geometry, stoichiometry, cell/PBC, vacuum, charge, spin, magnetism, occupation/smearing, dispersion, XC, basis, k sampling, units, energy/reference definitions, supported code/version, control variables, resource allocations, and the job script's directives and commands. The verdict is `APPROVED`, `REJECTED` (contradicts the declared task or violates policy), or `NEEDS_REVIEW` (content the tools cannot verify, such as an unknown keyword or shell line), which needs explicit user approval before submission.
+4. **Execution:** submit only examined files, through a constrained job manager, to Slurm; persist calculation identity, input hashes, manifest, job ID and task linkage atomically as far as the backend permits.
 5. **Runtime checks and controlled recovery:** inspect scheduler state and scientific code outputs separately. Retry only known recoverable failures under specified policy, and always record changes; changes that alter the scientific question/observable require fresh approval or an appropriately defined comparison.
-6. **Result parsing:** check numerical and geometry convergence, target property convergence, reference consistency and physically meaningful result selection.
+6. **Result reading and checks:** agents may read raw outputs directly. Protocol tools check run health (normal termination, SCF and geometry convergence), verify that every value an agent quotes appears at the cited lines of the hashed output, and check target property convergence, reference consistency and physically meaningful result selection.
 7. **Scientific validation:** mark as `VALIDATED`, `PROVISIONAL`, `INCONCLUSIVE`, or `INVALID` against explicit protocol conditions; output a structured Evidence Object with limitations.
 
 ### 4.1 Scientific-variable isolation
@@ -131,9 +132,19 @@ Example XC investigation:
 
 Prioritize convergence of the **target difference/observable** rather than only total energy or SCF thresholds. Test relevant k meshes, basis, slab thickness, vacuum, spin solutions and other conditions; convergence is an empirical test, not a promise from a `tight` preset. Scoping/accuracy tiers (`screening`, `research`, `reference`) specify evidence expectations, not magic parameter bundles. Theories with different approximations may disagree *after* all numerical gates pass; do not label theory error as a convergence problem.
 
-### 4.3 FHI-aims implementation notes
+### 4.3 Portability: no site-specific settings in code
 
-Initial scientific backend can use **ASE + FHI-aims + Slurm**, matching the intended research environment. Future adapters can add VASP, Quantum ESPRESSO, phonon codes, MD and MLIPs. Existing ecosystems (pymatgen, atomate2, custodian, AiiDA) are useful references/components where compatible, but do not prematurely combine all of them into a two-day prototype.
+Sim2Real must run on any HPC system. Nothing about a particular cluster belongs in the code: code binaries and versions, species or pseudopotential locations, environment setup, launch commands, schedulers, partitions, resource limits, or "usual" numerical settings taken from one group's past runs.
+
+- An **environment-setup agent** (the Chief Scientist or a dedicated subagent) works out how to run each code on the current system, by reading local files (existing job scripts, inputs, module files, installation directories) or by asking the user. It proposes a **compute profile**: the code installations, job-script template, approved environment-setup lines, scheduler type, allowed partitions and limits. Each value records where it came from (file and content hash, or the user's answer).
+- Deterministic checks verify the proposed profile (paths exist, the binary is executable, the template is well formed). The profile takes effect only after the user approves it, and changing it later needs another approval.
+- Generated job scripts are rendered from the approved profile's template. Agent-written job scripts are examined against the approved profile, not against fixed patterns in code.
+- Scheduler access goes through adapters; Slurm is implemented first.
+- Protocols encode only code-level knowledge that holds everywhere, such as what each input keyword means and which output lines signal success or failure. Scientific and numerical settings are declared explicitly in each task by the agent, which may learn typical values from the user's previous inputs or ask the user.
+
+### 4.4 FHI-aims implementation notes
+
+Initial scientific backend: **FHI-aims**, with Slurm as the first scheduler adapter (ASE where useful). Future adapters can add VASP, Quantum ESPRESSO, phonon codes, MD and MLIPs. Existing ecosystems (pymatgen, atomate2, custodian, AiiDA) are useful references/components where compatible, but do not prematurely combine all of them into a two-day prototype.
 
 - FHI-aims species defaults (e.g., `light`, `intermediate`, `tight`, `really_tight`) are only starting points; verify the protocol with target-specific convergence tests and current manual/version documentation.
 - FHI-aims has atom-centered DFT+U facilities. **Do not equate this with the molecular-orbital DFT+U used in CO/metal adsorption-site literature**; placing a Hubbard U on Cu 3d does *not* reproduce a correction targeted at CO's frontier molecular orbitals. Verify syntax and force/gradient support against the installed FHI-aims build before implementing.
@@ -147,7 +158,7 @@ More detail: [`docs/SCIENTIFIC_PROTOCOLS.md`](docs/SCIENTIFIC_PROTOCOLS.md).
 Implement **event-driven fan-out/fan-in**:
 
 - Each Hypothesis Agent requests a scientific task and receives a durable `calculation_id` / `job_id` and a `WAITING_FOR_JOB` state. It checkpoints and **ends its current LLM runtime**; do not consume tokens while idle.
-- A separate Job Monitor queries permitted Slurm interfaces (`squeue`/`sacct` or approved APIs) and reacts to changes. Treat unknown/unavailable scheduler information as unknown, not completed. Respect cluster polling and login-node policies.
+- A separate Job Monitor queries the scheduler through its adapter (for Slurm: `squeue`/`sacct` or approved APIs) and reacts to changes. Treat unknown/unavailable scheduler information as unknown, not completed. Respect cluster polling and login-node policies.
 - Result validation happens *before* job output becomes trusted scientific evidence; failures create explicit terminal or recoverable failure events.
 - An Event Dispatcher links events to awaiting investigations, restores checkpointed state, and invokes only the appropriate agents/nodes. The Chief Scientist conversation stays available throughout.
 - Workers and simulations run independently; fast hypotheses can finish while other DFT tasks remain queued/running. Judge may publish provisional synthesis before final evidence; require clear completeness status.
@@ -189,7 +200,7 @@ The system should classify proposed mechanisms as:
 
 If computing a mechanism's contribution, specify reference state, method, controlled variables and estimator. Coupled mechanisms may require interaction terms or joint models. Statistical sampling noise, numerical truncation, model bias and experimental uncertainty are distinct and potentially correlated. Propagate covariance where known; do not assign uncalibrated LLM “confidence” as a probability. If only one theory value and one measured value are available, a detailed percentage split is usually not identifiable.
 
-Evidence must link to raw code outputs or a verifiable external source, plus method/condition information, not merely an LLM assertion. Source credibility and access are part of provenance; blind/offline evaluation may intentionally withhold external literature, and this must be enforced through tool permissions and data access.
+Evidence must link to raw code outputs or a verifiable external source, plus method/condition information, not merely an LLM assertion. A value an agent read from an output cites the file and lines it came from. Source credibility and access are part of provenance; blind/offline evaluation may intentionally withhold external literature, and this must be enforced through tool permissions and data access.
 
 ## 8. Scientific Research Recorder and human-readable documentation
 
@@ -229,7 +240,7 @@ For a short presentation, show a genuine discrepancy, live hypotheses, actual co
 - **Language/runtime:** Python; typed Pydantic-style contracts.
 - **Orchestration:** LangGraph for durable, dynamic, iterative workflows; simple asyncio and/or an Agents SDK can bootstrap a narrow prototype. Avoid multiple competing orchestration frameworks without need.
 - **Compute:** ASE, FHI-aims first, optionally VASP/QE, Phonopy, suitable MLIPs (e.g., UMA only where validated).
-- **HPC:** Slurm submission manager and independently running monitor; respect individual cluster policies.
+- **HPC:** scheduler adapters (Slurm first), a submission manager and an independently running monitor; site details come from the user-approved compute profile, never from code; respect individual cluster policies.
 - **Storage:** SQLite for prototype; database abstraction with PostgreSQL/queue upgrades for scale; artifact filesystem with content hashes and immutable provenance.
 - **Statistics:** NumPy/SciPy, and probabilistic libraries only when an actual statistical model is justified.
 - **TUI:** Textual with fixed upper dashboard, conversation, and input.
@@ -240,7 +251,7 @@ Architectural decisions are provisional where marked in [`docs/DECISIONS.md`](do
 ## 11. Development instructions for coding agents
 
 - **Build a vertical slice, not mock scientific theater.** Start from one well-scoped adsorption problem, typed hypothesis/test objects, a single working protocol, real Slurm or a clearly labeled test-double, a parser/validator, checkpoint/resume, and a round summary. Broaden only after the path works end to end.
-- **Never expose unrestricted remote execution** or accept an arbitrary shell command produced by an LLM. Only allowlisted task specs and approved scripts/paths may reach HPC. Validate arguments, forbid path traversal, cap budgets, use least privileges and preserve cluster/user data.
+- **Never execute anything unexamined.** Agents may write inputs and job scripts, but only files that passed input examination (or that the user explicitly approved after a `NEEDS_REVIEW` verdict) may reach HPC, and they run through the job manager, never through an agent's own shell. Validate arguments, forbid path traversal, cap budgets, use least privileges and preserve cluster/user data.
 - **Never silently change a scientific parameter** while recovering a computation. Distinguish numerical recovery from changing the physical model. Store exact versions and diffs.
 - **Never identify scheduler `COMPLETED` as validated scientific evidence** before parsing/checks.
 - **Do not let conversational context serve as sole state.** All important status/evidence must survive agent shutdown, process restart, UI exit, and research-plan revision.
@@ -249,7 +260,7 @@ Architectural decisions are provisional where marked in [`docs/DECISIONS.md`](do
 - **Distinguish facts, inferences, recommendations, and unknowns** in UI and generated reports. Label citations, conditions, and uncertainties. No invented scientific numerical results.
 - **Do not confuse public reasoning summaries with hidden chain of thought.** Persist concise scientific decision records, observation-based rationales and validation steps, not model-private deliberation.
 - **Do not add fake installation or usage claims to README** until working commands have been exercised and tested. Do not claim novelty, awards, final publication, or validated scientific performance without supporting evidence.
-- **Provide tests:** protocol schema and invalid-input cases; intended-control vs uncontrolled-change cases; parser convergence/failure checks; resume/idempotency; replayed events; user plan versions; cancellation; UI reconnect; blinded evaluation leak checks; unit/reference consistency; record/source linking.
+- **Provide tests:** protocol schema and invalid-input cases; input examination of agent-written files (approved, rejected, needs review); citation checks for agent readings of outputs; intended-control vs uncontrolled-change cases; parser convergence/failure checks; resume/idempotency; replayed events; user plan versions; cancellation; UI reconnect; blinded evaluation leak checks; unit/reference consistency; record/source linking.
 - **Document implementation changes** in the relevant docs and update [`docs/DECISIONS.md`](docs/DECISIONS.md) when a provisional design becomes a concrete decision.
 
 ## 12. Definition of done — minimum credible prototype
@@ -266,4 +277,4 @@ A minimal, honest end-to-end prototype should demonstrate all of the following:
 - The terminal UI displays real per-agent and HPC status, with a pinned top panel and independent chat input.
 - A demo/evaluation uses real or disclosed precomputed data, includes at least one baseline/control, and clearly identifies what remains unimplemented or unvalidated.
 
-**Core maxim:** *The researcher directs the science. The Chief Scientist coordinates the investigation. The hypothesis swarm investigates. Verified protocols control execution. Evidence determines the claims.*
+**Core maxim:** *The researcher directs the science. The Chief Scientist coordinates the investigation. The hypothesis swarm investigates, writes its own inputs and reads its own outputs. Verified protocols examine what the agents write and read before it counts. Evidence determines the claims.*

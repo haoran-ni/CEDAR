@@ -6,9 +6,11 @@ and reopening it shows the same investigation.
 
 Top to bottom: the panel, always shown: the logo, set across its top border, with the
 tagline and the models in use beside it; the mode, on its own line and highlighted in full
-automation; the status lines; which sub-agents are working;
-and a table with one row per hypothesis, keeping lifecycle, agent role and activity,
-scheduler state, evidence quality and assessment in separate columns. Then the scrolling
+automation; the status lines; a table of the agents, each with its status (working, queued,
+waiting for jobs, proposed, idle, retired or off), for how long and its task; and a table
+with one row per hypothesis, keeping lifecycle, scheduler state, evidence quality and
+assessment in separate columns. Each table shows at most three rows and scrolls for the
+rest. Where the tables do not fit, one line says which agents are working. Then the scrolling
 conversation and the input line, above which a menu of matching commands opens when a
 line starts with "/". The Chief Scientist answers in a
 background thread, so the panel keeps updating and commands keep working while it thinks.
@@ -34,8 +36,11 @@ from textual.widgets.option_list import Option
 
 from sim2real.chat import COMMANDS, HELP, ChatSession, Command, Notice, command_lines
 from sim2real.dashboard import (
+    AgentRow,
     SwarmRow,
+    agent_rows,
     dispatcher_status,
+    fit_tasks,
     mode_line,
     model_line,
     status_line,
@@ -51,7 +56,7 @@ TUI_COMMANDS = (
     Command("/notebook", "open the research notebook's index"),
     Command("/round", "open this round's notebook page"),
     Command("/timeline", "open the timeline of every event"),
-    Command("/panel", "hide or show the panel's table of hypotheses"),
+    Command("/panel", "hide or show the panel's tables of agents and hypotheses"),
 )
 MENU_COMMANDS = COMMANDS + TUI_COMMANDS
 
@@ -205,6 +210,7 @@ class _Snapshot:
     models: str
     mode: str = ""
     automated: bool = False
+    agents: list[AgentRow] = field(default_factory=list)
     rows: list[SwarmRow] = field(default_factory=list)
     notices: list[Notice] = field(default_factory=list)
     alerts: list[str] = field(default_factory=list)
@@ -227,7 +233,8 @@ class Sim2RealApp(App):
     #status { height: auto; }
     #status.alarm { color: $warning; text-style: bold; }
     #subagents { height: auto; color: $success; }
-    #swarm { height: auto; max-height: 40vh; margin-top: 1; }
+    .section { height: auto; margin-top: 1; color: $accent; text-style: bold; }
+    #agents, #swarm { height: auto; max-height: 4; }
     #chat { height: 1fr; padding: 0 1; }
     #working { height: auto; padding: 0 1; color: $text-muted; display: none; }
     #commands { height: auto; max-height: 12; margin: 0 1; display: none; }
@@ -243,7 +250,10 @@ class Sim2RealApp(App):
     """
     ENABLE_COMMAND_PALETTE = False
     """Commands in the conversation are typed, starting with "/"; there are no shortcut keys."""
-    COLUMNS = ("Hypothesis", "Lifecycle", "Agent", "Jobs (scheduler)", "Evidence (validator)", "Assessment (judge)")
+    COLUMNS = ("Hypothesis", "Lifecycle", "Jobs (scheduler)", "Evidence (validator)", "Assessment (judge)")
+    AGENT_COLUMNS = ("Agent", "Role", "Status", "For", "Task")
+    STATUS_STYLES = {"working": "bold green", "queued": "yellow", "waiting for jobs": "cyan", "proposed": "magenta",
+                     "idle": "", "retired": "dim", "off": "dim"}
 
     def __init__(self, session: ChatSession, *, refresh_seconds: float = 2.0,
                  clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc), started: str | None = None) -> None:
@@ -254,12 +264,15 @@ class Sim2RealApp(App):
         self.refresh_seconds = refresh_seconds
         self.clock = clock
         self.chief_busy = False
+        self._chief_since: datetime | None = None
+        """When the Chief Scientist began answering the researcher, while it is answering."""
         self.waiting: deque[str] = deque()
         self._refreshing = False
         self._version: int | None = None
         self._events: list = []
         self._state: InvestigationState | None = None
         self._rows: list[SwarmRow] | None = None
+        self._agents: list[AgentRow] | None = None
         self._seen_results: set[tuple[str, ...]] | None = None
         self._round = 0
         self._working_text = ""
@@ -283,6 +296,9 @@ class Sim2RealApp(App):
                 yield Static(id="mode")
                 yield Static(id="status")
                 yield Static("No working sub-agents", id="subagents")
+                yield Static("Agents", id="agents-title", classes="section")
+                yield DataTable(id="agents", cursor_type="row", zebra_stripes=True)
+                yield Static("Hypotheses", id="swarm-title", classes="section")
                 yield DataTable(id="swarm", cursor_type="row", zebra_stripes=True)
         yield VerticalScroll(id="chat")
         yield Static(id="working")
@@ -292,7 +308,8 @@ class Sim2RealApp(App):
         yield Composer(placeholder="Message the Chief Scientist, or a /command (/help)", id="composer")
 
     def on_mount(self) -> None:
-        self.query_one(DataTable).add_columns(*self.COLUMNS)
+        self.query_one("#agents", DataTable).add_columns(*self.AGENT_COLUMNS)
+        self.query_one("#swarm", DataTable).add_columns(*self.COLUMNS)
         if self.session.investigation_id:
             self.say(f"Investigation {self.session.investigation_id}. Type /help for commands.", "notice")
         else:
@@ -307,10 +324,16 @@ class Sim2RealApp(App):
 
     def on_resize(self) -> None:
         self._fit_panel()
+        if self._agents:
+            self._show_agents()
 
     def _fit_panel(self) -> None:
+        """Show the tables when there is room or the researcher asked for them; otherwise one line summarizes
+        what the agents are doing."""
         show = self._panel_choice if self._panel_choice is not None else self.size.width >= NARROW_COLUMNS
-        self.query_one(DataTable).display = show and bool(self._rows)
+        for name, rows in (("agents", self._agents), ("swarm", self._rows)):
+            self.query_one(f"#{name}").display = self.query_one(f"#{name}-title").display = show and bool(rows)
+        self.query_one("#subagents").display = not show
 
     def say(self, text: str, kind: str) -> None:
         """Add a line to the conversation, shown exactly as written."""
@@ -414,7 +437,7 @@ class Sim2RealApp(App):
     # -- the Chief Scientist ----------------------------------------------------------------------
 
     def _ask(self, line: str) -> None:
-        self.chief_busy = True
+        self.chief_busy, self._chief_since = True, self.clock()
         steps = Static(Text(""), classes="notice")
         box = Collapsible(steps, title="Chief Scientist is working…", collapsed=False)
         chat = self.query_one("#chat", VerticalScroll)
@@ -452,7 +475,7 @@ class Sim2RealApp(App):
             chat.mount(Static("Chief Scientist ›", classes="speaker"))
             chat.mount(Markdown(reply or "(no reply)", open_links=False))
         chat.scroll_end(animate=False)
-        self.chief_busy = False
+        self.chief_busy, self._chief_since = False, None
         self._working("")
         self.refresh_state()
         if self.waiting:
@@ -495,7 +518,8 @@ class Sim2RealApp(App):
             mode, automated = mode_line(None)
             return _Snapshot("No investigation yet: describe the discrepancy to the Chief Scientist.", dispatcher,
                              alarm, subagent_status(None, activities, now, running, automatic),
-                             model_line(settings, None), mode=mode, automated=automated)
+                             model_line(settings, None), mode=mode, automated=automated,
+                             agents=agent_rows(None, [], activities, now, self._chief_since))
         version = self.workspace.store.current_version(investigation_id)
         changed = version != self._version
         if changed:
@@ -506,7 +530,8 @@ class Sim2RealApp(App):
         mode, automated = mode_line(state)
         return _Snapshot(status_line(state, now), f"{work_summary(state)} · {dispatcher}", alarm,
                          subagent_status(state, activities, now, running, automatic), model_line(settings, state),
-                         mode, automated, swarm_rows(state, self._events, activities, now),
+                         mode, automated, agent_rows(state, self._events, activities, now, self._chief_since),
+                         swarm_rows(state),
                          self.session.notices() if changed else [], self._new_results(state) if changed else [],
                          state.round)
 
@@ -542,14 +567,18 @@ class Sim2RealApp(App):
         self.query_one("#subagents", Static).update(Text(snapshot.subagents))
         self.query_one("#models", Static).update(Text(snapshot.models))
         self._round = snapshot.round
+        if snapshot.agents != self._agents:
+            self._agents = snapshot.agents
+            self._show_agents()
+            self._fit_panel()
         if snapshot.rows != self._rows:
             self._rows = snapshot.rows
-            table = self.query_one(DataTable)
+            table = self.query_one("#swarm", DataTable)
             cursor = table.cursor_row
             table.clear()
             for row in snapshot.rows:
                 lifecycle = row.lifecycle + (f", {row.priority.replace('_', ' ')}" if row.priority != "normal" else "")
-                table.add_row(row.hypothesis_id, lifecycle, row.agent, row.jobs, row.evidence, row.assessment,
+                table.add_row(row.hypothesis_id, lifecycle, row.jobs, row.evidence, row.assessment,
                               key=row.hypothesis_id)
             if snapshot.rows:
                 table.move_cursor(row=min(cursor, len(snapshot.rows) - 1))
@@ -565,8 +594,28 @@ class Sim2RealApp(App):
         for alert in snapshot.alerts:
             self.notify(alert, title="New result", timeout=10, markup=False)
 
+    def _show_agents(self) -> None:
+        """Fill the agents table, its tasks shortened to fit the panel so that it never scrolls sideways."""
+        table = self.query_one("#agents", DataTable)
+        cursor = table.cursor_row
+        table.clear()
+        rows = self._agents or []
+        # less the panel's border and padding, and room for the table's own scrollbar
+        tasks = fit_tasks(rows, self.size.width - 8, self.AGENT_COLUMNS[:-1])
+        for row, task in zip(rows, tasks):
+            style = self.STATUS_STYLES.get(row.status.split(" · ")[0], "")
+            table.add_row(row.name, row.role, Text(row.status, style=style), row.since or "—", task, key=row.key)
+        if rows:
+            table.move_cursor(row=min(cursor, len(rows) - 1))
+
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
-        self.action_page(f"hypotheses/{event.row_key.value}.md")
+        """Enter on a hypothesis, or on an agent working on one, opens that hypothesis's notebook page."""
+        if event.data_table.id == "swarm":
+            self.action_page(f"hypotheses/{event.row_key.value}.md")
+            return
+        row = next((r for r in self._agents or () if r.key == event.row_key.value), None)
+        if row is not None and row.hypothesis_id is not None:
+            self.action_page(f"hypotheses/{row.hypothesis_id}.md")
 
     # -- actions ----------------------------------------------------------------------------------
 

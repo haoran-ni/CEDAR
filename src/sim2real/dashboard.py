@@ -1,8 +1,10 @@
 """What the live panel shows, computed from the record without any terminal code.
 
-One row per hypothesis, with four separate statuses that must not be confused: the
-hypothesis's lifecycle, its agent's role and activity (or the agent proposed for it), its
-calculations' scheduler states, and the quality of their evidence, next to the Evidence
+Two tables. One row per agent (the Chief Scientist, each hypothesis agent, the Evidence
+Judge and, in full automation, the approver), with what it is doing: working, queued,
+waiting for jobs, proposed, idle, retired or off, for how long, and on which task. And one
+row per hypothesis, with separate statuses that must not be confused: its lifecycle, its
+calculations' scheduler states and the quality of their evidence, next to the Evidence
 Judge's assessment. Several agents can be working at once. Ages come from event times and
 the dispatcher's own reports; there are no progress percentages, because nothing measures
 progress.
@@ -19,15 +21,19 @@ from sim2real.contracts.plan import PermissionAction
 from sim2real.contracts.status import CalculationState, HypothesisStatus, InvestigationMode
 from sim2real.dispatch import Activity
 from sim2real.models.types import ModelSettings
+from sim2real.automation import pending_decisions
+from sim2real.contracts.events import HypothesisStatusChanged
 from sim2real.state.projection import (
+    AgentRecord,
+    AgentTaskRecord,
     CalculationRecord,
-    HypothesisRecord,
     InvestigationState,
+    agent_id_for,
     authorization_for,
     hypothesis_evidence,
 )
 from sim2real.summaries import approval_requests
-from sim2real.swarm import minutes_left
+from sim2real.swarm import FIRST_TASK, WAKE_TASK, minutes_left
 
 STALE_DISPATCHER_SECONDS = 600
 """A dispatcher silent for longer than this is reported as not running."""
@@ -40,7 +46,6 @@ class SwarmRow:
     hypothesis_id: str
     lifecycle: str
     priority: str
-    agent: str
     jobs: str
     evidence: str
     assessment: str
@@ -80,7 +85,10 @@ def job_status(state: InvestigationState, calc: CalculationRecord) -> str:
     elif calc.state is _C.VALIDATED_INPUT:
         needs = state.spec.constraints.submit_requires_approval and authorization_for(
             state, PermissionAction.SUBMIT, calc.calculation_id) is None
-        text = "needs /approve submit" if needs else "authorized, not yet submitted"
+        if needs and any(d.target_id == calc.calculation_id for d in pending_decisions(state)):
+            text = "for the approver"
+        else:
+            text = "needs /approve submit" if needs else "authorized, not yet submitted"
     elif calc.state is _C.SUBMISSION_PENDING:
         text = "submitting"
     elif calc.state is _C.CANCELLED:
@@ -99,51 +107,172 @@ def _times(events: Sequence[RecordedEvent]) -> dict[int, datetime]:
     return {e.stream_version: e.occurred_at for e in events}
 
 
-def _role(text: str, limit: int = 32) -> str:
-    return text if len(text) <= limit else text[:limit - 1] + "…"
+@dataclass(frozen=True)
+class AgentRow:
+    """One agent in the panel's table of agents: what it is, and what it is doing now."""
+
+    key: str
+    name: str
+    role: str
+    status: str
+    """working, queued, waiting for jobs, proposed (with when it starts), idle, retired or off."""
+    since: str
+    """How long it has been so, where that is known."""
+    task: str
+    hypothesis_id: str | None = None
+    """The hypothesis it works on or assesses, if any."""
 
 
-def agent_status(state: InvestigationState, hyp: HypothesisRecord, times: dict[int, datetime],
-                 activities: Sequence[Activity], now: datetime) -> str:
-    hid = hyp.hypothesis_id
-    agent = state.active_agent(hid)
-    mine = [a for a in activities if (a.investigation_id, a.hypothesis_id) == (state.investigation_id, hid)]
-    if not mine and agent is None:
-        proposal = state.pending_proposal
-        spec = next((s for s in proposal.agents if s.hypothesis_id == hid), None) if proposal else None
-        if spec is not None:
-            if proposal.feedback_ids:
-                return f"proposed {_role(spec.role)}; held for your reply"
-            if state.automation is not None:
-                return f"proposed {_role(spec.role)}; for the approver"
-            left = minutes_left(state, proposal, now)
-            return f"proposed {_role(spec.role)}; " + (f"starts in {age(left * 60)}" if left > 0 else "starting")
-        retired = [a for a in state.agents.values() if a.hypothesis_id == hid]
-        return "agent retired" if retired else "no agent"
-    name = _role(agent.spec.role) if agent else "agent"
-    for activity in mine:
-        if activity.role == "evidence_judge":
-            return f"judge working for {age((now - activity.started_at).total_seconds())}"
-    if mine:
-        step = f"; last step {mine[0].last_step}" if mine[0].last_step else ""
-        return f"{name}: working for {age((now - mine[0].started_at).total_seconds())}{step}"
-    pending = [t for t in state.pending_tasks if t.hypothesis_id == hid]
-    if pending:
-        who = "judge" if pending[0].role == "evidence_judge" else name
-        return f"{who}: queued {age((now - times[pending[0].queued_at]).total_seconds())} ago"
-    if hyp.status is HypothesisStatus.WAITING_FOR_JOB:
-        return f"{name}: waiting for jobs"
-    runs = [r for r in state.agent_runs if r.run.task_id and state.tasks[r.run.task_id].hypothesis_id == hid]
-    if runs:
-        last = runs[-1]
-        who = "judge" if last.role == "evidence_judge" else name
-        return f"{who}: last ran {age((now - times[last.recorded_at]).total_seconds())} ago ({last.run.outcome})"
-    return f"{name}: not run yet"
+def task_label(task: AgentTaskRecord | None) -> str:
+    """A task in a few words."""
+    if task is None:
+        return "—"
+    if task.role == "chief_scientist":
+        return "review the agents' reports"
+    if task.role == "evidence_judge":
+        return f"assess {task.hypothesis_id}"
+    if task.role == "approver":
+        return "decide on proposals and submissions"
+    if task.instruction.startswith(WAKE_TASK):
+        return "analyze its finished calculations"
+    return _short(task.instruction.removeprefix(FIRST_TASK).splitlines()[0], 70)
 
 
-def swarm_rows(state: InvestigationState, events: Sequence[RecordedEvent], activities: Sequence[Activity],
-               now: datetime) -> list[SwarmRow]:
+def _short(text: str, limit: int) -> str:
+    return text if len(text) <= limit else text[:max(limit - 1, 0)] + "…"
+
+
+def fit_tasks(rows: Sequence[AgentRow], width: int, headers: Sequence[str]) -> list[str]:
+    """Each row's task, shortened so that the table fits ``width`` columns: the other columns keep their widths and
+    every column takes two more for padding."""
+    others = [max([len(h)] + [len(text) for text in column]) for h, column in zip(
+        headers, zip(*[(r.name, r.role, r.status, r.since or "—") for r in rows]) if rows else [() for _ in headers])]
+    room = max(width - sum(others) - 2 * (len(others) + 1), 16)
+    return [_short(r.task, room) for r in rows]
+
+
+def agent_rows(state: InvestigationState | None, events: Sequence[RecordedEvent], activities: Sequence[Activity],
+               now: datetime, chief_since: datetime | None = None) -> list[AgentRow]:
+    """Every agent of the investigation and what it is doing: the Chief Scientist, the hypothesis agents (working
+    ones first, then those proposed, then those retired), the Evidence Judge and, in full automation, the approver.
+    ``chief_since`` is when the Chief Scientist began answering the researcher, if it is answering now."""
     times = _times(events)
+    mine = [a for a in activities if state is not None and a.investigation_id == state.investigation_id]
+    pending = state.pending_tasks if state is not None else []
+
+    def ago(moment: datetime | None) -> str:
+        return age((now - moment).total_seconds()) if moment is not None else ""
+
+    def at(version: int | None) -> datetime | None:
+        return times.get(version) if version is not None else None
+
+    def runs_of(actor_id: str | None = None, role: str | None = None) -> list:
+        if state is None:
+            return []
+        return [r for r in state.agent_runs if (actor_id is None or r.actor_id == actor_id)
+                and (role is None or r.role == role)]
+
+    # The Chief Scientist: answering the researcher, reviewing, or idle.
+    review = next((a for a in mine if a.role == "chief_scientist"), None)
+    queued_review = next((t for t in pending if t.role == "chief_scientist"), None)
+    if chief_since is not None:
+        chief = ("working", ago(chief_since), "answer your message" + (" · reviewing the agents' reports" if review
+                                                                       else ""))
+    elif review is not None:
+        chief = ("working", ago(review.started_at), "review the agents' reports")
+    elif queued_review is not None:
+        chief = ("queued", ago(at(queued_review.queued_at)), "review the agents' reports")
+    else:
+        last = runs_of(role="chief_scientist")
+        did = (("last: review the agents' reports" if last[-1].run.task_id else "last: answer your message")
+               if last else "—")
+        chief = ("idle", ago(at(last[-1].recorded_at)) if last else "", did)
+    rows = [AgentRow("chief", "Chief Scientist", "plans and coordinates", *chief)]
+
+    if state is not None:
+        rows += [_hypothesis_agent_row(state, a, mine, pending, ago, at, events) for a in state.agents.values()
+                 if a.active]
+        proposal = state.pending_proposal
+        for spec in proposal.agents if proposal is not None else ():
+            if proposal.feedback_ids:
+                when = "held for your reply"
+            elif state.automation is not None:
+                when = "for the approver"
+            else:
+                left = minutes_left(state, proposal, now)
+                when = f"starts in {age(left * 60)}" if left > 0 else "starting"
+            rows.append(AgentRow(f"proposed:{spec.hypothesis_id}", agent_id_for(state, spec.hypothesis_id),
+                                 _short(spec.role, 32), f"proposed · {when}",
+                                 ago(at(proposal.recorded_at)), _short(spec.brief, 70), spec.hypothesis_id))
+        rows += [AgentRow(a.agent_id, a.agent_id, _short(a.spec.role, 32), "retired",
+                          ago(at(a.retired_at)), _short(a.retire_reason or "—", 70), a.hypothesis_id)
+                 for a in state.agents.values() if not a.active]
+
+    # The Evidence Judge: one at a time per investigation.
+    judging = next((a for a in mine if a.role == "evidence_judge"), None)
+    queued = [t for t in pending if t.role == "evidence_judge"]
+    automated = state is not None and state.automation is not None
+    if judging is not None:
+        judge = ("working", ago(judging.started_at), f"assess {judging.hypothesis_id}", judging.hypothesis_id)
+    elif queued:
+        more = f" (and {len(queued) - 1} more)" if len(queued) > 1 else ""
+        judge = ("queued", ago(at(queued[0].queued_at)), f"assess {queued[0].hypothesis_id}{more}",
+                 queued[0].hypothesis_id)
+    else:
+        last = runs_of(role="evidence_judge")
+        if last and last[-1].run.task_id:
+            done = state.tasks[last[-1].run.task_id]
+            judge = ("idle", ago(at(last[-1].recorded_at)), f"last: assess {done.hypothesis_id}", None)
+        else:
+            judge = ("idle", "", "assesses new evidence each round" if automated else
+                     "assesses when the Chief Scientist asks", None)
+    rows.append(AgentRow("judge", "Evidence Judge", "assesses evidence", *judge[:3], hypothesis_id=judge[3]))
+
+    # The approver: only in full automation, or once it has worked.
+    if state is not None and (automated or any(t.role == "approver" for t in state.tasks.values())):
+        deciding = next((a for a in mine if a.role == "approver"), None)
+        waiting = next((t for t in pending if t.role == "approver"), None)
+        if not automated:
+            approver = ("off", "", "only in full automation")
+        elif deciding is not None:
+            approver = ("working", ago(deciding.started_at), "decide on proposals and submissions")
+        elif waiting is not None:
+            approver = ("queued", ago(at(waiting.queued_at)), "decide on proposals and submissions")
+        else:
+            last = runs_of(role="approver")
+            approver = ("idle", ago(at(last[-1].recorded_at)) if last else "", "nothing waits for a decision")
+        rows.append(AgentRow("approver", "Approver", "decides for you", *approver))
+    return rows
+
+
+def _hypothesis_agent_row(state: InvestigationState, agent: AgentRecord, mine: Sequence[Activity],
+                          pending: Sequence[AgentTaskRecord], ago, at, events: Sequence[RecordedEvent]) -> AgentRow:
+    working = next((a for a in mine if a.agent_id == agent.agent_id), None)
+    queued = [t for t in pending if t.agent_id == agent.agent_id]
+    hyp = state.hypotheses[agent.hypothesis_id]
+    if working is not None:
+        step = f" · step {working.last_step}" if working.last_step else ""
+        status = ("working", ago(working.started_at), task_label(state.tasks.get(working.task_id)) + step)
+    elif queued:
+        status = ("queued", ago(at(queued[0].queued_at)), task_label(queued[0]))
+    elif hyp.status is HypothesisStatus.WAITING_FOR_JOB:
+        since = next((e.stream_version for e in reversed(events) if isinstance(e.payload, HypothesisStatusChanged)
+                      and e.payload.hypothesis_id == agent.hypothesis_id
+                      and e.payload.status is HypothesisStatus.WAITING_FOR_JOB), None)
+        status = ("waiting for jobs", ago(at(since)),
+                  "calculations " + ", ".join(short_id(c) for c in hyp.awaiting_calculation_ids))
+    else:
+        runs = [r for r in state.agent_runs if r.actor_id == agent.agent_id]
+        if runs:
+            done = state.tasks.get(runs[-1].run.task_id) if runs[-1].run.task_id else None
+            status = ("idle", ago(at(runs[-1].recorded_at)), f"last: {task_label(done)}")
+        else:
+            status = ("idle", ago(at(agent.started_at)), "not run yet")
+    return AgentRow(agent.agent_id, agent.agent_id, _short(agent.spec.role, 32), *status,
+                    hypothesis_id=agent.hypothesis_id)
+
+
+def swarm_rows(state: InvestigationState) -> list[SwarmRow]:
     rows = []
     for hyp in state.hypotheses.values():
         calcs = [state.calculations[c] for c in hyp.calculation_ids]
@@ -153,7 +282,6 @@ def swarm_rows(state: InvestigationState, events: Sequence[RecordedEvent], activ
             hypothesis_id=hyp.hypothesis_id,
             lifecycle=hyp.status.value,
             priority=state.plan.priority(hyp.hypothesis_id).value,
-            agent=agent_status(state, hyp, times, activities, now),
             jobs="; ".join(job_status(state, c) for c in calcs) or "none",
             evidence=", ".join(f"{n} {quality}" for quality, n in qualities.items()) or "none",
             assessment=f"{last.assessment.value} ({last.completeness.value.lower()})" if last else "NOT_TESTED",

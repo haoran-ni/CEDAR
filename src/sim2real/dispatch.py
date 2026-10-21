@@ -80,7 +80,15 @@ from sim2real.notebook import update_notebook
 from sim2real.protocols.base import ProtocolRegistry
 from sim2real.state.projection import AgentTaskRecord, InvestigationState, authorization_for, review_deadline
 from sim2real.summaries import calculation_summary, task_owner
-from sim2real.swarm import CHIEF, REVIEW_INSTRUCTION, agent_prompt, review_due, review_material, start_drafts
+from sim2real.swarm import (
+    CHIEF,
+    REVIEW_INSTRUCTION,
+    WAKE_TASK,
+    agent_prompt,
+    review_due,
+    review_material,
+    start_drafts,
+)
 from sim2real.workspace import ModelClients, Services, Workspace, profile_for, registry_for, services_for
 
 SYSTEM = Actor(kind=ActorKind.SYSTEM, id="dispatcher")
@@ -390,7 +398,7 @@ class Dispatcher:
                 continue
             summaries = "\n".join(calculation_summary(state, c, findings=False, viewer=hyp.hypothesis_id)
                                   for c in awaited)
-            instruction = ("Your calculations have ended and their runs were checked:\n" + summaries + "\nLook at "
+            instruction = (WAKE_TASK + "\n" + summaries + "\nLook at "
                            "the outputs (run_outputs, file tools). Record the values that matter: a value printed in "
                            "an output with submit_reading, citing its lines; anything that must be computed with "
                            "run_analysis and then record_result. Say what the results mean for your hypothesis, then "

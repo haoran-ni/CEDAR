@@ -8,6 +8,7 @@ import re
 import threading
 
 import pytest
+from factories import add_hypothesis
 from sites import aims_output
 from test_orchestration import (
     ENERGY,
@@ -90,8 +91,16 @@ def conversation(app) -> str:
 
 
 def panel(app) -> list[list[str]]:
-    table = app.query_one(DataTable)
+    """The hypotheses table."""
+    table = app.query_one("#swarm", DataTable)
     return [[str(cell) for cell in table.get_row_at(i)] for i in range(table.row_count)]
+
+
+def agents(app) -> dict[str, list[str]]:
+    """The agents table, by agent: role, status, for, task."""
+    table = app.query_one("#agents", DataTable)
+    rows = [[str(cell) for cell in table.get_row_at(i)] for i in range(table.row_count)]
+    return {row[0]: row[1:] for row in rows}
 
 
 def status(app) -> str:
@@ -131,7 +140,9 @@ def test_conversation_live_panel_and_approval(system):
 
         await refresh(pilot)
         (row,) = panel(app)
-        assert row[0] == HYP and row[1] == "ACTIVE" and row[2] == f"proposed {ROLE}; starts in 10 min"
+        assert row[0] == HYP and row[1] == "ACTIVE"
+        assert agents(app)[f"agent-{HYP}"] == [ROLE, "proposed · starts in 10 min", "0 s",
+                                               "Compute a PBE baseline total energy for CO atop."]
         assert status(app).startswith(f"{INV} · INVESTIGATING · round 1 · plan v1 · 0 agents")
         assert "1 agent proposed: start in 10 min unless you reply (/agents)" in status(app)
         assert "[waiting for you] /approve agents" in conversation(app)
@@ -141,7 +152,7 @@ def test_conversation_live_panel_and_approval(system):
         await send(pilot, "/approve agents")
         assert f"Started agent-{HYP} on {HYP}" in conversation(app)
         await refresh(pilot)
-        assert panel(app)[0][2].startswith(f"{ROLE}: queued") and "proposed" not in status(app)
+        assert agents(app)[f"agent-{HYP}"][1] == "queued" and "proposed" not in status(app)
 
         # The dispatcher works in its own thread, as a separate process would.
         clients.add("hypothesis_agent", *agent_requests(system))
@@ -149,8 +160,9 @@ def test_conversation_live_panel_and_approval(system):
         await refresh(pilot)
         calc = latest_calc(system["workspace"])
         (row,) = panel(app)
-        assert row[3] == f"{short_id(calc)} needs /approve submit" and row[4] == "none" and row[5] == "NOT_TESTED"
-        assert row[2] == f"{ROLE}: waiting for jobs" and "dispatcher seen 0 s ago" in status(app)
+        assert row[2] == f"{short_id(calc)} needs /approve submit" and row[3] == "none" and row[4] == "NOT_TESTED"
+        assert agents(app)[f"agent-{HYP}"][1] == "waiting for jobs" and "dispatcher seen 0 s ago" in status(app)
+        assert agents(app)[f"agent-{HYP}"][3] == f"calculations {short_id(calc)}"
         assert "1 waiting for you (/pending)" in status(app)
         assert f"[waiting for you] /approve submit {calc}" in conversation(app)
         assert "Requested the PBE baseline; waiting for it." in conversation(app)
@@ -158,7 +170,7 @@ def test_conversation_live_panel_and_approval(system):
         await send(pilot, f"/approve submit {short_id(calc)}")
         assert f"Submission of {calc} authorized" in conversation(app)
         await refresh(pilot)
-        assert panel(app)[0][3] == f"{short_id(calc)} authorized, not yet submitted"
+        assert panel(app)[0][2] == f"{short_id(calc)} authorized, not yet submitted"
         assert "waiting for you" not in status(app)
 
     drive(app, script)
@@ -210,8 +222,8 @@ def test_notebook_pages_and_cited_output_open_in_place(system):
 
     async def script(pilot):
         await settle(pilot)
-        assert panel(app)[0][4] == "2 VALIDATED"  # a cited reading and an analysis result
-        app.query_one(DataTable).focus()
+        assert panel(app)[0][3] == "2 VALIDATED"  # a cited reading and an analysis result
+        app.query_one("#swarm", DataTable).focus()
         await pilot.press("enter")
         await settle(pilot)
         page = app.screen
@@ -275,13 +287,14 @@ def test_narrow_terminals_start_with_the_panel_hidden_and_a_summary_shown(system
 
     async def script(pilot):
         await settle(pilot)
-        assert not app.query_one(DataTable).display
+        tables = ("#agents", "#agents-title", "#swarm", "#swarm-title")
+        assert not any(app.query_one(t).display for t in tables) and app.query_one("#subagents").display
         summary = status(app).splitlines()[1]
         assert summary.startswith("1 hypothesis · jobs: none active · evidence: 2 VALIDATED")
         await send(pilot, "/panel")
-        assert app.query_one(DataTable).display
+        assert all(app.query_one(t).display for t in tables) and not app.query_one("#subagents").display
         await send(pilot, "/panel")
-        assert not app.query_one(DataTable).display
+        assert not any(app.query_one(t).display for t in tables)
 
     drive(app, script, size=(90, 30))
 
@@ -321,8 +334,8 @@ def test_the_panel_is_always_there_with_the_logo_across_its_top_border(system):
         assert str(app.query_one("#tagline", Static).content) == TAGLINE
         assert str(app.query_one("#models", Static).content).startswith("Models: Chief Scientist "
                                                                         "scripted-chief_scientist (scripted)")
-        assert str(app.query_one("#subagents", Static).content) == "No working sub-agents"
-        assert not app.query_one(DataTable).display  # no hypotheses yet: the panel stays, without a table
+        assert not app.query_one("#swarm").display  # no hypotheses yet: the panel stays, without their table
+        assert app.query_one("#agents").display and list(agents(app)) == ["Chief Scientist", "Evidence Judge"]
 
     drive(app, script)
 
@@ -333,10 +346,10 @@ def test_on_narrow_terminals_the_panel_stays_and_its_table_can_be_shown(system):
 
     async def script(pilot):
         await settle(pilot)
-        assert app.query_one("#panel").display and not app.query_one(DataTable).display
+        assert app.query_one("#panel").display and not app.query_one("#swarm").display
         assert app.query_one(PanelTop).render().plain.split("\n")[1].endswith("╮")
         await send(pilot, "/panel")
-        assert app.query_one(DataTable).display
+        assert app.query_one("#swarm").display and app.query_one("#agents").display
 
     drive(app, script, size=(80, 40))
 
@@ -402,6 +415,24 @@ def test_a_slash_at_the_start_of_a_line_lists_the_matching_commands(system):
     drive(app, script)
 
 
+def test_each_table_shows_at_most_three_rows_and_scrolls_for_the_rest(system):
+    open_and_start(system)
+    for n in range(14):
+        add_hypothesis(system["workspace"].ledger, INV, f"hyp-{n:02d}")
+    app = Sim2RealApp(system["chat"], refresh_seconds=3600, clock=lambda: NOW)
+
+    async def script(pilot):
+        await settle(pilot)
+        await refresh(pilot)
+        for name, rows in (("#agents", 17), ("#swarm", 15)):
+            table = app.query_one(name, DataTable)
+            assert table.row_count == rows and table.size.height == 4  # its header and three rows
+            assert table.max_scroll_y > 0 and table.virtual_size.width <= table.size.width  # scrolls, not sideways
+        assert app.query_one("#chat").size.height >= 10
+
+    drive(app, script, size=(120, 40))
+
+
 def test_the_panel_shows_the_mode_on_its_own_line(system):
     system["clients"].add("chief_scientist", open_and_delegate(system["site"]), reply(TextPart(text="Opened.")))
     app = Sim2RealApp(system["chat"], refresh_seconds=3600, clock=lambda: NOW)
@@ -434,11 +465,11 @@ def test_the_conversation_has_no_shortcut_keys(system):
         await settle(pilot)
         main = app.screen
         assert not main.query(Footer)
-        shown = app.query_one(DataTable).display
+        shown = app.query_one("#swarm", DataTable).display
         for key in ("f2", "f3", "f4", "f8", "ctrl+p"):  # commands are typed with "/" only
             await pilot.press(key)
             await settle(pilot)
-            assert app.screen is main and app.query_one(DataTable).display == shown
+            assert app.screen is main and app.query_one("#swarm", DataTable).display == shown
         await send(pilot, "/notebook")
         assert isinstance(app.screen, NotebookScreen)
 

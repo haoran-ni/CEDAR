@@ -36,6 +36,10 @@ from sim2real.state.projection import (
 )
 
 CHIEF = Actor(kind=ActorKind.CHIEF_SCIENTIST, id="chief-scientist")
+FIRST_TASK = "Your first task, from the Chief Scientist: "
+"""How an agent's first task, its brief, begins."""
+WAKE_TASK = "Your calculations have ended and their runs were checked:"
+"""How the task begins that the dispatcher queues for an agent whose calculations have ended."""
 REVIEW_ROLES = ("hypothesis_agent", "evidence_judge")
 """Roles whose reports the Chief Scientist reviews."""
 
@@ -67,7 +71,7 @@ def start_drafts(state: InvestigationState, proposal: ProposalRecord, actor: Act
     for spec in proposal.agents:
         drafts.append(EventDraft(actor=actor, payload=AgentTaskQueued(
             task_id=new_id("task"), role="hypothesis_agent", hypothesis_id=spec.hypothesis_id,
-            agent_id=ids[spec.hypothesis_id], instruction=f"Your first task, from the Chief Scientist: {spec.brief}")))
+            agent_id=ids[spec.hypothesis_id], instruction=FIRST_TASK + spec.brief)))
     return drafts
 
 

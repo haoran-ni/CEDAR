@@ -31,6 +31,8 @@ from sim2real.contracts import (
     AgentsProposed,
     AgentTaskQueued,
     CalculationState,
+    InvestigationMode,
+    ModeChanged,
     EvidenceQuality,
     ExaminationVerdict,
     HypothesisStatus,
@@ -41,7 +43,7 @@ from sim2real.contracts import (
 )
 from sim2real.dashboard import (
     age,
-    agent_status,
+    agent_rows,
     dispatcher_status,
     job_status,
     model_line,
@@ -125,46 +127,63 @@ def test_rows_keep_jobs_evidence_and_assessment_apart(ledger):
     record_evidence(ledger, inv, failed, "ev-2", quality=EvidenceQuality.INVALID,
                     checks=(QualityCheck(name="scf_converged", passed=False),))
     state = ledger.load(inv)
-    (row,) = swarm_rows(state, [], [], LATER)
+    (row,) = swarm_rows(state)
     assert row.hypothesis_id == hyp and row.lifecycle == "PLANNING_TEST" and row.priority == "normal"
     assert row.jobs == f"{short_id(ok)} job 1 COMPLETED; {short_id(failed)} job 2 FAILED, run failed its checks"
     assert row.evidence == "1 VALIDATED, 1 INVALID"
-    assert row.assessment == "NOT_TESTED" and row.agent == "test specialist: not run yet"
+    assert row.assessment == "NOT_TESTED"
     assert work_summary(state) == "1 hypothesis · jobs: none active · evidence: 1 VALIDATED, 1 INVALID"
 
 
-def test_agent_status_prefers_what_is_happening_now(workspace):
+def test_the_agents_table_shows_every_agent_and_what_it_is_doing(workspace):
     ledger = workspace.ledger
+
+    def table(investigation=None, *activities, chief_since=None):
+        state = ledger.load(investigation) if investigation else None
+        events = workspace.store.read_stream(investigation) if investigation else []
+        return [(r.name, r.status, r.task) for r in agent_rows(state, events, activities, LATER, chief_since)]
+
+    def row(name, *activities, **kwargs):
+        return next(r for r in table(inv, *activities, **kwargs) if r[0] == name)
+
+    # Before any investigation: the Chief Scientist and the Evidence Judge.
+    assert table() == [("Chief Scientist", "idle", "—"),
+                       ("Evidence Judge", "idle", "assesses when the Chief Scientist asks")]
+    assert table(chief_since=LATER)[0] == ("Chief Scientist", "working", "answer your message")
+
     inv = start_investigation(ledger)
     hyp = add_hypothesis(ledger, inv, agent=False)
-
-    def status(*activities):
-        state = ledger.load(inv)
-        times = {e.stream_version: e.occurred_at for e in workspace.store.read_stream(inv)}
-        return agent_status(state, state.hypotheses[hyp], times, activities, LATER)
-
-    assert status() == "no agent"
+    name = f"agent-{hyp}"
     ledger.record(inv, [draft(CHIEF, AgentsProposed(proposal_id="p-1", rationale="test", agents=(
         AgentSpec(hypothesis_id=hyp, role="exchange-correlation specialist", brief="compare functionals"),)))])
-    assert status().startswith("proposed exchange-correlation specialist; starts in ")
+    _, status, task_text = row(name)
+    assert status.startswith("proposed · starts in ") and task_text == "compare functionals"
     ledger.record(inv, [draft(USER, UserInterventionRecorded(intervention_id="msg-1", text="Use PBE0 too."))])
-    assert status() == "proposed exchange-correlation specialist; held for your reply"
+    assert row(name)[1] == "proposed · held for your reply"
 
     agent = start_agent(ledger, inv, hyp, role="exchange-correlation specialist")
-    assert status() == "exchange-correlation specialist: not run yet"
+    assert row(name) == (name, "idle", "not run yet")
     ledger.record(inv, [draft(USER, AgentTaskQueued(task_id="t-1", role="hypothesis_agent", hypothesis_id=hyp,
                                                     agent_id=agent.id, instruction="test it"))])
-    assert status().startswith("exchange-correlation specialist: queued ") and status().endswith(" ago")
+    assert row(name) == (name, "queued", "test it")
     working = Activity(investigation_id=inv, task_id="t-1", role="hypothesis_agent", hypothesis_id=hyp,
                        agent_id=agent.id, started_at=LATER - timedelta(minutes=3), last_step="request_calculation",
                        last_step_at=LATER)
-    assert status(working) == "exchange-correlation specialist: working for 3 min; last step request_calculation"
+    assert row(name, working) == (name, "working", "test it · step request_calculation")
+    full = next(r for r in agent_rows(ledger.load(inv), workspace.store.read_stream(inv), [working], LATER)
+                if r.name == name)
+    assert (full.role, full.since, full.hypothesis_id) == ("exchange-correlation specialist", "3 min", hyp)
     elsewhere = Activity(investigation_id="other", task_id="t-9", role="hypothesis_agent", hypothesis_id=hyp,
                          agent_id=agent.id, started_at=LATER)
-    assert status(elsewhere).startswith("exchange-correlation specialist: queued")
+    assert row(name, elsewhere)[1] == "queued"
     judge = Activity(investigation_id=inv, task_id="t-8", role="evidence_judge", hypothesis_id=hyp, agent_id=None,
                      started_at=LATER - timedelta(minutes=1))
-    assert status(working, judge) == "judge working for 1 min"
+    assert row("Evidence Judge", judge) == ("Evidence Judge", "working", f"assess {hyp}")
+    review = Activity(investigation_id=inv, task_id="t-7", role="chief_scientist", hypothesis_id=None,
+                      agent_id=None, started_at=LATER)
+    assert row("Chief Scientist", review) == ("Chief Scientist", "working", "review the agents' reports")
+    assert row("Chief Scientist", review, chief_since=LATER)[2] == ("answer your message · reviewing the agents' "
+                                                                    "reports")
 
     calc = ledger.request_calculation(inv, agent, hyp, task(), "test").calculation_id
     examine(ledger, inv, calc)
@@ -172,11 +191,21 @@ def test_agent_status_prefers_what_is_happening_now(workspace):
     ledger.record(inv, [draft(agent, AgentRunRecorded(
         session_id="s", role="hypothesis_agent", task_id="t-1", provider="scripted", requested_model="m", turns=2,
         input_tokens=1, output_tokens=1, cache_read_tokens=0, cache_write_tokens=0, outcome="waiting"))])
-    assert status() == "exchange-correlation specialist: waiting for jobs"
+    assert row(name) == (name, "waiting for jobs", f"calculations {short_id(calc)}")
     set_hypothesis_status(ledger, inv, hyp, HypothesisStatus.ANALYZING)
-    assert status().startswith("exchange-correlation specialist: last ran ") and status().endswith(" ago (waiting)")
+    assert row(name) == (name, "idle", "last: test it")
+
+    # The approver appears in full automation; the Judge then assesses every round.
+    assert "Approver" not in [r[0] for r in table(inv)]
+    ledger.record(inv, [draft(USER, UserInterventionRecorded(intervention_id="msg-2", text="/mode full-automation")),
+                        draft(USER, ModeChanged(mode=InvestigationMode.FULL_AUTOMATION, reason="away",
+                                                max_core_hours=10, max_tokens=1000, intervention_id="msg-2"))])
+    assert row("Approver") == ("Approver", "idle", "nothing waits for a decision")
+    assert row("Evidence Judge") == ("Evidence Judge", "idle", "assesses new evidence each round")
+
     ledger.record(inv, [draft(CHIEF, AgentRetired(agent_id=agent.id, reason="done"))])
-    assert status() == "agent retired"
+    assert row(name) == (name, "retired", "done")
+    assert [r[0] for r in table(inv)] == ["Chief Scientist", name, "Evidence Judge", "Approver"]
 
 
 def test_dispatcher_status_and_status_line(ledger):

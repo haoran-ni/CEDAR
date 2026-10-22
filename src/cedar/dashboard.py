@@ -34,7 +34,7 @@ from cedar.state.projection import (
     authorization_for,
     hypothesis_evidence,
 )
-from cedar.summaries import approval_requests
+from cedar.summaries import approval_requests, short_id
 from cedar.swarm import FIRST_TASK, WAKE_TASK, minutes_left
 from cedar.web import web_summary
 
@@ -65,11 +65,6 @@ def age(seconds: float) -> str:
     if hours < 48:
         return f"{hours} h {minutes} min" if minutes else f"{hours} h"
     return f"{hours // 24} d"
-
-
-def short_id(calculation_id: str) -> str:
-    """The first characters of a calculation id; the chat accepts them in place of the full id."""
-    return calculation_id.removeprefix("calc_")[:8]
 
 
 def job_status(state: InvestigationState, calc: CalculationRecord) -> str:

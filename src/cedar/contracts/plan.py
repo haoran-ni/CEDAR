@@ -31,6 +31,9 @@ class PermissionAction(StrEnum):
     CANCEL = "cancel"
     APPROVE_INPUTS = "approve_inputs"
     """Run inputs whose examination ended NEEDS_REVIEW."""
+    REJECT_INPUTS = "reject_inputs"
+    """Refuse examined inputs that wait for the researcher, to be reviewed or submitted; the reason goes to the
+    agents of the calculation."""
     START_AGENTS = "start_agents"
     """Start proposed hypothesis agents before their review window ends."""
     CLOSE_INVESTIGATION = "close_investigation"

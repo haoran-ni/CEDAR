@@ -4,6 +4,9 @@ These summarize the record; they never add to it. Job status and scientific stat
 always shown separately.
 """
 
+from collections.abc import Iterable
+from pathlib import Path
+
 from cedar.automation import mode_summary, pending_decisions
 from cedar.contracts.base import canonical_json
 from cedar.contracts.examination import ExaminationVerdict, FindingSeverity
@@ -42,11 +45,14 @@ def calculation_summary(state: InvestigationState, calc: CalculationRecord, *, f
             head += f"; job {calc.scheduler_job_id} {job_state}"
         lines = [head, f"  {calc.task.observable.name} via {calc.task.protocol.name} {calc.task.protocol.version}; "
                        f"estimand: {calc.task.estimand}; for {', '.join(calc.hypothesis_ids)}"]
+        if calc.rejected_by_researcher:
+            lines.append(f"  rejected by the researcher ({calc.ended_by}): {calc.end_reason}")
+        elif calc.state is CalculationState.CANCELLED and calc.end_reason:
+            lines.append("  cancelled" + (f" ({calc.ended_by})" if calc.ended_by else "") + f": {calc.end_reason}")
     if findings and calc.examination is not None:
         for f in calc.examination.findings:
             if f.severity is not FindingSeverity.INFO or f.code == "generated":
-                where = f" ({f.file}{':' + str(f.line) if f.line else ''})" if f.file else ""
-                lines.append(f"  [{f.severity.value}] {f.code}: {f.message}{where}")
+                lines.append(f"  [{f.severity.value}] {f.code}: {f.message}{_place(f)}")
     if calc.run_check is not None:
         failed = [c for c in calc.run_check.checks if not c.passed]
         lines.append("  run check: " + ("healthy" if not failed else
@@ -67,6 +73,22 @@ def calculation_summary(state: InvestigationState, calc: CalculationRecord, *, f
                      + f": {evidence.quality.value}, {evidence.observable.name} = {value}"
                      + (f"; failed checks: {', '.join(failed)}" if failed else ""))
     return "\n".join(lines)
+
+
+def _place(finding) -> str:
+    """Where in the inputs a finding is, e.g. " (control.in:42)"; nothing if it names no file."""
+    return f" ({finding.file}{':' + str(finding.line) if finding.line else ''})" if finding.file else ""
+
+
+def short_id(calculation_id: str, among: Iterable[str] = ()) -> str:
+    """The first characters of a calculation id, eight unless more are needed to tell it from those ``among``; the
+    chat accepts them in place of the full id."""
+    stem = calculation_id.removeprefix("calc_")
+    others = [other.removeprefix("calc_") for other in among if other != calculation_id]
+    length = 8
+    while length < len(stem) and any(other.startswith(stem[:length]) for other in others):
+        length += 1
+    return stem[:length]
 
 
 def recommendation_text(record: RecommendationRecord, *, brief: bool = False) -> str:
@@ -132,9 +154,35 @@ def requested_by(state: InvestigationState, calc: CalculationRecord) -> str:
     return f"{agent.tag} {agent.agent_id} on {hypothesis_id}" if agent else (hypothesis_id or "no hypothesis")
 
 
-def submission_note(state: InvestigationState, calc: CalculationRecord) -> str:
+def awaiting_review(state: InvestigationState) -> list[str]:
+    """Calculations whose inputs wait for the researcher's review: the examiner could not verify part of them."""
+    return [c.calculation_id for c in state.calculations.values()
+            if c.state is CalculationState.SPECIFIED and c.examination is not None
+            and c.examination.verdict is ExaminationVerdict.NEEDS_REVIEW
+            and authorization_for(state, PermissionAction.APPROVE_INPUTS, c.calculation_id) is None]
+
+
+def run_directory(calc: CalculationRecord, runs_root: str | Path | None = None) -> str | None:
+    """Where a calculation's examined inputs are: under ``runs_root`` if given, else relative to it."""
+    if calc.workdir is None:
+        return None
+    return str(Path(runs_root) / calc.workdir) if runs_root is not None else calc.workdir
+
+
+def review_note(state: InvestigationState, calc: CalculationRecord, runs_root: str | Path | None = None) -> str:
+    """What the researcher needs to review inputs: who asks, what the examiner could not verify and where, and
+    where the files are."""
+    reasons = "; ".join(f"{f.message}{_place(f)}" for f in calc.examination.findings
+                        if f.severity is FindingSeverity.REVIEW)
+    directory = run_directory(calc, runs_root)
+    return (f"{requested_by(state, calc)}; needs review: {reasons}"
+            + (f"; files in {directory}" if directory else ""))
+
+
+def submission_note(state: InvestigationState, calc: CalculationRecord, runs_root: str | Path | None = None) -> str:
     """What the researcher needs to decide on a submission: who asks, for what, where it runs and what it costs."""
     exam = calc.examination
+    directory = run_directory(calc, runs_root)
     where = ("locally, on the interactive node" if calc.task.execution == "local"
              else f"through Slurm, partition {exam.partition}" if exam.partition else "through Slurm")
     size = (f"{exam.requested_tasks} tasks × {exam.requested_minutes} min = {exam.requested_core_hours:g} core-hours"
@@ -143,27 +191,27 @@ def submission_note(state: InvestigationState, calc: CalculationRecord) -> str:
     warnings = [f.code for f in exam.findings if f.severity is FindingSeverity.WARNING]
     parts = [requested_by(state, calc), f"{calc.task.system_label}: {calc.task.estimand}", where, size,
              f"warnings: {', '.join(warnings)}" if warnings else "no warnings",
-             f"examined inputs ({', '.join(sorted(exam.files))}) in the run directory {calc.workdir}"
-             if calc.workdir else f"examined inputs: {', '.join(sorted(exam.files))}"]
+             f"examined inputs ({', '.join(sorted(exam.files))}) in the run directory {directory}"
+             if directory else f"examined inputs: {', '.join(sorted(exam.files))}"]
     return "; ".join(parts)
 
 
-def approval_requests(state: InvestigationState) -> list[tuple[str, str]]:
-    """What waits for the researcher: the command that grants it, and what it concerns. In full automation, what
-    the approver may still decide is not the researcher's to wait on."""
+def approval_requests(state: InvestigationState, runs_root: str | Path | None = None) -> list[tuple[str, str]]:
+    """What waits for the researcher: the command that grants it, naming a calculation by the short form of its
+    id, and what it concerns, with run directories under ``runs_root`` if given. In full automation, what the
+    approver may still decide is not the researcher's to wait on."""
     needs = []
     for_approver = {d.target_id for d in pending_decisions(state)}
     proposal = state.pending_proposal
     if proposal is not None and proposal.proposal_id not in for_approver:
         needs.append(("/approve agents", proposal_note(state, proposal)))
+    review, submission = set(awaiting_review(state)), set(awaiting_submission(state))
     for calc in state.calculations.values():
-        if (calc.state is CalculationState.SPECIFIED and calc.examination is not None
-                and calc.examination.verdict is ExaminationVerdict.NEEDS_REVIEW
-                and authorization_for(state, PermissionAction.APPROVE_INPUTS, calc.calculation_id) is None):
-            reasons = "; ".join(f.message for f in calc.examination.findings if f.severity is FindingSeverity.REVIEW)
-            needs.append((f"/approve inputs {calc.calculation_id}", f"needs review: {reasons}"))
-        if calc.calculation_id in awaiting_submission(state) and calc.calculation_id not in for_approver:
-            needs.append((f"/approve submit {calc.calculation_id}", submission_note(state, calc)))
+        short = short_id(calc.calculation_id, state.calculations)
+        if calc.calculation_id in review:
+            needs.append((f"/approve inputs {short}", review_note(state, calc, runs_root)))
+        if calc.calculation_id in submission and calc.calculation_id not in for_approver:
+            needs.append((f"/approve submit {short}", submission_note(state, calc, runs_root)))
     closing = state.pending_closing
     if closing is not None:
         needs.append(("/approve close", f"the Chief Scientist proposes closing the investigation as "
@@ -183,9 +231,9 @@ def agent_requests(state: InvestigationState) -> list[str]:
     return found
 
 
-def pending_approvals(state: InvestigationState) -> list[str]:
+def pending_approvals(state: InvestigationState, runs_root: str | Path | None = None) -> list[str]:
     """What waits for the researcher, with the command that grants it."""
-    return [f"{command}  ({note})" for command, note in approval_requests(state)]
+    return [f"{command}  ({note})" for command, note in approval_requests(state, runs_root)]
 
 
 def investigation_summary(state: InvestigationState) -> str:

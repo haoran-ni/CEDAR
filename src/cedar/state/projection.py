@@ -227,10 +227,18 @@ class CalculationRecord:
     history: list[tuple[int, CalculationState]] = field(default_factory=list)
     registration: RunRegistered | None = None
     """For a run computed outside CEDAR and registered: where it came from, who registered it, what it is."""
+    end_reason: str | None = None
+    """Why it was rejected or cancelled."""
+    ended_by: str | None = None
+    """The researcher's message recorded with the rejection or cancellation, where the record requires one."""
 
     @property
     def registered(self) -> bool:
         return self.registration is not None
+
+    @property
+    def rejected_by_researcher(self) -> bool:
+        return self.state is CalculationState.REJECTED and self.ended_by is not None
 
     @property
     def shared(self) -> bool:
@@ -1167,12 +1175,18 @@ def _on_calculation_state(state: InvestigationState, event: RecordedEvent, p: Ca
             _require_authorization(state, p.authorization_id, PermissionAction.SUBMIT, calc.calculation_id)
     if p.state in (_C.REJECTED, _C.CANCELLED) and not (p.reason and p.reason.strip()):
         raise RuleViolation(f"{p.state} needs a reason")
+    if (p.state is _C.REJECTED and calc.examination is not None
+            and calc.examination.verdict is not ExaminationVerdict.REJECTED):
+        # Inputs the examiner did not reject wait for the researcher, who alone may refuse them.
+        _require_authorization(state, p.authorization_id, PermissionAction.REJECT_INPUTS, calc.calculation_id)
     if p.state is _C.CANCELLED and calc.state in _LIVE_AT_SCHEDULER:
         _require_authorization(state, p.authorization_id, PermissionAction.CANCEL, calc.calculation_id)
     if p.state is _C.QUALITY_ASSESSED and calc.run_check is None:
         raise RuleViolation("QUALITY_ASSESSED requires the run check to be recorded first")
 
     calc.state = new_state
+    if p.state in (_C.REJECTED, _C.CANCELLED):
+        calc.end_reason, calc.ended_by = p.reason, p.authorization_id
     if scheduler_state is not None:
         calc.scheduler_state = scheduler_state
     if p.scheduler_job_id is not None:

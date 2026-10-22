@@ -164,7 +164,7 @@ def test_conversation_live_panel_and_approval(system):
         assert agents(app)[f"A1 agent-{HYP}"][1] == "waiting for jobs" and "dispatcher seen 0 s ago" in status(app)
         assert agents(app)[f"A1 agent-{HYP}"][3] == f"calculations {short_id(calc)}"
         assert "1 waiting for you (/pending)" in status(app)
-        assert f"[waiting for you] /approve submit {calc}" in conversation(app)
+        assert f"[waiting for you] /approve submit {short_id(calc)}  (" in conversation(app)
         assert "Requested the PBE baseline; waiting for it." in conversation(app)
 
         await send(pilot, f"/approve submit {short_id(calc)}")
@@ -380,10 +380,10 @@ def test_a_slash_at_the_start_of_a_line_lists_the_matching_commands(system):
         composer.value = "/a"
         await settle(pilot)
         assert shown() == ["/agents", "/approve agents", "/approve submit <calc>", "/approve submit all",
-                           "/approve submit <agent>", "/approve inputs <calc>",
-                           "/approve close", "/attach <path> <note>"]
+                           "/approve submit <agent>", "/approve inputs <calc>", "/approve inputs all",
+                           "/approve inputs <agent>", "/approve close", "/attach <path> <note>"]
         await pilot.press("up")  # the arrows wrap around the menu
-        assert app.query_one("#commands", OptionList).highlighted == 7
+        assert app.query_one("#commands", OptionList).highlighted == 9
         await pilot.press("down", "down", "down", "tab")
         submits = ["/approve submit <calc>", "/approve submit all", "/approve submit <agent>"]
         assert composer.value == "/approve submit " and shown() == submits

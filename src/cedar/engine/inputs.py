@@ -107,6 +107,21 @@ class ProtocolEngine:
         return self._ledger.record(investigation_id, [
             self._move(calculation_id, CalculationState.VALIDATED_INPUT, authorization_id=authorization)])
 
+    def reject(self, investigation_id: str, calculation_id: str, reason: str) -> RecordResult:
+        """Reject examined inputs that wait for the researcher, to be reviewed or submitted, once the researcher
+        has refused them; their reason goes to the agents."""
+        state = self._ledger.load(investigation_id)
+        calc = state.calculations.get(calculation_id)
+        if calc is None:
+            raise RuleViolation(f"unknown calculation {calculation_id}")
+        if calc.examination is None or calc.examination.verdict is ExaminationVerdict.REJECTED:
+            raise RuleViolation(f"{calculation_id} has no examined inputs that wait for the researcher")
+        authorization = authorization_for(state, PermissionAction.REJECT_INPUTS, calculation_id)
+        if authorization is None:
+            raise RuleViolation(f"no user rejection names the inputs of {calculation_id}")
+        return self._ledger.record(investigation_id, [
+            self._move(calculation_id, CalculationState.REJECTED, reason=reason, authorization_id=authorization)])
+
     def _reject(self, investigation_id: str, calculation_id: str, reason: str) -> RecordResult:
         return self._ledger.record(investigation_id, [self._move(calculation_id, CalculationState.REJECTED,
                                                                  reason=reason)])

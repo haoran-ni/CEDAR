@@ -39,7 +39,7 @@ from cedar.errors import RuleViolation
 from cedar.models import TextPart
 from cedar.models.scripted import reply
 from cedar.notebook import render_notebook
-from cedar.summaries import approval_requests, investigation_summary
+from cedar.summaries import approval_requests, investigation_summary, short_id
 
 APPROVER = Actor(kind=ActorKind.APPROVER, id="approver")
 
@@ -179,7 +179,7 @@ def test_the_approver_decides_only_in_full_automation_and_within_its_core_hours(
     with pytest.raises(RuleViolation, match=f"requests {hours:g} core-hours; {hours / 2:g} of full automation's"):
         decide()
     assert not approver_due(ledger.load(INV))
-    assert [command for command, _ in approval_requests(ledger.load(INV))] == [f"/approve submit {calc}"]
+    assert [command for command, _ in approval_requests(ledger.load(INV))] == [f"/approve submit {short_id(calc)}"]
 
     # Within them it is offered, once; the approval authorizes the submission while full automation lasts.
     chat.handle(f"/mode full-automation {hours * 2:g} 1000000")
@@ -190,7 +190,7 @@ def test_the_approver_decides_only_in_full_automation_and_within_its_core_hours(
         decide("d-2")
     chat.handle("/mode human-in-the-loop")
     assert authorization_for(ledger.load(INV), PermissionAction.SUBMIT, calc) is None
-    assert [command for command, _ in approval_requests(ledger.load(INV))] == [f"/approve submit {calc}"]
+    assert [command for command, _ in approval_requests(ledger.load(INV))] == [f"/approve submit {short_id(calc)}"]
 
     # A submission the approval let start is recorded even if full automation ends while sbatch runs.
     chat.handle(f"/mode full-automation {hours * 2:g} 1000000")

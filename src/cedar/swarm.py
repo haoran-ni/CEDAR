@@ -45,8 +45,9 @@ MAX_CONTINUATIONS = 2
 investigation leaving the states its role works in."""
 FIRST_TASK = "Your first task, from the Chief Scientist: "
 """How an agent's first task, its brief, begins."""
-WAKE_TASK = "Your calculations have ended and their runs were checked:"
-"""How the task begins that the dispatcher queues for an agent whose calculations have ended."""
+WAKE_TASK = "Your calculations have ended:"
+"""How the task begins that the dispatcher queues for an agent whose calculations have ended: their runs were
+checked, or they were cancelled, or the researcher rejected their inputs."""
 REVIEW_ROLES = ("hypothesis_agent", "evidence_judge")
 """Roles whose reports the Chief Scientist reviews."""
 
@@ -324,15 +325,16 @@ def continuation_text(state: InvestigationState, task: AgentTaskRecord, why: str
 
 
 def ended_unseen(state: InvestigationState, hypothesis_id: str, since: int) -> list[str]:
-    """The hypothesis's calculations whose jobs ended after ``since``: their runs were checked, or they were
-    cancelled. Registered runs never ran here, and an examiner's rejection is answered at once."""
+    """The hypothesis's calculations that ended after ``since``: their runs were checked, they were cancelled, or
+    the researcher rejected their inputs. Registered runs never ran here, and an examiner's rejection is answered
+    at once."""
     found = []
     for cid in state.hypotheses[hypothesis_id].calculation_ids:
         calc = state.calculations[cid]
         if calc.registered:
             continue
-        ended = next((v for v, s in calc.history if s in (CalculationState.QUALITY_ASSESSED,
-                                                           CalculationState.CANCELLED)), None)
+        ended = next((v for v, s in calc.history if s in (CalculationState.QUALITY_ASSESSED, CalculationState.CANCELLED)
+                      or (s is CalculationState.REJECTED and calc.rejected_by_researcher)), None)
         if ended is not None and ended > since:
             found.append(cid)
     return found

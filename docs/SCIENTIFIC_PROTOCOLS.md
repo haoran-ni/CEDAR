@@ -39,7 +39,7 @@ Every task must declare `xc`, `spin`, `charge`, `relativistic`, `occupation_type
 
 ### Input examination
 
-Findings are `ERROR` (reject), `REVIEW` (needs user approval), `WARNING` or `INFO`.
+Findings are `ERROR` (reject), `REVIEW` (needs user approval), `WARNING` or `INFO`. `/pending` shows each `REVIEW` finding with its file and line, and the run directory that holds the examined files. The researcher approves such inputs (`/approve inputs`), or rejects them, or any examined inputs not yet submitted, with a reason that wakes the agent (`/reject inputs`).
 
 **Declarations:**
 - An unknown variable is an `ERROR`.

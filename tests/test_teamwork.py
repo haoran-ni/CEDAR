@@ -4,6 +4,8 @@ Everything here is SYNTHETIC: the models are scripted (TEST DOUBLES), the schedu
 DOUBLE, and every directory is under the test's temporary directory.
 """
 
+from pathlib import Path
+
 import pytest
 from factories import CHIEF, USER, draft
 from sites import aims_output
@@ -16,6 +18,7 @@ from cedar.contracts import AgentTaskQueued, Observable, UserInterventionRecorde
 from cedar.engine import RunRegistrar
 from cedar.models.scripted import ScriptedModel, reply
 from cedar.models.types import TextPart
+from cedar.summaries import short_id
 
 
 @pytest.fixture
@@ -454,10 +457,11 @@ def test_pending_shows_what_a_submission_costs_and_approvals_go_by_agent_or_all(
                        backend=system["scheduler"], clock=system["clock"])
     pending = chat.handle("/pending")
     exam = world.calc(mine).examination
-    assert (f"/approve submit {mine}  (A1 agent-hyp-xc on hyp-xc; CO/Cu(111) atop (synthetic): total energy of "
-            f"CO/Cu(111) atop; through Slurm, partition {exam.partition}; {exam.requested_tasks} tasks × "
+    assert (f"/approve submit {short_id(mine)}  (A1 agent-hyp-xc on hyp-xc; CO/Cu(111) atop (synthetic): total "
+            f"energy of CO/Cu(111) atop; through Slurm, partition {exam.partition}; {exam.requested_tasks} tasks × "
             f"{exam.requested_minutes} min = {exam.requested_core_hours:g} core-hours") in pending
-    assert f"examined inputs (control.in, geometry.in, job.sh) in the run directory {world.calc(mine).workdir}" in pending
+    directory = Path(system["site"].runs_root) / world.calc(mine).workdir
+    assert f"examined inputs (control.in, geometry.in, job.sh) in the run directory {directory}" in pending
 
     answer = chat.handle("/approve submit A2")
     assert answer.startswith("Submission of 1 calculation of A2 agent-hyp-b authorized") and theirs in answer

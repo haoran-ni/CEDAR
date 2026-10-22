@@ -612,7 +612,8 @@ def _tested(rnd: _Round, state: InvestigationState) -> list[str]:
             by = f", authorized by {p.authorization_id}" if p.authorization_id else ""
             lines.append(f"- **{p.calculation_id}** cancelled{by}: {_said(p.reason or '')}")
         elif isinstance(p, CalculationStateChanged) and p.state is CalculationState.REJECTED:
-            lines.append(f"- **{p.calculation_id}** rejected by the input examination: {_said(p.reason or '')}")
+            by = f"the researcher ({p.authorization_id})" if p.authorization_id else "the input examination"
+            lines.append(f"- **{p.calculation_id}** rejected by {by}: {_said(p.reason or '')}")
     return lines or ["No calculations were requested or submitted this round."]
 
 

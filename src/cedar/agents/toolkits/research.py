@@ -398,11 +398,15 @@ def _read_input(ctx: ResearchContext, path: str) -> bytes:
 
 
 def _next_step(calc: CalculationRecord) -> str:
+    if calc.rejected_by_researcher:
+        return ("The researcher rejected these inputs, for the reason above. Address it and make a new request, or say "
+                "in your report why you cannot.")
     if calc.state is CalculationState.REJECTED:
         return "The inputs were rejected. Fix the errors above and make a new request."
     if calc.state is CalculationState.SPECIFIED and calc.examination is not None:
         return ("The examiner could not verify part of the inputs. The researcher must approve them before they "
-                "can run; tell the Chief Scientist why the unusual content is needed.")
+                "can run, or may reject them with a reason, which you are then told; tell the Chief Scientist why "
+                "the unusual content is needed.")
     if calc.state is CalculationState.VALIDATED_INPUT:
         return ("The inputs are approved. Submission needs the researcher's authorization. Register predictions "
                 "for it now if you have not, then end with submit_report, waiting for it.")

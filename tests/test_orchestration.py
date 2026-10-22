@@ -4,6 +4,7 @@ ScriptedModel and FakeScheduler TEST DOUBLES on a SYNTHETIC site; no model or jo
 """
 
 import fcntl
+import re
 import subprocess
 import sys
 from datetime import datetime, timedelta, timezone
@@ -28,6 +29,7 @@ from cedar.models import ModelPrices, ModelSettings, TextPart, ToolCall
 from cedar.models.scripted import ScriptedModel, reply
 from cedar.notebook import render_notebook
 from cedar.state import replay
+from cedar.summaries import short_id
 from cedar.workspace import Workspace
 
 ENERGY = -5000.123456789
@@ -223,7 +225,7 @@ def test_full_loop(system):
     assert scheduler.submissions == [] and heartbeat_age(workspace, NOW) == 0
     notices = [n.text for n in chat.notices()]
     assert any(f"agent-{HYP} ({ROLE})" in n and "Requested the PBE baseline" in n for n in notices)
-    assert any(f"/approve submit {calc}" in n for n in notices)
+    assert any(f"/approve submit {short_id(calc)}  (" in n for n in notices)
 
     # The researcher authorizes; the dispatcher submits; the job finishes.
     assert "authorized" in chat.handle(f"/approve submit {calc}")
@@ -451,7 +453,7 @@ def test_cli_start_and_dispatch(system, monkeypatch, capsys, tmp_path):
     monkeypatch.setattr("builtins.input", lambda prompt: next(lines))
     assert cli.main(["start", INV]) == 0
     out = capsys.readouterr().out
-    assert "Requested the PBE baseline" in out and "/approve submit calc_" in out
+    assert "Requested the PBE baseline" in out and re.search(r"/approve submit [0-9a-f]{8}  \(", out)
     assert cli.main(["start", "no-such-investigation"]) == 1
 
     assert cli.main(["report"]) == 0

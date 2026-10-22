@@ -537,6 +537,28 @@ class TestInputExamination:
         approval = authorize(ledger, inv, PermissionAction.APPROVE_INPUTS, calc, intervention_id="ok-inputs")
         move(ledger, inv, calc, ENGINE, CalculationState.VALIDATED_INPUT, authorization_id=approval)
 
+    @pytest.mark.parametrize("verdict", [ExaminationVerdict.NEEDS_REVIEW, ExaminationVerdict.APPROVED])
+    def test_only_the_researcher_rejects_inputs_that_wait_for_them(self, ledger, inv, hyp, verdict):
+        calc = request(ledger, inv, hyp).calculation_id
+        examine(ledger, inv, calc, verdict)
+        if verdict is ExaminationVerdict.APPROVED:
+            move(ledger, inv, calc, ENGINE, CalculationState.VALIDATED_INPUT)
+        with pytest.raises(RuleViolation, match="reject_inputs"):
+            move(ledger, inv, calc, ENGINE, CalculationState.REJECTED, reason="not wanted")
+        refusal = authorize(ledger, inv, PermissionAction.REJECT_INPUTS, calc, intervention_id="msg-7")
+        state = move(ledger, inv, calc, ENGINE, CalculationState.REJECTED, reason="use the light defaults",
+                     authorization_id=refusal).state
+        rejected = state.calculations[calc]
+        assert rejected.rejected_by_researcher and (rejected.end_reason, rejected.ended_by) == (
+            "use the light defaults", "msg-7")
+
+    def test_submitted_inputs_cannot_be_rejected(self, ledger, inv, hyp):
+        calc = request(ledger, inv, hyp).calculation_id
+        submit(ledger, inv, calc)
+        refusal = authorize(ledger, inv, PermissionAction.REJECT_INPUTS, calc, intervention_id="msg-7")
+        with pytest.raises(RuleViolation):
+            move(ledger, inv, calc, ENGINE, CalculationState.REJECTED, reason="too late", authorization_id=refusal)
+
     def test_examined_files_must_be_the_agents_files(self, ledger, inv, hyp):
         from factories import RAW_OUTPUT
 

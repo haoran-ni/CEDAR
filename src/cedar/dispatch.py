@@ -87,7 +87,8 @@ from cedar.hpc.profile import ProfileNotApproved, ProfileStore
 from cedar.hpc.slurm import SchedulerBackend, SchedulerError
 from cedar.models.prices import dollars, prices_for
 from cedar.notebook import update_notebook
-from cedar.state.projection import AgentTaskRecord, InvestigationState, authorization_for, review_deadline
+from cedar.state.projection import (AgentTaskRecord, CalculationRecord, InvestigationState, authorization_for,
+                                    review_deadline)
 from cedar.summaries import calculation_summary, task_owner
 from cedar.swarm import (
     CHIEF,
@@ -129,6 +130,26 @@ _LIVE = frozenset({CalculationState.SUBMISSION_PENDING, CalculationState.SUBMITT
 _RESTING = frozenset({HypothesisStatus.PAUSED, HypothesisStatus.DISCARDED, HypothesisStatus.SUPERSEDED,
                       HypothesisStatus.FAILED})
 """Hypotheses whose agents are not woken for results."""
+_LOOK_AT_OUTPUTS = (
+    "Look at the outputs (run_outputs, file tools). Record the values that matter: a value printed in an output with "
+    "submit_reading, citing its lines; anything that must be computed with run_analysis and then record_result.")
+_ANSWER_REJECTION = (
+    "The researcher rejected the inputs of {calcs}; their reason is shown above. Address it: change what it concerns "
+    "and request the calculation again, or, if you cannot or disagree, say why in your report and ask the researcher. "
+    "Never request the same inputs again unchanged.")
+
+
+def wake_instruction(state: InvestigationState, ended: list[CalculationRecord]) -> str:
+    """The task that wakes an agent for calculations of its that have ended: what each came to, and what to do."""
+    rejected = [c.calculation_id for c in ended if c.rejected_by_researcher]
+    lines = [WAKE_TASK, *(calculation_summary(state, c, findings=False) for c in ended)]
+    if len(rejected) < len(ended):
+        lines.append(_LOOK_AT_OUTPUTS)
+    if rejected:
+        lines.append(_ANSWER_REJECTION.format(calcs=", ".join(rejected)))
+    lines.append("Say what this means for your hypothesis, then set its status (ASSESSED, or PLANNING_TEST if another "
+                 "test is needed).")
+    return "\n".join(lines)
 
 
 def needs_dispatcher(state: InvestigationState) -> bool:
@@ -446,32 +467,35 @@ class Dispatcher:
             if agent is None:
                 continue
             drafts = []
+            runs = [r for r in state.agent_runs if r.actor_id == agent.agent_id]
+            last = runs[-1] if runs else None
+            since = 0 if last is None else last.run.started_version if last.run.started_version is not None \
+                else last.recorded_at
             if hyp.status is HypothesisStatus.WAITING_FOR_JOB:
-                ended = [state.calculations[c] for c in hyp.awaiting_calculation_ids]
-                if not all(c.state in _ENDED for c in ended):
+                awaited = [state.calculations[c] for c in hyp.awaiting_calculation_ids]
+                # The researcher's rejection is answered at once, without waiting for the other calculations.
+                rejected = [state.calculations[c] for c in ended_unseen(state, hyp.hypothesis_id, since)
+                            if state.calculations[c].rejected_by_researcher]
+                if all(c.state in _ENDED for c in awaited):
+                    ended = awaited + [c for c in rejected if c not in awaited]
+                    why = "the calculations it was waiting for have ended"
+                elif rejected and state.plan.priority(hyp.hypothesis_id) is not Priority.ON_HOLD:
+                    ended = rejected
+                    why = f"the researcher rejected the inputs of {', '.join(c.calculation_id for c in rejected)}"
+                else:
                     continue
                 drafts.append(EventDraft(actor=SYSTEM, payload=HypothesisStatusChanged(
-                    hypothesis_id=hyp.hypothesis_id, status=HypothesisStatus.ANALYZING,
-                    reason="the calculations it was waiting for have ended")))
+                    hypothesis_id=hyp.hypothesis_id, status=HypothesisStatus.ANALYZING, reason=why)))
             else:
-                runs = [r for r in state.agent_runs if r.actor_id == agent.agent_id]
                 if (not runs or hyp.status in _RESTING or state.plan.priority(hyp.hypothesis_id) is Priority.ON_HOLD
                         or any(t.agent_id == agent.agent_id for t in state.pending_tasks)):
                     continue
-                last = runs[-1]
-                since = last.run.started_version if last.run.started_version is not None else last.recorded_at
                 ended = [state.calculations[c] for c in ended_unseen(state, hyp.hypothesis_id, since)]
                 if not ended:
                     continue
-            summaries = "\n".join(calculation_summary(state, c, findings=False) for c in ended)
-            instruction = (WAKE_TASK + "\n" + summaries + "\nLook at "
-                           "the outputs (run_outputs, file tools). Record the values that matter: a value printed in "
-                           "an output with submit_reading, citing its lines; anything that must be computed with "
-                           "run_analysis and then record_result. Say what the results mean for your hypothesis, then "
-                           "set its status (ASSESSED, or PLANNING_TEST if another test is needed).")
             drafts.append(EventDraft(actor=SYSTEM, payload=AgentTaskQueued(
                 task_id=new_id("task"), role="hypothesis_agent", hypothesis_id=hyp.hypothesis_id,
-                agent_id=agent.agent_id, instruction=instruction)))
+                agent_id=agent.agent_id, instruction=wake_instruction(state, ended))))
             self.workspace.ledger.record(investigation_id, drafts)
             notes.append(f"woke the agent for {hyp.hypothesis_id}")
         return notes

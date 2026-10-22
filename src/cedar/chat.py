@@ -65,6 +65,7 @@ from cedar.contracts.events import (
 )
 from cedar.contracts.investigation import DEFAULT_BUDGET_USD, RetrievalPolicy
 from cedar.contracts.plan import Authorization, PermissionAction
+from cedar.contracts.examination import ExaminationVerdict
 from cedar.contracts.status import INVESTIGATION_MACHINE, CalculationState, InvestigationMode
 from cedar.errors import RuleViolation
 from cedar.hpc.profile import ProfileStore
@@ -87,11 +88,14 @@ from cedar.dispatch import (
 )
 from cedar.notebook import round_file, update_notebook
 from cedar.paths import config_dir
-from cedar.state.projection import AgentRunRecord, InvestigationState, RetrievalRecord, find_agent
+from cedar.state.projection import AgentRunRecord, CalculationRecord, InvestigationState, RetrievalRecord, find_agent
 from cedar.summaries import (
     agent_requests,
     approval_requests,
+    awaiting_review,
     awaiting_submission,
+    review_note,
+    short_id,
     submission_note,
     calculation_summary,
     investigation_summary,
@@ -126,6 +130,10 @@ COMMANDS = (
     Command("/approve submit all", "allow every calculation waiting for submission"),
     Command("/approve submit <agent>", "allow the calculations one agent waits to submit, e.g. A2"),
     Command("/approve inputs <calc>", "allow inputs the examiner could not verify"),
+    Command("/approve inputs all", "allow every input waiting for your review that you have been shown"),
+    Command("/approve inputs <agent>", "allow the inputs of one agent waiting for your review, e.g. A2"),
+    Command("/reject inputs <calc> <reason>", "refuse inputs waiting for your review or for submission; the reason "
+                                              "goes to the agent"),
     Command("/approve close", "close the investigation for good, as the Chief Scientist proposes"),
     Command("/mode", "show the mode: human-in-the-loop, or full automation and what it has left"),
     Command("/mode human-in-the-loop", "take your decisions back: agent proposals and submissions wait for you"),
@@ -176,6 +184,24 @@ the Chief Scientist. A message sent while agents are proposed holds them until t
 proposes again."""
 
 
+def _not_rejectable(calc: CalculationRecord) -> str | None:
+    """Why a calculation's inputs cannot be rejected now, or None if they wait for the researcher."""
+    cid = calc.calculation_id
+    if calc.registered:
+        return f"{cid} is a registered run, computed outside CEDAR; it has no inputs to reject."
+    if calc.state is CalculationState.VALIDATED_INPUT or (
+            calc.state is CalculationState.SPECIFIED and calc.examination is not None
+            and calc.examination.verdict is ExaminationVerdict.NEEDS_REVIEW):
+        return None
+    if calc.state is CalculationState.SPECIFIED:
+        return f"The inputs of {cid} have not been examined yet."
+    if calc.state is CalculationState.REJECTED:
+        return f"The inputs of {cid} are already rejected."
+    if calc.state in _AT_SCHEDULER:
+        return f"{cid} is already {calc.state.value}; /cancel {short_id(cid)} <reason> stops it."
+    return f"{cid} has ended ({calc.state.value}); there is nothing to reject."
+
+
 @dataclass(frozen=True)
 class Notice:
     """Something that happened while the researcher was not looking."""
@@ -207,6 +233,9 @@ class ChatSession:
     _unrecorded_runs: list[RunResult] = field(default_factory=list)
     _seen_runs: int = 0
     _shown_approvals: set[str] = field(default_factory=set)
+    _shown_reviews: set[str] = field(default_factory=set)
+    """Calculations whose inputs needing review the researcher has been shown; /approve inputs all approves only
+    these."""
     _shown_starts: set[str] = field(default_factory=set)
     chief_session: str = ""
     auto_dispatch: bool = False
@@ -266,6 +295,8 @@ class ChatSession:
                 f"is {self.workspace.root / LOG}. `cedar dispatch --stop` stops it.")
 
     def _command(self, line: str) -> str:
+        if line.split(maxsplit=1)[0] == "/reject":
+            return self._reject(line)  # read from the line as typed: a reason is prose, apostrophes and all
         try:
             words = shlex.split(line)
         except ValueError as exc:
@@ -300,13 +331,18 @@ class ChatSession:
             return self._mode(args, line)
         if name == "/pending":
             requests = agent_requests(state)
-            text = "\n".join(pending_approvals(state)) or "Nothing waits for your approval."
+            pending = pending_approvals(state, self._runs_root(state))
+            self._shown_reviews.update(awaiting_review(state))
+            text = "\n".join(pending) or "Nothing waits for your approval."
+            if any(p.startswith(("/approve inputs", "/approve submit")) for p in pending):
+                text += ("\nRefuse any of these calculations with /reject inputs <calc> <reason>; the reason goes to "
+                         "its agent.")
             return text + ("\n\nRequests from agents:\n" + "\n".join(f"  {r}" for r in requests) if requests else "")
         if name == "/report":
             update = update_notebook(self.workspace, self.investigation_id)
             return (f"Research notebook ({update.summary}): {update.index}\n"
                     f"This round: {update.directory / round_file(state.round)}")
-        if name == "/approve" and len(args) == 2 and args[0] in ("submit", "inputs"):
+        if name == "/approve" and len(args) == 2 and args[0] in ("submit", "inputs", "input"):
             action = PermissionAction.SUBMIT if args[0] == "submit" else PermissionAction.APPROVE_INPUTS
             return self._authorize(action, args[1], line)
         if name == "/cancel" and len(args) >= 2:
@@ -334,8 +370,8 @@ class ChatSession:
 
     def _authorize(self, action: PermissionAction, given: str, line: str) -> str:
         state = self.workspace.ledger.load(self.investigation_id)
-        if action is PermissionAction.SUBMIT and (given.lower() == "all" or find_agent(state, given) is not None):
-            return self._authorize_many(state, given, line)
+        if given.lower() == "all" or find_agent(state, given) is not None:
+            return self._authorize_many(action, state, given, line)
         calculation_id, problem = self._find_calculation(state, given)
         if calculation_id is None:
             return problem
@@ -349,23 +385,50 @@ class ChatSession:
             return f"Inputs of {calculation_id} approved ({intervention}). They still need /approve submit to run."
         return f"Submission of {calculation_id} authorized ({intervention}). The dispatcher submits it on its next tick."
 
-    def _authorize_many(self, state: InvestigationState, given: str, line: str) -> str:
-        """Authorize every submission waiting for the researcher, or those of one agent's hypothesis."""
-        waiting = [state.calculations[c] for c in awaiting_submission(state)]
+    def _authorize_many(self, action: PermissionAction, state: InvestigationState, given: str, line: str) -> str:
+        """Authorize every submission waiting for the researcher, or approve every input waiting for their review
+        that they have been shown; or those of one agent's hypothesis."""
+        inputs = action is PermissionAction.APPROVE_INPUTS
+        waiting = [state.calculations[c] for c in (awaiting_review(state) if inputs else awaiting_submission(state))]
         if given.lower() != "all":
             agent = find_agent(state, given)
             waiting = [c for c in waiting if agent.hypothesis_id in c.hypothesis_ids]
             whose = f" of {agent.tag} {agent.agent_id}"
         else:
             whose = ""
+        # Inputs the researcher has not seen are never approved in bulk: they may have arrived after /pending.
+        unseen = [c.calculation_id for c in waiting if inputs and c.calculation_id not in self._shown_reviews]
+        waiting = [c for c in waiting if c.calculation_id not in unseen]
+        left_out = (f"Not approved, because you have not been shown them yet: {', '.join(unseen)}. /pending shows "
+                    "them.") if unseen else ""
         if not waiting:
-            return f"No calculation{whose} waits for your authorization to be submitted."
+            if left_out:
+                return left_out
+            return (f"No inputs{whose} wait for your review." if inputs else
+                    f"No calculation{whose} waits for your authorization to be submitted.")
         ids = tuple(c.calculation_id for c in waiting)
-        intervention = self._record_message(line, (Authorization(action=PermissionAction.SUBMIT, target_ids=ids),))
-        lines = [f"Submission of {len(ids)} calculation{'s' * (len(ids) != 1)}{whose} authorized ({intervention}). "
-                 "The dispatcher submits them on its next tick:"]
-        lines += [f"  - {c.calculation_id}: {submission_note(state, c)}" for c in waiting]
-        return "\n".join(lines)
+        intervention = self._record_message(line, (Authorization(action=action, target_ids=ids),))
+        plural = "s" * (len(ids) != 1)
+        root = self._runs_root(state)
+        if not inputs:
+            lines = [f"Submission of {len(ids)} calculation{plural}{whose} authorized ({intervention}). "
+                     "The dispatcher submits them on its next tick:"]
+            lines += [f"  - {c.calculation_id}: {submission_note(state, c, root)}" for c in waiting]
+            return "\n".join(lines)
+        services = services_for(self.workspace, profile_for(state, self.profiles), self.backend)
+        approved, failed = [], []
+        for calc in waiting:
+            try:
+                services.engine.approve(self.investigation_id, calc.calculation_id)
+                approved.append(calc)
+            except RuleViolation as exc:
+                failed.append(f"  - {calc.calculation_id}: {exc}")
+        lines = [f"Inputs of {len(approved)} calculation{'s' * (len(approved) != 1)}{whose} approved ({intervention}). "
+                 "They still need /approve submit to run:"] if approved else []
+        lines += [f"  - {c.calculation_id}: {review_note(state, c, root)}" for c in approved]
+        if failed:
+            lines += [f"Recorded your approval ({intervention}), but these inputs could not be validated:", *failed]
+        return "\n".join(lines + ([left_out] if left_out else []))
 
     def _start_agents(self, line: str) -> str:
         found = []
@@ -428,7 +491,8 @@ class ChatSession:
                 "decides on agent proposals and submissions, and the Evidence Judge assesses new evidence before each "
                 f"review of the Chief Scientist, within {limits['max_core_hours']:g} core-hours and "
                 f"{dollars(limits['max_usd'])} of model use from now. When that is spent, the investigation switches "
-                "back to human-in-the-loop and pauses. /approve inputs, /approve close, /cancel and /halt stay yours; "
+                "back to human-in-the-loop and pauses. /approve inputs, /reject inputs, /approve close, /cancel and "
+                "/halt stay yours; "
                 "/mode human-in-the-loop takes everything back.")
 
     # -- the budget -----------------------------------------------------------------------------
@@ -770,6 +834,45 @@ class ChatSession:
             return f"Recorded your cancellation ({intervention}), but it could not be applied: {exc}"
         return f"Cancelled {calculation_id} ({intervention})."
 
+    def _reject(self, line: str) -> str:
+        """Refuse inputs that wait for the researcher, to be reviewed or submitted; the reason goes to the agents."""
+        match = re.fullmatch(r"/reject\s+inputs?\s+(\S+)\s+(.*\S)\s*", line, re.DOTALL)
+        if match is None:
+            return ("Usage: /reject inputs <calc> <reason>, e.g. /reject inputs 1eea8563 use the light species "
+                    "defaults unmodified. The reason goes to the agent that asked for the calculation.")
+        if self.investigation_id is None:
+            return "No investigation is open yet. Describe the discrepancy and the Chief Scientist will open one."
+        given, reason = match.groups()
+        if len(reason) > 1 and reason[0] == reason[-1] and reason[0] in "\"'":
+            reason = reason[1:-1].strip() or reason
+        state = self.workspace.ledger.load(self.investigation_id)
+        calculation_id, problem = self._find_calculation(state, given)
+        if calculation_id is None:
+            return problem
+        refusal = _not_rejectable(state.calculations[calculation_id])
+        if refusal is not None:
+            return refusal
+        intervention = self._record_message(line, (Authorization(action=PermissionAction.REJECT_INPUTS,
+                                                                 target_ids=(calculation_id,)),))
+        services = services_for(self.workspace, profile_for(state, self.profiles), self.backend)
+        try:
+            services.engine.reject(self.investigation_id, calculation_id, reason)
+        except RuleViolation as exc:
+            return f"Recorded your rejection ({intervention}), but it could not be applied: {exc}"
+        state = self.workspace.ledger.load(self.investigation_id)
+        agents = [a for a in (state.active_agent(h) for h in state.calculations[calculation_id].hypothesis_ids) if a]
+        told = (f"The dispatcher passes your reason to {', '.join(agent_label(a) for a in agents)}." if agents else
+                "No active agent works on it; your reason stays in the record.")
+        return f"Rejected the inputs of {calculation_id} ({intervention}). {told}"
+
+    def _runs_root(self, state: InvestigationState) -> Path | None:
+        """Where the investigation's run directories are, so the paths shown can be opened; None without an approved
+        compute profile."""
+        try:
+            return Path(profile_for(state, self.profiles).runs_root)
+        except (LookupError, ProfileNotApproved, FileNotFoundError):
+            return None
+
     # -- the Chief Scientist ------------------------------------------------------------------
 
     def _ask_chief(self, text: str, observer: Callable[[ToolCall, ToolOutcome], None] | None = None) -> str:
@@ -951,8 +1054,9 @@ class ChatSession:
                                   f"{a.reason}"))
         notices += [Notice(f"[full automation ended] {m.reason}. It is paused: ask the Chief Scientist to resume it, "
                            "or switch full automation on again with /mode.") for m in ended]
-        for command, note in approval_requests(state):
+        for command, note in approval_requests(state, self._runs_root(state)):
             if f"{command} {note}" not in self._shown_approvals:
                 self._shown_approvals.add(f"{command} {note}")
                 notices.append(Notice(f"[waiting for you] {command}  ({note})"))
+        self._shown_reviews.update(awaiting_review(state))
         return notices

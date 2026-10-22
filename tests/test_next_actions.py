@@ -152,5 +152,5 @@ def test_the_chief_sees_what_every_hypothesis_predicted_for_each_calculation(led
             "    predicted by hyp-b (pred-b): E(atop) - E(fcc) > 0; falsified if E(atop) - E(fcc) < 0") in summary
     assert ("  prediction pred-b2 (about no particular calculation): hyp-b expects this Expected: the gap closes at "
             "higher coverage") in summary
-    # An agent's own view of the run shows no other hypothesis's predictions.
-    assert "predicted by" not in calculation_summary(state, state.calculations[calc], viewer=a)
+    # Every agent sees the same: what each hypothesis predicted for the run.
+    assert "predicted by hyp-b (pred-b)" in calculation_summary(state, state.calculations[calc])

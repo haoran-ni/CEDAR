@@ -6,16 +6,13 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-from cedar.agents.toolkits.research import (
-    PSEUDO_FILESYSTEMS,
-    ResearchContext,
-    agent_file_access,
-    registrant_file_access,
-)
+from cedar.agents.toolkits.files import PSEUDO_FILESYSTEMS, agent_access
+from cedar.agents.toolkits.research import ResearchContext
 from cedar.agents.transcripts import TranscriptStore
 from cedar.contracts.base import Actor, ActorKind
 from cedar.engine import JobManager, JobMonitor, ProtocolEngine, ResultValidator, RunRegistrar
 from cedar.engine.analysis import AnalysisRunner
+from cedar.engine.external import ExternalEvidenceRecorder
 from cedar.engine.sandbox import SandboxView, program_paths
 from cedar.engine.workbench import AgentBench, Workbench
 from cedar.hpc.local import LocalBackend
@@ -52,9 +49,13 @@ class Workspace:
         """Where the investigation's research notebook (generated Markdown) lives."""
         return self.root / "notebooks" / investigation_id
 
+    def workspaces(self, investigation_id: str) -> Path:
+        """Where the investigation's agents have their workspaces, one directory per hypothesis."""
+        return self.root / "workspaces" / investigation_id
+
     def agent_workspace(self, investigation_id: str, hypothesis_id: str) -> Path:
         """The directory of a hypothesis's agent, the only place it writes; created on first use."""
-        path = self.root / "workspaces" / investigation_id / hypothesis_id
+        path = self.workspaces(investigation_id) / hypothesis_id
         path.mkdir(mode=0o700, parents=True, exist_ok=True)
         return path
 
@@ -118,7 +119,7 @@ def investigation_registrar(workspace: Workspace, profiles: ProfileStore, invest
         profile = profile_for(workspace.ledger.load(investigation_id), profiles)
     except (LookupError, ProfileNotApproved, FileNotFoundError):
         profile = None
-    access = registrant_file_access(workspace.root, deny)
+    access = agent_access(deny)
     return RunRegistrar(workspace.ledger, workspace.artifacts, profile=profile,
                         readable=lambda path: access.resolve(str(path)))
 
@@ -132,9 +133,7 @@ def research_context(workspace: Workspace, investigation_id: str, agent: AgentRe
     ``workbench``, which ``should_stop`` interrupts."""
     directory = workspace.agent_workspace(investigation_id, agent.hypothesis_id)
     profile = services.profile if services is not None else None
-    files = agent_file_access(workspace.ledger, investigation_id, agent.hypothesis_id,
-                              profile.runs_root if profile is not None else None, data_dir=workspace.root,
-                              workspace=directory, deny=deny)
+    files = agent_access(deny)
     if services is not None:
         registry, engine, validator, analysis = services.registry, services.engine, services.validator, \
             services.analysis
@@ -151,11 +150,10 @@ def research_context(workspace: Workspace, investigation_id: str, agent: AgentRe
         binaries = [Path(code.binary) for code in profile.codes.values()] if profile is not None else []
 
         def view() -> SandboxView:
-            # The sandbox makes its own /proc and /dev; everything else the agent may not read is hidden.
+            # The sandbox makes its own /proc and /dev; the credentials, DFT codes and launchers are hidden.
             hidden = [p for p in files.deny if str(p) not in PSEUDO_FILESYSTEMS]
             hidden += [*binaries, *program_paths(), *map(Path, local.hidden_paths)]
-            shown = [p for p in files.allow if p != directory.resolve()]
-            return SandboxView(workspace=directory, hidden=tuple(dict.fromkeys(hidden)), shown=tuple(shown))
+            return SandboxView(workspace=directory, hidden=tuple(dict.fromkeys(hidden)), shown=())
 
         bench = AgentBench(workbench, investigation_id, agent.hypothesis_id, agent.agent_id, view, local,
                            code_paths=[Path(p) / "bin" for p in local.python_environments], should_stop=should_stop)
@@ -163,7 +161,11 @@ def research_context(workspace: Workspace, investigation_id: str, agent: AgentRe
                            hypothesis_id=agent.hypothesis_id,
                            actor=Actor(kind=ActorKind.HYPOTHESIS_AGENT, id=agent.agent_id), registry=registry,
                            artifacts=workspace.artifacts, engine=engine, validator=validator, files=files,
-                           analysis=analysis, workspace=directory, registrar=registrar, bench=bench)
+                           analysis=analysis, workspace=directory, registrar=registrar, bench=bench,
+                           runs_root=Path(profile.runs_root) if profile is not None else None,
+                           workspaces=workspace.workspaces(investigation_id),
+                           external=ExternalEvidenceRecorder(workspace.ledger, workspace.artifacts,
+                                                             readable=lambda path: files.resolve(str(path))))
 
 
 def profile_for(state: InvestigationState, profiles: ProfileStore) -> ComputeProfile:

@@ -207,7 +207,10 @@ class ResultValidator:
         if quality is EvidenceQuality.VALIDATED and not all(c.passed for c in script_checks):
             quality = EvidenceQuality.INCONCLUSIVE
         sources = (run.script, *(ref for staged in run.inputs for ref in staged.files.values()),
-                   *([run.output] if run.output else []), *run.products.values())
+                   *(d.artifact for d in run.data), *([run.output] if run.output else []), *run.products.values())
+        if run.data:
+            limitations = (*limitations, "It also read data from outside CEDAR's calculations: "
+                           + ", ".join(f"{d.name} ({d.origin})" for d in run.data) + ".")
         evidence = EvidenceObject(
             kind=EvidenceKind.ANALYSIS, summary=summary, observable=observable, value=result.value,
             calculation_ids=run.calculation_ids, analysis_id=analysis_id, analysis_result=result.name,

@@ -152,7 +152,7 @@ def test_conversation_live_panel_and_approval(system):
         await send(pilot, "/approve agents")
         assert f"Started agent-{HYP} on {HYP}" in conversation(app)
         await refresh(pilot)
-        assert agents(app)[f"agent-{HYP}"][1] == "queued" and "proposed" not in status(app)
+        assert agents(app)[f"A1 agent-{HYP}"][1] == "queued" and "proposed" not in status(app)
 
         # The dispatcher works in its own thread, as a separate process would.
         clients.add("hypothesis_agent", *agent_requests(system))
@@ -161,8 +161,8 @@ def test_conversation_live_panel_and_approval(system):
         calc = latest_calc(system["workspace"])
         (row,) = panel(app)
         assert row[2] == f"{short_id(calc)} needs /approve submit" and row[3] == "none" and row[4] == "NOT_TESTED"
-        assert agents(app)[f"agent-{HYP}"][1] == "waiting for jobs" and "dispatcher seen 0 s ago" in status(app)
-        assert agents(app)[f"agent-{HYP}"][3] == f"calculations {short_id(calc)}"
+        assert agents(app)[f"A1 agent-{HYP}"][1] == "waiting for jobs" and "dispatcher seen 0 s ago" in status(app)
+        assert agents(app)[f"A1 agent-{HYP}"][3] == f"calculations {short_id(calc)}"
         assert "1 waiting for you (/pending)" in status(app)
         assert f"[waiting for you] /approve submit {calc}" in conversation(app)
         assert "Requested the PBE baseline; waiting for it." in conversation(app)
@@ -379,16 +379,18 @@ def test_a_slash_at_the_start_of_a_line_lists_the_matching_commands(system):
 
         composer.value = "/a"
         await settle(pilot)
-        assert shown() == ["/agents", "/approve agents", "/approve submit <calc>", "/approve inputs <calc>",
+        assert shown() == ["/agents", "/approve agents", "/approve submit <calc>", "/approve submit all",
+                           "/approve submit <agent>", "/approve inputs <calc>",
                            "/approve close", "/attach <path> <note>"]
         await pilot.press("up")  # the arrows wrap around the menu
-        assert app.query_one("#commands", OptionList).highlighted == 5
+        assert app.query_one("#commands", OptionList).highlighted == 7
         await pilot.press("down", "down", "down", "tab")
-        assert composer.value == "/approve submit " and shown() == ["/approve submit <calc>"]
+        submits = ["/approve submit <calc>", "/approve submit all", "/approve submit <agent>"]
+        assert composer.value == "/approve submit " and shown() == submits
         await pilot.press("escape")  # closed until the line changes
         assert shown() == [] and app.focused is composer
         await pilot.press("backspace")
-        assert shown() == ["/approve submit <calc>"]
+        assert shown() == submits
 
         # Enter completes a partial command; Enter on the complete command runs it.
         composer.value = "/sta"

@@ -3,10 +3,11 @@
 The Chief Scientist proposes agents, one per hypothesis it wants tested. A proposal starts
 when the researcher types ``/approve agents``, or by itself once its review window has
 passed without a message from the researcher; any message holds it until the Chief
-Scientist revises it. Agents work independently and see only their own hypothesis. When
-every agent that was given work has finished its current step, and no proposed agents are
-about to start, the dispatcher wakes the Chief Scientist to collect and compare what they
-reported, together with the evidence and assessments recorded since its last review.
+Scientist revises it. Each agent records work for its own hypothesis only, and can see and
+read the others' work. When every agent that was given work has finished its current step,
+and no proposed agents are about to start, the dispatcher wakes the Chief Scientist to collect
+and compare what they reported, together with the evidence and assessments recorded since its
+last review.
 """
 
 from datetime import datetime
@@ -22,7 +23,8 @@ from cedar.contracts.events import (
     ProposalWithdrawn,
 )
 from cedar.contracts.plan import Priority
-from cedar.contracts.status import INVESTIGATION_MACHINE, InvestigationMode, InvestigationStatus
+from cedar.models.prices import dollars
+from cedar.contracts.status import INVESTIGATION_MACHINE, CalculationState, InvestigationMode, InvestigationStatus
 from cedar.state.projection import (
     AgentRecord,
     AgentRunRecord,
@@ -38,6 +40,9 @@ from cedar.state.projection import (
 )
 
 CHIEF = Actor(kind=ActorKind.CHIEF_SCIENTIST, id="chief-scientist")
+MAX_CONTINUATIONS = 2
+"""How many times a task cut off before its end is carried on with: by a temporary model-service error, or by the
+investigation leaving the states its role works in."""
 FIRST_TASK = "Your first task, from the Chief Scientist: "
 """How an agent's first task, its brief, begins."""
 WAKE_TASK = "Your calculations have ended and their runs were checked:"
@@ -113,13 +118,14 @@ def halt_drafts(state: InvestigationState, actor: Actor, reason: str,
 
 
 def agent_label(agent: AgentRecord) -> str:
-    return f"{agent.agent_id} ({agent.spec.role})"
+    return f"{agent.tag} {agent.agent_id} ({agent.spec.role})"
 
 
 def agent_prompt(agent: AgentRecord) -> str:
     """What a hypothesis agent is told about itself, after the instructions all agents share."""
-    return (f"\n\nYour assignment: you are {agent.agent_id}, the {agent.spec.role} for hypothesis "
-            f"{agent.hypothesis_id}. Every tool acts on that hypothesis only.")
+    return (f"\n\nYour assignment: you are {agent.tag} ({agent.agent_id}), the {agent.spec.role} for hypothesis "
+            f"{agent.hypothesis_id}. Everything you record is for that hypothesis; you can read the other agents' "
+            "work.")
 
 
 def agents_summary(state: InvestigationState, now: datetime) -> str:
@@ -141,8 +147,7 @@ def agents_summary(state: InvestigationState, now: datetime) -> str:
         lines += [f"Proposed by the Chief Scientist ({proposal.proposal_id}), {when}.",
                   f"  Why: {proposal.rationale}"]
         for spec in proposal.agents:
-            limits = ", ".join(x for x in (f"{spec.token_budget:,} tokens" if spec.token_budget else "",
-                                           f"{spec.max_turns} turns per run" if spec.max_turns else "") if x)
+            limits = f"budget {dollars(spec.budget_usd)}" if spec.budget_usd else ""
             lines += [f"  - {spec.hypothesis_id}: {spec.role}" + (f" ({limits})" if limits else ""),
                       f"    first task: {spec.brief}"]
     active = [a for a in state.agents.values() if a.active]
@@ -150,10 +155,9 @@ def agents_summary(state: InvestigationState, now: datetime) -> str:
     if active:
         lines.append("Agents:")
         for agent in active:
-            budget = agent.spec.token_budget
-            used = state.agent_tokens_used(agent.agent_id)
-            lines.append(f"  - {agent_label(agent)} on {agent.hypothesis_id}; {used:,} tokens used"
-                         + (f" of {budget:,}" if budget else ""))
+            budget = agent.spec.budget_usd
+            lines.append(f"  - {agent_label(agent)} on {agent.hypothesis_id}; {dollars(state.agent_cost(agent.agent_id))} "
+                         "spent" + (f" of {dollars(budget)}" if budget else ""))
     if retired:
         lines.append("Retired: " + "; ".join(f"{agent_label(a)} on {a.hypothesis_id}: {a.retire_reason}"
                                               for a in retired))
@@ -172,9 +176,12 @@ def _reviews(state: InvestigationState) -> list[AgentTaskRecord]:
 
 
 def blocking_tasks(state: InvestigationState) -> list[AgentTaskRecord]:
-    """Queued or running agent work the dispatcher will carry out; a review waits for all of it."""
+    """Queued or running agent work the dispatcher will carry out now; a review waits for all of it. A hypothesis
+    agent works only while the investigation is INVESTIGATING, so its work waits, without holding a review back,
+    while the investigation is REVIEWING."""
     return [t for t in state.pending_tasks if t.role in REVIEW_ROLES
-            and not (t.hypothesis_id and state.plan.priority(t.hypothesis_id) is Priority.ON_HOLD)]
+            and not (t.hypothesis_id and state.plan.priority(t.hypothesis_id) is Priority.ON_HOLD)
+            and not (t.role == "hypothesis_agent" and state.status is not InvestigationStatus.INVESTIGATING)]
 
 
 def review_due(state: InvestigationState) -> bool:
@@ -233,7 +240,8 @@ def review_material(state: InvestigationState, task: AgentTaskRecord) -> str:
     """What the Chief Scientist reviews: the reports, the evidence and the Evidence Judge's assessments recorded, and
     the researcher's messages, since the previous review."""
     reviews = _reviews(state)
-    before = [t for t in reviews if t.queued_at < task.queued_at]
+    first = task_chain(state, task)[0]  # a review carried on after it was cut off covers what the first one would
+    before = [t for t in reviews if t.queued_at < first.queued_at]
     since = before[-1].queued_at if before else 0
     lines = ["This is a background review: the researcher is not in this conversation, but sees your final message "
              "in the chat."]
@@ -241,7 +249,8 @@ def review_material(state: InvestigationState, task: AgentTaskRecord) -> str:
     if automation is not None:
         lines.append(f"The investigation is in full automation ({automation.intervention_id or 'switched on'}): the "
                      "researcher is away. An approver decides on your agent proposals and on submissions, within "
-                     f"{automation.max_core_hours:g} core-hours and {automation.max_tokens:,} tokens from the switch; "
+                     f"{automation.max_core_hours:g} core-hours and {dollars(automation.max_usd)} of model use from the "
+                     "switch; "
                      "inputs needing review and closing wait for the researcher. Do not wait for answers from the "
                      "researcher.")
     lines.append("Reports since your last review, in the agents' own words:")
@@ -280,14 +289,90 @@ def review_material(state: InvestigationState, task: AgentTaskRecord) -> str:
         lines += [f"[{i.intervention_id}] {i.text}" for i in messages]
     lines += ["", "Collect and compare these results across hypotheses. A report is its agent's account, not "
               "evidence: weigh the recorded evidence and the Judge's assessments above, and check investigation_state "
-              "for the rest. Agents never see each other's work: noticing confounders, "
-              "contradictions and interactions between hypotheses is your job. Then decide what follows, if "
+              "for the rest. Each agent concentrates on its own hypothesis: comparing across hypotheses, "
+              "noticing confounders, contradictions and interactions, is your job. Record that comparison with "
+              "record_synthesis: every open hypothesis, how much of the discrepancy each accounts for (citing "
+              "evidence), how they interact, what remains unexplained and what cannot be separated; when the "
+              "comparison suggests new hypotheses, propose them (propose_hypothesis, then propose_agents) and name "
+              "them in it. Then decide what follows, if "
               "anything, recording the candidates you weighed and your choice with recommend_next_actions before "
-              "you act on it: further work for an agent (delegate; pass on another agent's finding only when its test "
-              "needs it, citing the evidence id), an assessment (request_judgement), new hypotheses and agents "
+              "you act on it: further work for an agent (delegate; name another agent's calculations or evidence "
+              "when its test needs them), an assessment (request_judgement), new hypotheses and agents "
               "(propose_agents), a plan revision, or moving the investigation on. The researcher may be talking with "
               "you in the chat at the same time; the record shows what has already been done. End with a short "
               "message for the researcher: what came in, what it means, what you did, and what waits for them. If "
               "you proposed closing the investigation, say so first: as what and why, and that /approve close "
               "closes it."]
+    return "\n".join(lines)
+
+
+# -- runs that end early --------------------------------------------------------------------------
+
+def task_chain(state: InvestigationState, task: AgentTaskRecord) -> list[AgentTaskRecord]:
+    """The task and the ones it continues, the first one first."""
+    chain = [task]
+    while chain[0].continues is not None and chain[0].continues in state.tasks:
+        chain.insert(0, state.tasks[chain[0].continues])
+    return chain
+
+
+def continuation_text(state: InvestigationState, task: AgentTaskRecord, why: str) -> str:
+    """The instruction that carries on with a task whose run was cut off."""
+    first = task_chain(state, task)[0]
+    return (f"Continue task {first.task_id}: the run carrying it out was cut off ({why}). The briefing above shows "
+            f"what was recorded until then. The task was: {first.instruction}")
+
+
+def ended_unseen(state: InvestigationState, hypothesis_id: str, since: int) -> list[str]:
+    """The hypothesis's calculations whose jobs ended after ``since``: their runs were checked, or they were
+    cancelled. Registered runs never ran here, and an examiner's rejection is answered at once."""
+    found = []
+    for cid in state.hypotheses[hypothesis_id].calculation_ids:
+        calc = state.calculations[cid]
+        if calc.registered:
+            continue
+        ended = next((v for v, s in calc.history if s in (CalculationState.QUALITY_ASSESSED,
+                                                           CalculationState.CANCELLED)), None)
+        if ended is not None and ended > since:
+            found.append(cid)
+    return found
+
+
+def account_of_run(state: InvestigationState, task: AgentTaskRecord, actor_id: str, since: int, *, outcome: str,
+                   error: str | None, turns: int, last_step: str | None) -> str:
+    """CEDAR's account of a run that ended without the agent's own report, from what the record holds."""
+    how = f"it ended {outcome}" + (f" ({error})" if error else "") + f" after {turns} model call{'s' * (turns != 1)}"
+    lines = [f"No report from the agent: {how}" + (f"; its last step was {last_step}" if last_step else "") + ". "
+             "CEDAR's account from the record of what it did in this run:"]
+    h = task.hypothesis_id
+    if task.role == "hypothesis_agent" and h in state.hypotheses:
+        hyp = state.hypotheses[h]
+        lines += [f"- requested {c}: {state.calculations[c].state.value}" for c in hyp.calculation_ids
+                  if state.calculations[c].requested_at > since and not state.calculations[c].registered]
+        lines += [f"- registered {c} from {state.calculations[c].registration.source}" for c in hyp.calculation_ids
+                  if state.calculations[c].requested_at > since and state.calculations[c].registered]
+        lines += [f"- registered prediction {p}: {state.predictions[p].prediction.statement}"
+                  for p in hyp.prediction_ids if state.predictions[p].registered_at > since]
+        lines += [f"- ran analysis {a.analysis_id} ({a.run.outcome.value}): {a.run.purpose}"
+                  for a in state.analyses.values() if a.hypothesis_id == h and a.recorded_at > since]
+        lines += [f"- recorded evidence {r.evidence_id}: {r.evidence.observable.name} = "
+                  + (f"{r.evidence.value.value!r} {r.evidence.value.unit}" if r.evidence.value else "no value")
+                  + f" ({r.evidence.quality.value})" for r in state.evidence.values()
+                  if r.recorded_at > since and r.evidence.interpreted_by is not None
+                  and r.evidence.interpreted_by.id == actor_id]
+        commands = [w for w in state.workbench_runs.values() if w.agent_id == actor_id and w.recorded_at > since]
+        if commands:
+            lines.append(f"- ran {len(commands)} workbench command{'s' * (len(commands) != 1)}, the last: "
+                         f"{commands[-1].run.command}")
+        lines.append(f"- its hypothesis is now {hyp.status.value}")
+    elif task.role == "evidence_judge" and h in state.hypotheses:
+        lines += [f"- assessed {h}: {a.assessment.value} ({a.completeness.value})"
+                  for a in state.hypotheses[h].assessments if a.recorded_at > since]
+    else:
+        lines += [f"- recommended next steps {r.recommendation_id}" for r in state.recommendations.values()
+                  if r.recorded_at > since]
+        lines += [f"- queued {t.task_id} for {t.agent_id or t.role}" for t in state.tasks.values()
+                  if t.queued_at > since and t.queued_by == actor_id]
+    if len(lines) == 1:
+        lines.append("- nothing was recorded")
     return "\n".join(lines)

@@ -12,6 +12,14 @@ from cedar.models.types import ModelSettings
 
 STARTER = """# Which model each CEDAR agent role uses. Roles without a section use [roles.default].
 # provider: an adapter CEDAR knows ("anthropic"); model: the provider's exact model id.
+# Budgets are in dollars. CEDAR knows the published prices of the current Claude models; for any other model, or
+# when prices change, give them in dollars per million tokens (web_search: dollars per search), e.g.
+#   [roles.default.prices]
+#   input = 4.0
+#   output = 20.0
+#   cache_read = 0.20
+#   cache_write = 5.0
+#   web_search = 0.01
 
 [roles.default]
 provider = "anthropic"

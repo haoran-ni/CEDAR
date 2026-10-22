@@ -47,7 +47,8 @@ from cedar.contracts.events import (
     RoundStarted,
     RunChecked,
     RunRegistered,
-    TokenBudgetChanged,
+    SynthesisRecorded,
+    BudgetChanged,
     UserInterventionRecorded,
     WorkbenchPolicyChanged,
     WorkbenchRunRecorded,
@@ -89,9 +90,10 @@ EVENT_ACTORS: dict[type, frozenset[ActorKind]] = {
     InvestigationStatusChanged: frozenset({_A.USER, _A.CHIEF_SCIENTIST, _A.SYSTEM}),
     ClosingProposed: frozenset({_A.CHIEF_SCIENTIST}),
     NextActionsRecommended: frozenset({_A.CHIEF_SCIENTIST}),
+    SynthesisRecorded: frozenset({_A.CHIEF_SCIENTIST}),
     ModeChanged: frozenset({_A.USER, _A.SYSTEM}),
     RetrievalPolicyChanged: frozenset({_A.USER}),
-    TokenBudgetChanged: frozenset({_A.USER}),
+    BudgetChanged: frozenset({_A.USER}),
     WorkbenchPolicyChanged: frozenset({_A.USER}),
     MaterialAttached: frozenset({_A.USER}),
     ApproverDecision: frozenset({_A.APPROVER}),
@@ -137,9 +139,9 @@ CALCULATION_STATE_ACTORS: dict[CalculationState, frozenset[ActorKind]] = {
 EVIDENCE_KIND_ACTORS: dict[EvidenceKind, frozenset[ActorKind]] = {
     EvidenceKind.DIRECT_COMPUTATION: frozenset({_A.VALIDATOR}),
     EvidenceKind.ARCHIVED_COMPUTATION: frozenset({_A.VALIDATOR}),
-    EvidenceKind.PUBLISHED_EXPERIMENT: frozenset({_A.HYPOTHESIS_AGENT, _A.USER}),
-    EvidenceKind.INFERENCE: frozenset({_A.HYPOTHESIS_AGENT, _A.USER}),
-    EvidenceKind.INDIRECT_CONSTRAINT: frozenset({_A.HYPOTHESIS_AGENT, _A.USER}),
+    EvidenceKind.PUBLISHED_EXPERIMENT: frozenset({_A.VALIDATOR, _A.USER}),
+    EvidenceKind.INFERENCE: frozenset({_A.VALIDATOR, _A.USER}),
+    EvidenceKind.INDIRECT_CONSTRAINT: frozenset({_A.VALIDATOR, _A.USER}),
     EvidenceKind.ANALYSIS: frozenset({_A.VALIDATOR}),
 }
 
@@ -148,9 +150,8 @@ _LIVE_AT_SCHEDULER = frozenset({_C.SUBMISSION_PENDING, _C.SUBMITTED, _C.QUEUED, 
 """SUBMISSION_PENDING counts as live: sbatch may already have accepted the job."""
 _FOLLOWED = _LIVE_AT_SCHEDULER | {_C.SCHEDULER_TERMINAL, _C.PARSING}
 """Calculations the dispatcher still follows: at the scheduler, or waiting for their run check."""
-_OUTCOME_UNSEEN = frozenset({
-    _C.SPECIFIED, _C.VALIDATED_INPUT, _C.SUBMISSION_PENDING, _C.SUBMITTED, _C.QUEUED, _C.RUNNING,
-})
+_PREDICTABLE = frozenset({_C.SPECIFIED, _C.VALIDATED_INPUT})
+"""A calculation can be predicted until it is submitted: once it runs, its output can be read."""
 _CLOSED_HYPOTHESIS = frozenset({HypothesisStatus.DISCARDED, HypothesisStatus.SUPERSEDED})
 _NOT_YET_ACTIVE = frozenset({HypothesisStatus.PROPOSED, HypothesisStatus.SCREENED})
 
@@ -249,10 +250,6 @@ class CalculationRecord:
             return self.examination.input_hash
         return self.registration.input_hash if self.registration is not None else None
 
-    def visible_to(self, hypothesis_id: str) -> bool:
-        """Whether the hypothesis's agent may use this run: its own, or a registered run shared with every agent."""
-        return hypothesis_id in self.hypothesis_ids or self.shared
-
 
 @dataclass
 class EvidenceRecord:
@@ -337,7 +334,7 @@ class ModeRecord:
     actor: Actor
     recorded_at: int
     max_core_hours: float | None = None
-    max_tokens: int | None = None
+    max_usd: float | None = None
     intervention_id: str | None = None
 
 
@@ -354,9 +351,10 @@ class RetrievalRecord:
 
 @dataclass(frozen=True)
 class BudgetRecord:
-    """The researcher's setting of the investigation's total token budget; None for no limit."""
+    """The researcher's setting of what the investigation's agents may spend on models, in dollars; None for no
+    limit."""
 
-    max_tokens: int | None
+    max_usd: float | None
     intervention_id: str
     recorded_at: int
 
@@ -401,6 +399,19 @@ class RecommendationRecord:
         return self.recommendation.recommendation_id
 
 
+@dataclass(frozen=True)
+class SynthesisRecord:
+    """The Chief Scientist's comparison across hypotheses."""
+
+    synthesis: SynthesisRecorded
+    recorded_at: int
+    round: int
+
+    @property
+    def synthesis_id(self) -> str:
+        return self.synthesis.synthesis_id
+
+
 @dataclass
 class AgentRecord:
     agent_id: str
@@ -411,12 +422,19 @@ class AgentRecord:
     started_by: Actor
     authorization_id: str | None
     """The researcher's command that started it; None if the review window passed."""
+    index: int = 0
+    """Its number in the investigation, in the order agents started: 1 for A1."""
     retired_at: int | None = None
     retire_reason: str | None = None
 
     @property
     def active(self) -> bool:
         return self.retired_at is None
+
+    @property
+    def tag(self) -> str:
+        """Its short name, e.g. A1, used in the panel, commands and the notebook."""
+        return f"A{self.index}"
 
 
 @dataclass
@@ -434,6 +452,8 @@ class AgentTaskRecord:
     """The Chief Scientist's recommendation it carries out, if any."""
     dropped_at: int | None = None
     """Stream version at which its agent was retired before carrying it out."""
+    continues: str | None = None
+    """The task it carries on with, after the run carrying that one out was cut off."""
 
 
 @dataclass
@@ -469,6 +489,7 @@ class InvestigationState:
     pending_closing: ClosingRecord | None = None
     """A proposal to close the investigation that waits for the researcher's /approve close."""
     recommendations: dict[str, RecommendationRecord] = field(default_factory=dict)
+    syntheses: dict[str, SynthesisRecord] = field(default_factory=dict)
     modes: list[ModeRecord] = field(default_factory=list)
     approvals: dict[str, ApprovalRecord] = field(default_factory=dict)
     retrieval_changes: list[RetrievalRecord] = field(default_factory=list)
@@ -500,12 +521,13 @@ class InvestigationState:
         return self.modes[-1] if self.mode is InvestigationMode.FULL_AUTOMATION else None
 
     @property
-    def automation_tokens_left(self) -> int | None:
+    def automation_cost_left(self) -> float | None:
+        """Dollars full automation may still spend on models; None in human-in-the-loop."""
         automation = self.automation
         if automation is None:
             return None
-        used = sum(_run_tokens(r.run) for r in self.agent_runs if r.recorded_at > automation.recorded_at)
-        return automation.max_tokens - used
+        spent = sum(r.run.cost_usd or 0 for r in self.agent_runs if r.recorded_at > automation.recorded_at)
+        return automation.max_usd - spent
 
     @property
     def automation_core_hours_left(self) -> float | None:
@@ -540,6 +562,10 @@ class InvestigationState:
     def agent_tokens_used(self, agent_id: str) -> int:
         return sum(_run_tokens(r.run) for r in self.agent_runs if r.actor_id == agent_id)
 
+    def agent_cost(self, agent_id: str) -> float:
+        """Dollars an agent has spent on models, as far as its models' prices are known."""
+        return sum(r.run.cost_usd or 0 for r in self.agent_runs if r.actor_id == agent_id)
+
     @property
     def plan(self) -> ResearchPlan:
         return self.plans[-1].plan
@@ -549,16 +575,27 @@ class InvestigationState:
         return sum(_run_tokens(r.run) for r in self.agent_runs)
 
     @property
-    def model_token_budget(self) -> int | None:
-        """The total the researcher set with /budget, else the one the investigation opened with; None for none."""
-        if self.budget_changes:
-            return self.budget_changes[-1].max_tokens
-        return self.spec.constraints.model_token_budget
+    def model_cost(self) -> float:
+        """Dollars all the investigation's agents have spent on models, the Chief Scientist's answers included."""
+        return sum(r.run.cost_usd or 0 for r in self.agent_runs)
 
     @property
-    def model_tokens_remaining(self) -> int | None:
-        budget = self.model_token_budget
-        return None if budget is None else max(0, budget - self.model_tokens_used)
+    def unpriced_runs(self) -> int:
+        """Runs whose cost is not known, because their model's prices were not."""
+        return sum(1 for r in self.agent_runs if r.run.cost_usd is None)
+
+    @property
+    def budget_usd(self) -> float | None:
+        """What the researcher set with /budget, else what the investigation opened with; None for no limit."""
+        if self.budget_changes:
+            return self.budget_changes[-1].max_usd
+        return self.spec.constraints.budget_usd
+
+    @property
+    def budget_left(self) -> float | None:
+        """Dollars left of the budget; None for no limit."""
+        budget = self.budget_usd
+        return None if budget is None else max(0.0, budget - self.model_cost)
 
     @property
     def plan_version(self) -> int:
@@ -588,6 +625,22 @@ def agent_id_for(state: InvestigationState, hypothesis_id: str) -> str:
     if base not in taken:
         return base
     return next(f"{base}-{n}" for n in range(2, len(taken) + 3) if f"{base}-{n}" not in taken)
+
+
+def agent_tag(state: InvestigationState, agent_id: str) -> str:
+    """An agent's short name (A1, A2, ...), or its id if it is not an agent of the investigation."""
+    agent = state.agents.get(agent_id)
+    return agent.tag if agent is not None else agent_id
+
+
+def find_agent(state: InvestigationState, given: str) -> AgentRecord | None:
+    """The agent ``given`` names: by its short name (A1, case-insensitive), its id, or its hypothesis (the active
+    agent, else the latest)."""
+    for agent in state.agents.values():
+        if given.upper() == agent.tag or given == agent.agent_id:
+            return agent
+    matching = [a for a in state.agents.values() if a.hypothesis_id == given]
+    return next((a for a in matching if a.active), matching[-1] if matching else None)
 
 
 def evidence_owner(state: InvestigationState, evidence: EvidenceObject) -> str | None:
@@ -622,32 +675,48 @@ def _is_reusable(calc: CalculationRecord) -> bool:
     )
 
 
-def calculation_with_inputs(state: InvestigationState, input_hash: str, hypothesis_ids=()) -> str | None:
-    """A reusable calculation whose scientific inputs are identical. A registered run counts only for the
-    hypotheses that may use it, so no agent is kept from a run it cannot see."""
+def submitted_at(calc: CalculationRecord) -> int | None:
+    """When a calculation was handed to the scheduler, or None if it never was (registered runs never are)."""
+    return next((v for v, s in calc.history if s is _C.SUBMISSION_PENDING), None)
+
+
+def predicted_by(state: InvestigationState, hypothesis_id: str, record: EvidenceRecord) -> str | None:
+    """The prediction of the hypothesis that this evidence tests: one that named a calculation the evidence rests
+    on before that calculation was submitted. None for evidence that existed before (registered runs, published
+    or reported measurements) and for outcomes the hypothesis did not predict."""
+    ev = record.evidence
+    if ev.kind not in (EvidenceKind.DIRECT_COMPUTATION, EvidenceKind.ANALYSIS):
+        return None
+    runs = [ev.calculation_id] if ev.calculation_id else list(ev.calculation_ids)
+    for pid in state.hypotheses[hypothesis_id].prediction_ids:
+        prediction = state.predictions[pid]
+        for cid in prediction.prediction.calculation_ids:
+            calc = state.calculations.get(cid)
+            sent = submitted_at(calc) if calc is not None else None
+            if cid in runs and sent is not None and prediction.registered_at < sent:
+                return pid
+    return None
+
+
+def calculation_with_inputs(state: InvestigationState, input_hash: str) -> str | None:
+    """A reusable calculation whose scientific inputs are identical; every agent may use any of them."""
     for calc in state.calculations.values():
-        if calc.input_hash != input_hash or not _is_reusable(calc):
-            continue
-        if not calc.registered or any(calc.visible_to(h) for h in hypothesis_ids):
+        if calc.input_hash == input_hash and _is_reusable(calc):
             return calc.calculation_id
     return None
 
 
-def hypothesis_calculations(state: InvestigationState, hypothesis_id: str) -> list[CalculationRecord]:
-    """The runs the hypothesis's agent may use: its own, then the registered runs shared with every agent."""
-    own = [state.calculations[c] for c in state.hypotheses[hypothesis_id].calculation_ids]
-    return own + [c for c in state.calculations.values() if c.shared]
-
-
 def hypothesis_evidence(state: InvestigationState, hypothesis_id: str) -> list[EvidenceRecord]:
-    """Evidence from the hypothesis's calculations and from the analyses it ran, in recording order."""
+    """The hypothesis's evidence, in recording order: what its agent recorded, from any run, and evidence no agent
+    recorded from the hypothesis's own calculations. Another agent's reading of a shared run is that agent's."""
     hyp = state.hypotheses[hypothesis_id]
     calcs = set(hyp.calculation_ids)
     found = []
     for record in state.evidence.values():
         ev = record.evidence
-        mine = evidence_owner(state, ev) == hypothesis_id
-        if mine or ev.calculation_id in calcs or calcs.intersection(ev.calculation_ids):
+        owner = evidence_owner(state, ev)
+        if owner == hypothesis_id or (owner is None and (ev.calculation_id in calcs
+                                                         or calcs.intersection(ev.calculation_ids))):
             found.append(record)
     return found
 
@@ -787,7 +856,7 @@ def _on_mode_changed(state: InvestigationState, event: RecordedEvent, p: ModeCha
     elif p.mode is not InvestigationMode.HUMAN_IN_THE_LOOP:
         raise RuleViolation("only the researcher switches full automation on")
     state.modes.append(ModeRecord(p.mode, p.reason, event.actor, event.stream_version, p.max_core_hours,
-                                  p.max_tokens, p.intervention_id))
+                                  p.max_usd, p.intervention_id))
 
 
 def _on_retrieval_policy(state: InvestigationState, event: RecordedEvent, p: RetrievalPolicyChanged) -> None:
@@ -798,11 +867,11 @@ def _on_retrieval_policy(state: InvestigationState, event: RecordedEvent, p: Ret
                                                    event.stream_version))
 
 
-def _on_token_budget(state: InvestigationState, event: RecordedEvent, p: TokenBudgetChanged) -> None:
+def _on_budget(state: InvestigationState, event: RecordedEvent, p: BudgetChanged) -> None:
     _require_open(state)
     if p.intervention_id not in state.interventions:
-        raise RuleViolation("the researcher's token budget cites their recorded command")
-    state.budget_changes.append(BudgetRecord(p.max_tokens, p.intervention_id, event.stream_version))
+        raise RuleViolation("the researcher's budget cites their recorded command")
+    state.budget_changes.append(BudgetRecord(p.max_usd, p.intervention_id, event.stream_version))
 
 
 def _on_workbench_policy(state: InvestigationState, event: RecordedEvent, p: WorkbenchPolicyChanged) -> None:
@@ -891,6 +960,24 @@ def _on_next_actions(state: InvestigationState, event: RecordedEvent, p: NextAct
                                                                       event.round)
 
 
+def _on_synthesis(state: InvestigationState, event: RecordedEvent, p: SynthesisRecorded) -> None:
+    _require_open(state)
+    if p.synthesis_id in state.syntheses:
+        raise RuleViolation(f"synthesis {p.synthesis_id} already exists")
+    named = {h.hypothesis_id for h in p.hypotheses}
+    unknown = sorted((named | set(p.new_hypotheses)) - set(state.hypotheses))
+    if unknown:
+        raise RuleViolation(f"unknown hypotheses {', '.join(unknown)}; propose new ones before naming them")
+    missing = sorted(h for h, hyp in state.hypotheses.items() if hyp.status not in _CLOSED_HYPOTHESIS
+                     and h not in named and h not in p.new_hypotheses)
+    if missing:
+        raise RuleViolation(f"a comparison covers every open hypothesis; missing {', '.join(missing)}")
+    cited = sorted({e for h in p.hypotheses for e in h.evidence_ids} - set(state.evidence))
+    if cited:
+        raise RuleViolation(f"unknown evidence {', '.join(cited)}")
+    state.syntheses[p.synthesis_id] = SynthesisRecord(p, event.stream_version, event.round)
+
+
 def _require_recommendation(state: InvestigationState, recommendation_id: str | None) -> None:
     if recommendation_id is not None and recommendation_id not in state.recommendations:
         raise RuleViolation(f"unknown recommendation {recommendation_id}")
@@ -900,6 +987,10 @@ def _on_closing_proposed(state: InvestigationState, event: RecordedEvent, p: Clo
     if state.status is not InvestigationStatus.REVIEWING:
         raise RuleViolation(f"closing is proposed while REVIEWING, not {state.status}; move the investigation to "
                             "REVIEWING first")
+    latest = max((r.recorded_at for r in state.evidence.values()), default=0)
+    if not any(s.recorded_at > latest for s in state.syntheses.values()):
+        raise RuleViolation("closing needs a comparison across hypotheses (record_synthesis) recorded after the "
+                            "latest evidence")
     state.pending_closing = ClosingRecord(p.closing_id, p.status, p.reason, event.actor.id, event.stream_version)
 
 
@@ -972,12 +1063,11 @@ def _on_prediction(state: InvestigationState, event: RecordedEvent, p: Predictio
         raise RuleViolation(f"hypothesis {p.hypothesis_id} is {hyp.status}")
     if p.prediction_id in state.predictions:
         raise RuleViolation(f"prediction {p.prediction_id} already registered; predictions are immutable")
-    for calc_id in p.prediction.calculation_ids:
+    for calc_id in p.prediction.calculation_ids:  # any calculation of the investigation, not yet submitted
         calc = _calculation(state, calc_id)
-        if p.hypothesis_id not in calc.hypothesis_ids:
-            raise RuleViolation(f"calculation {calc_id} is not linked to {p.hypothesis_id}")
-        if calc.state not in _OUTCOME_UNSEEN:
-            raise RuleViolation(f"calculation {calc_id} has already ended ({calc.state}); too late to predict it")
+        if calc.state not in _PREDICTABLE:
+            raise RuleViolation(f"calculation {calc_id} is {calc.state}; a prediction names calculations before they "
+                                "are submitted")
     state.predictions[p.prediction_id] = PredictionRecord(
         p.prediction_id, p.hypothesis_id, p.prediction, event.stream_version, event.round
     )
@@ -1035,7 +1125,7 @@ def _on_inputs_examined(state: InvestigationState, event: RecordedEvent, p: Calc
     if structure is not None and structure.sha256 not in {ref.sha256 for ref in exam.files.values()}:
         raise RuleViolation("the requested structure is not among the examined files")
     if exam.verdict is not ExaminationVerdict.REJECTED:
-        duplicate = calculation_with_inputs(state, exam.input_hash, calc.hypothesis_ids)
+        duplicate = calculation_with_inputs(state, exam.input_hash)
         if duplicate is not None:
             raise RuleViolation(f"inputs are identical to calculation {duplicate}")
     calc.examination = exam
@@ -1126,11 +1216,8 @@ def _on_analysis(state: InvestigationState, event: RecordedEvent, p: AnalysisRec
         raise RuleViolation(f"hypothesis {p.hypothesis_id} is {hyp.status}")
     if p.analysis_id in state.analyses:
         raise RuleViolation(f"analysis {p.analysis_id} already recorded")
-    for staged in p.run.inputs:
+    for staged in p.run.inputs:  # any calculation of the investigation, the hypothesis's own or another's
         calc = _calculation(state, staged.calculation_id)
-        if not calc.visible_to(p.hypothesis_id):
-            raise RuleViolation(f"calculation {calc.calculation_id} is not linked to {p.hypothesis_id}; an analysis "
-                                "uses only its own hypothesis's runs and shared registered runs")
         if calc.run_check is None:
             raise RuleViolation(f"the run of {calc.calculation_id} has not been checked; nothing to analyse yet")
         known = {**calc.input_files, **calc.run_check.outputs}
@@ -1151,20 +1238,17 @@ def _require_healthy_for_validation(ev: EvidenceObject, calcs: list[CalculationR
             raise RuleViolation(f"cannot validate results of {calc.calculation_id}: its run failed checks")
 
 
-def _require_reader_owns(state: InvestigationState, ev: EvidenceObject, linked: list[CalculationRecord]) -> None:
-    """An agent's reading or analysis result concerns its own hypothesis's runs."""
+def _require_reader_owns(state: InvestigationState, ev: EvidenceObject) -> None:
+    """An agent records evidence for its own hypothesis: its own readings, and results of analyses it ran for it. The
+    runs may be any of the investigation's."""
     reader = ev.interpreted_by
     if reader is None or reader.kind is not ActorKind.HYPOTHESIS_AGENT:
         return
     agent = state.agents.get(reader.id)
     if agent is None or not agent.active:
         raise RuleViolation(f"{reader.id} is not an active agent")
-    if ev.analysis_id is not None:
-        if state.analyses[ev.analysis_id].hypothesis_id != agent.hypothesis_id:
-            raise RuleViolation(f"analysis {ev.analysis_id} was not run for {agent.hypothesis_id}")
-    elif not all(calc.visible_to(agent.hypothesis_id) for calc in linked):
-        raise RuleViolation(f"{reader.id} reads only calculations linked to {agent.hypothesis_id} and shared "
-                            "registered runs")
+    if ev.analysis_id is not None and state.analyses[ev.analysis_id].hypothesis_id != agent.hypothesis_id:
+        raise RuleViolation(f"analysis {ev.analysis_id} was not run for {agent.hypothesis_id}")
 
 
 def _on_evidence(state: InvestigationState, event: RecordedEvent, p: EvidenceRecorded) -> None:
@@ -1203,7 +1287,7 @@ def _on_evidence(state: InvestigationState, event: RecordedEvent, p: EvidenceRec
             raise RuleViolation(f"analysis evidence must carry exactly the checks the script reported for "
                                 f"{result.name}")
         linked = [state.calculations[c] for c in ev.calculation_ids]
-    _require_reader_owns(state, ev, linked)
+    _require_reader_owns(state, ev)
     _require_healthy_for_validation(ev, linked)
     state.evidence[p.evidence_id] = EvidenceRecord(p.evidence_id, ev, event.stream_version, event.round)
     for calc in linked:
@@ -1232,15 +1316,12 @@ def _on_assessment(state: InvestigationState, event: RecordedEvent, p: Assessmen
             unvalidated = [r.evidence_id for r in cited if r.evidence.quality is not EvidenceQuality.VALIDATED]
             if unvalidated:
                 raise RuleViolation(f"a FINAL {p.assessment} needs VALIDATED evidence: {unvalidated}")
-        first_prediction = min(
-            (state.predictions[pid].registered_at for pid in hyp.prediction_ids), default=None
-        )
-        for record in cited:
-            if first_prediction is None or first_prediction > record.recorded_at:
-                raise RuleViolation(
-                    f"evidence {record.evidence_id} was recorded before any prediction of "
-                    f"{p.hypothesis_id}, so it cannot test it"
-                )
+        # Support comes only from an outcome the hypothesis predicted before anyone could know it; what already
+        # existed, or was not predicted, may challenge it or accompany a test.
+        if p.assessment is Assessment.SUPPORTED and not any(predicted_by(state, p.hypothesis_id, r) for r in cited):
+            raise RuleViolation(f"SUPPORTED needs evidence from a calculation that a prediction of {p.hypothesis_id} "
+                                "named before it was submitted; evidence that existed before or was not predicted "
+                                "can challenge it, or accompany such a test, but not support it")
 
     hyp.assessment = p.assessment
     hyp.assessments.append(AssessmentEntry(
@@ -1268,9 +1349,15 @@ def _on_agent_task(state: InvestigationState, event: RecordedEvent, p: AgentTask
         if agent.hypothesis_id != p.hypothesis_id:
             raise RuleViolation(f"{p.agent_id} works on {agent.hypothesis_id}, not {p.hypothesis_id}")
     _require_recommendation(state, p.recommendation_id)
+    if p.continues is not None:
+        earlier = state.tasks.get(p.continues)
+        if earlier is None or earlier.completed_by is None:
+            raise RuleViolation(f"task {p.continues} has not been carried out, so there is nothing to continue")
+        if (earlier.role, earlier.agent_id, earlier.hypothesis_id) != (p.role, p.agent_id, p.hypothesis_id):
+            raise RuleViolation(f"a continuation of {p.continues} is for the same agent and hypothesis")
     state.tasks[p.task_id] = AgentTaskRecord(p.task_id, p.role, p.hypothesis_id, p.agent_id, p.instruction,
                                              event.actor.id, event.stream_version,
-                                             recommendation_id=p.recommendation_id)
+                                             recommendation_id=p.recommendation_id, continues=p.continues)
 
 
 def _on_agent_run(state: InvestigationState, event: RecordedEvent, p: AgentRunRecorded) -> None:
@@ -1286,6 +1373,13 @@ def _on_agent_run(state: InvestigationState, event: RecordedEvent, p: AgentRunRe
             raise RuleViolation(f"task {p.task_id} is for {task.agent_id}, not {event.actor.id}")
         # A run already going when its agent was retired is still recorded, so its tokens count.
         task.completed_by = event.stream_version
+    if p.structured is not None:
+        if p.role != "hypothesis_agent":
+            raise RuleViolation("only a hypothesis agent ends its task with a structured report")
+        unknown = sorted({e for f in p.structured.findings for e in f.evidence_ids} - set(state.evidence))
+        unknown += sorted(set(p.structured.waiting_for) - set(state.calculations))
+        if unknown:
+            raise RuleViolation(f"the report names what the record does not hold: {', '.join(unknown)}")
     state.agent_runs.append(AgentRunRecord(p.session_id, p.role, event.actor.id, p, event.stream_version, event.round))
 
 
@@ -1342,7 +1436,7 @@ def _on_agents_started(state: InvestigationState, event: RecordedEvent, p: Agent
         _require_can_have_agent(state, spec.hypothesis_id)
         agent_id = p.agent_ids[spec.hypothesis_id]
         state.agents[agent_id] = AgentRecord(agent_id, spec.hypothesis_id, spec, p.proposal_id, event.stream_version,
-                                             event.actor, p.authorization_id)
+                                             event.actor, p.authorization_id, index=len(state.agents) + 1)
     proposal.status, proposal.closed_at = ProposalStatus.STARTED, event.stream_version
 
 
@@ -1372,11 +1466,12 @@ _HANDLERS = {
     ClosingProposed: _on_closing_proposed,
     ModeChanged: _on_mode_changed,
     RetrievalPolicyChanged: _on_retrieval_policy,
-    TokenBudgetChanged: _on_token_budget,
+    BudgetChanged: _on_budget,
     WorkbenchPolicyChanged: _on_workbench_policy,
     MaterialAttached: _on_material,
     ApproverDecision: _on_approver_decision,
     NextActionsRecommended: _on_next_actions,
+    SynthesisRecorded: _on_synthesis,
     ObservableAlignmentRecorded: _on_alignment,
     UserInterventionRecorded: _on_intervention,
     PlanRevised: _on_plan_revised,
@@ -1406,7 +1501,8 @@ __all__ = [
     "AgentRecord", "AnalysisRecord", "AssessmentEntry", "CalculationRecord", "ClosingRecord", "EvidenceRecord", "HypothesisRecord", "InterventionRecord",
     "InvestigationState", "ApprovalRecord", "BudgetRecord", "MaterialRecord", "ModeRecord", "PlanRecord", "RetrievalRecord", "PredictionRecord", "ProposalRecord",
     "ProposalStatus", "RecommendationRecord", "agent_id_for", "apply",
-    "authorization_for", "calculation_with_inputs", "evidence_owner", "hypothesis_calculations", "hypothesis_evidence",
+    "authorization_for", "calculation_with_inputs", "evidence_owner", "hypothesis_evidence",
     "replay",
     "reusable_calculation", "review_deadline", "WorkbenchPolicyRecord", "WorkbenchRecord", "workbench_run_with",
+    "agent_tag", "find_agent", "SynthesisRecord", "predicted_by", "submitted_at",
 ]

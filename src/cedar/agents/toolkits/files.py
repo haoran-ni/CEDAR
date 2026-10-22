@@ -3,9 +3,9 @@ PDFs; and, for an agent's own workspace, write and delete.
 
 Paths must resolve (after following symlinks) inside one of the allowed roots and outside
 every denied directory, such as the one holding API keys, unless they lie inside an
-explicitly allowed path (an agent's own workspace inside the denied data directory, say).
-Roots, denied and allowed paths can be given as functions, so what an agent may read
-follows the research record, e.g. the run directories of its own hypothesis's calculations.
+explicitly allowed path. Roots, denied and allowed paths can be given as functions, so what
+may be read can follow the research record. Agents read every file the researcher can,
+except credentials (``agent_access``).
 
 Text is read as a stream, so a very large file never has to fit in memory: reading stops
 after the requested lines, and a search after ``MAX_SCAN_BYTES``. Only regular files are
@@ -40,6 +40,23 @@ MAX_VISITED = 200_000
 """A file search stops after visiting this many directory entries."""
 
 PathsLike = Sequence[str | Path] | Callable[[], Sequence[str | Path]]
+
+SECRET_PATHS = ("~/.ssh", "~/.gnupg", "~/.netrc", "~/.aws", "~/.config/gcloud", "~/.kube", "~/.docker")
+"""Well-known stores of keys and passwords, never readable by agents."""
+PSEUDO_FILESYSTEMS = ("/proc", "/sys", "/dev")
+"""Not files: reading them could show a process's environment, or never end."""
+
+
+def credential_paths(deny: Sequence[str | Path] = ()) -> list[Path]:
+    """What no agent reads: ``deny`` (CEDAR's configuration directory, with the API keys), the well-known secret
+    stores and the pseudo-filesystems."""
+    return [*map(Path, deny), *(Path(p).expanduser() for p in SECRET_PATHS), *map(Path, PSEUDO_FILESYSTEMS)]
+
+
+def agent_access(deny: Sequence[str | Path] = ()) -> "FileAccess":
+    """What every agent may read: any file the researcher can, except credentials. CEDAR's own records, every run
+    directory and every agent's workspace included."""
+    return FileAccess(roots=["/"], deny=credential_paths(deny))
 
 
 def _paths(value: PathsLike) -> list[Path]:

@@ -24,6 +24,8 @@ class ToolOutcome:
     is_error: bool = False
     end_run: bool = False
     """Stop the agent's invocation after this turn, e.g. once it waits for a job."""
+    ends_as: str = "waiting"
+    """How the invocation ended when ``end_run``: e.g. "waiting" for a job, or "reported"."""
     media: tuple[MediaPart, ...] = ()
     """Images and PDFs shown to the model with the text."""
 

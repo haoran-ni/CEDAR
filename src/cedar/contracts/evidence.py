@@ -106,8 +106,8 @@ class EvidenceObject(Contract):
                              "evidence")
         analysis = self.kind is EvidenceKind.ANALYSIS
         if (analysis != (self.analysis_id is not None) or analysis != (self.analysis_result is not None)
-                or analysis != bool(self.calculation_ids)):
-            raise ValueError("analysis_id, analysis_result and calculation_ids are required for, and only allowed on, "
+                or (self.calculation_ids and not analysis)):
+            raise ValueError("analysis_id and analysis_result are required for, and calculation_ids allowed only on, "
                              "analysis evidence")
         if analysis and self.value is None:
             raise ValueError("analysis evidence must carry the value the analysis computed")

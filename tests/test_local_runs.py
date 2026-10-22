@@ -55,7 +55,8 @@ export OMP_NUM_THREADS=1
 """
 
 
-def interactive(cores=4, minutes=120) -> ExecutionHost:
+def interactive(cores=8, minutes=120) -> ExecutionHost:
+    """An allocation of 8 cores by default: 4 for local DFT, 4 kept for the agents' commands."""
     return ExecutionHost(socket.gethostname(), allocation="777001", cores=cores,
                          ends_at=datetime.now(timezone.utc) + timedelta(minutes=minutes),
                          reason="TEST DOUBLE: an allocation that does not exist")
@@ -67,7 +68,7 @@ LOGIN = ExecutionHost("login1", cores=8, reason="not inside a Slurm allocation")
 class Local:
     """A World whose site's code is a SYNTHETIC script, with a local backend on a stand-in host."""
 
-    def __init__(self, ledger, store, artifacts, site, tmp_path, host=None, cpus=(0, 1, 2, 3)):
+    def __init__(self, ledger, store, artifacts, site, tmp_path, host=None, cpus=tuple(range(8))):
         binary = Path(site.codes["fhi-aims"].binary)
         self.fixture = binary.with_name("aims.out.fixture")
         self.fixture.write_text(aims_output(energy=ENERGY))
@@ -215,7 +216,7 @@ def test_an_approved_local_run_starts_ends_and_gives_validated_evidence(local):
 
 
 def test_local_runs_wait_for_free_cores(ledger, store, artifacts, site, tmp_path):
-    local = Local(ledger, store, artifacts, site, tmp_path, host=interactive(cores=1), cpus=(0,))
+    local = Local(ledger, store, artifacts, site, tmp_path, host=interactive(cores=5), cpus=(0, 1, 2, 3, 4))
     local.code(sleep=2)
     w = local.world
     first, second = local.request_local(max_core_hours=0.5), local.request_local((6, 6, 1), max_core_hours=0.5)
@@ -283,9 +284,9 @@ def test_a_restarted_dispatcher_finds_its_local_runs_without_starting_them_again
     deadline = time.monotonic() + 10
     while not list((w.runs / RECORDS).glob("*.started")) and time.monotonic() < deadline:
         time.sleep(0.1)
-    pool = CorePool([0, 1, 2, 3])
+    pool = CorePool(list(range(8)))
     again = local.backend_again(pool)
-    assert pool.take(4) is None  # the running run keeps its cores
+    assert pool.take(5) is None  # the running run keeps its 4 cores
     settled = JobManager(w.ledger, again, w.runs, execution="local").reconcile(w.inv)
     assert settled[cid].startswith("local-") and w.calc(cid).state is CalculationState.SUBMITTED
     assert len(list((w.runs / RECORDS).glob("local-*.json"))) == 1
@@ -352,3 +353,14 @@ def test_on_a_login_node_the_dispatcher_starts_no_local_run(tmp_path, site):
     assert any(f"{cid} waits: CEDAR is running on a login node (login1)" in note for note in notes), notes
     assert workspace.ledger.load(INV).calculations[cid].state is CalculationState.VALIDATED_INPUT
     assert system["scheduler"].submissions == []
+
+
+def test_four_cores_always_stay_for_the_agents_commands(ledger, store, artifacts, site, tmp_path):
+    from cedar.hpc.node import local_dft
+    small = Local(ledger, store, artifacts, site, tmp_path, host=interactive(cores=4), cpus=(0, 1, 2, 3))
+    cid = small.request_local(max_walltime_hours=1)
+    assert "no_cores_for_dft" in findings(small.world, cid)
+    assert "4 cores are always kept for the agents' commands, which leaves none for DFT" in local_dft(small.host)
+    assert "a local run may use up to 4 cores, since 4 are kept" in local_dft(interactive(cores=8))
+    pool = CorePool(list(range(8)))
+    assert pool.take(5, keep=4) is None and len(pool.take(4, keep=4)) == 4

@@ -162,6 +162,7 @@ def test_the_agents_table_shows_every_agent_and_what_it_is_doing(workspace):
     assert row(name)[1] == "proposed · held for your reply"
 
     agent = start_agent(ledger, inv, hyp, role="exchange-correlation specialist")
+    name = f"A1 agent-{hyp}"  # numbered once it starts
     assert row(name) == (name, "idle", "not run yet")
     ledger.record(inv, [draft(USER, AgentTaskQueued(task_id="t-1", role="hypothesis_agent", hypothesis_id=hyp,
                                                     agent_id=agent.id, instruction="test it"))])
@@ -199,7 +200,7 @@ def test_the_agents_table_shows_every_agent_and_what_it_is_doing(workspace):
     assert "Approver" not in [r[0] for r in table(inv)]
     ledger.record(inv, [draft(USER, UserInterventionRecorded(intervention_id="msg-2", text="/mode full-automation")),
                         draft(USER, ModeChanged(mode=InvestigationMode.FULL_AUTOMATION, reason="away",
-                                                max_core_hours=10, max_tokens=1000, intervention_id="msg-2"))])
+                                                max_core_hours=10, max_usd=10, intervention_id="msg-2"))])
     assert row("Approver") == ("Approver", "idle", "nothing waits for a decision")
     assert row("Evidence Judge") == ("Evidence Judge", "idle", "assesses new evidence each round")
 
@@ -223,13 +224,13 @@ def test_dispatcher_status_and_status_line(ledger):
                                  running("chief_scientist", 3)], now)[0] == \
         "dispatcher running 2 hypothesis agents and the Chief Scientist's review"
 
-    inv = start_investigation(ledger, model_token_budget=1000)
+    inv = start_investigation(ledger, budget_usd=20)
     hyp = add_hypothesis(ledger, inv)
     calc = ledger.request_calculation(inv, AGENT, hyp, task(), "test").calculation_id
     examine(ledger, inv, calc)
     move(ledger, inv, calc, ENGINE, CalculationState.VALIDATED_INPUT)
     assert status_line(ledger.load(inv), now) == "inv-1 · INVESTIGATING · setup · plan v1 · 1 agent · " \
-                                                 "0 of 1,000 tokens · 1 waiting for you (/pending)"
+                                                 "$0.00 of $20.00 spent · 1 waiting for you (/pending)"
     other = add_hypothesis(ledger, inv, "hyp-other", agent=False)
     ledger.record(inv, [draft(CHIEF, AgentsProposed(proposal_id="p-9", rationale="test", agents=(
         AgentSpec(hypothesis_id=other, role="coverage specialist", brief="vary coverage"),)))])

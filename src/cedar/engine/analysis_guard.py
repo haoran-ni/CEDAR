@@ -69,6 +69,13 @@ def _hook(event: str, args: tuple) -> None:
         what = "write" if writing else "read"
         raise PermissionError(f"analysis scripts may not {what} {target}: read the staged inputs under inputs/ "
                               "and write only in the working directory")
+    if event == "sqlite3.connect" and args and isinstance(args[0], (str, bytes, os.PathLike)):
+        name = os.fsdecode(args[0])
+        if name.startswith("file:"):
+            name = name[len("file:"):].split("?", 1)[0]
+        if name and name != ":memory:" and not _readable(_real(name)):
+            raise PermissionError(f"analysis scripts may not open the database {_real(name)}: read the staged inputs "
+                                  "under inputs/")
     if event in CHANGE_EVENTS:
         for arg in args:
             if isinstance(arg, (str, bytes, os.PathLike)) and not _inside(_real(arg), ROOT):

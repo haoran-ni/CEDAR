@@ -48,13 +48,14 @@ from cedar.contracts.events import (
     MaterialAttached,
     ModeChanged,
     NextActionsRecommended,
+    SynthesisRecorded,
     ObservableAlignmentRecorded,
     PlanRevised,
     PredictionRegistered,
     RecordedEvent,
     RetrievalPolicyChanged,
     RoundStarted,
-    TokenBudgetChanged,
+    BudgetChanged,
     RunChecked,
     RunRegistered,
     UserInterventionRecorded,
@@ -75,6 +76,7 @@ from cedar.contracts.status import (
     InvestigationMode,
     SchedulerState,
 )
+from cedar.models.prices import dollars
 from cedar.state.projection import (
     CalculationRecord,
     HypothesisRecord,
@@ -438,8 +440,8 @@ def _web_change(p: RetrievalPolicyChanged) -> str:
     return f"Web access for the Chief Scientist and the hypothesis agents set {setting}"
 
 
-def _budget_change(max_tokens: int | None) -> str:
-    return "Token budget removed" if max_tokens is None else f"Token budget set to {max_tokens:,}"
+def _budget_change(max_usd: float | None) -> str:
+    return "Budget removed" if max_usd is None else f"Budget set to {dollars(max_usd)}"
 
 
 def _tokens(p: AgentRunRecorded) -> int:
@@ -545,8 +547,8 @@ def _why(rnd: _Round, state: InvestigationState) -> list[str]:
             lines.append(f"- {_web_change(p)} by {who} ({p.intervention_id})")
         elif isinstance(p, WorkbenchPolicyChanged):
             lines.append(f"- {_workbench_change(p)} by {who} ({p.intervention_id})")
-        elif isinstance(p, TokenBudgetChanged):
-            lines.append(f"- {_budget_change(p.max_tokens)} by {who} ({p.intervention_id})")
+        elif isinstance(p, BudgetChanged):
+            lines.append(f"- {_budget_change(p.max_usd)} by {who} ({p.intervention_id})")
         elif isinstance(p, MaterialAttached):
             note = f": {_said(p.note)}" if p.note else ""
             lines.append(f"- {who} attached {p.material_id}, {ROOT.artifact(p.artifact, _flat(p.name))} "
@@ -559,7 +561,7 @@ def _why(rnd: _Round, state: InvestigationState) -> list[str]:
 def _mode_change(p: ModeChanged) -> str:
     if p.mode is InvestigationMode.HUMAN_IN_THE_LOOP:
         return "Back to human-in-the-loop"
-    return f"Full automation, within {p.max_core_hours:g} core-hours and {p.max_tokens:,} tokens"
+    return f"Full automation, within {p.max_core_hours:g} core-hours and {dollars(p.max_usd)} of model use"
 
 
 def _decided(p: ApproverDecision) -> str:
@@ -641,7 +643,24 @@ def _assessed(rnd: _Round, state: InvestigationState) -> list[str]:
     lines = [line for event, p in rnd.of(AssessmentRecorded)
              for line in _assessment_lines(state.hypotheses[p.hypothesis_id], event, p, ROOT,
                                            ROOT.hyp(p.hypothesis_id))]
-    return lines or ["No assessments were recorded this round."]
+    lines = lines or ["No assessments were recorded this round."]
+    for event, p in rnd.of(SynthesisRecorded):
+        lines += ["", f"Comparison across hypotheses by {_actor(event.actor)} ({p.synthesis_id}, event "
+                      f"#{event.stream_version}), in its words; values are those of the evidence it cites: "
+                      f"{_said(p.summary)}"]
+        for h in p.hypotheses:
+            lines.append(f"- {ROOT.hyp(h.hypothesis_id)}: {_said(h.standing)}"
+                         + (f" Accounts for: {_said(h.accounts_for)}" if h.accounts_for else ""))
+            for evidence_id in h.evidence_ids:
+                ev = state.evidence[evidence_id].evidence
+                lines.append(f"  - {evidence_id}: {_flat(ev.observable.name)} = {_quantity(ev.value)} "
+                             f"({ev.quality.value})")
+        lines += [f"- Interaction: {_said(text)}" for text in p.interactions]
+        lines.append(f"- Unexplained: {_said(p.residual)}")
+        lines += [f"- Cannot be separated: {_said(text)}" for text in p.not_separable]
+        if p.new_hypotheses:
+            lines.append("- New hypotheses from this comparison: " + ", ".join(ROOT.hyp(h) for h in p.new_hypotheses))
+    return lines
 
 
 def _unknown(rnd: _Round, state: InvestigationState) -> list[str]:
@@ -892,30 +911,36 @@ def _index_page(state: InvestigationState, events: Sequence[RecordedEvent], roun
                    f"#{r.events[-1].stream_version}, {_when(r.events[0])} to {_when(r.events[-1])}" for r in rounds]
     waiting = [f"- `{command}` ({note})" for command, note in approval_requests(state)] or ["Nothing."]
 
-    usage, runs, searches, fetches = Counter(), Counter(), Counter(), Counter()
+    usage, runs, searches, fetches, spent = Counter(), Counter(), Counter(), Counter(), Counter()
     for run in state.agent_runs:
         usage[run.role] += _tokens(run.run)
         runs[run.role] += 1
         searches[run.role] += run.run.web_searches
         fetches[run.role] += run.run.web_fetches
-    model_usage = [f"- {role.replace('_', ' ')}: {runs[role]} run{'s' if runs[role] > 1 else ''}, {usage[role]:,} tokens"
+        spent[run.role] += run.run.cost_usd or 0
+    model_usage = [f"- {role.replace('_', ' ')}: {runs[role]} run{'s' if runs[role] > 1 else ''}, "
+                   f"{dollars(spent[role])}, {usage[role]:,} tokens"
                    + (f", {searches[role]} web searches, {fetches[role]} pages fetched"
                       if searches[role] or fetches[role] else "") for role in runs]
-    budget = state.model_token_budget
-    model_usage.append(f"- Total: {state.model_tokens_used:,} tokens" + (f" of a {budget:,} budget" if budget else ""))
-    model_usage += [f"- {_budget_change(b.max_tokens)} by the researcher's {b.intervention_id} (event #{b.recorded_at})"
+    budget = state.budget_usd
+    model_usage.append(f"- Total: {dollars(state.model_cost)}" + (f" of a {dollars(budget)} budget" if budget else "")
+                       + f", {state.model_tokens_used:,} tokens"
+                       + (f"; {state.unpriced_runs} runs of models with unknown prices are not counted"
+                          if state.unpriced_runs else ""))
+    model_usage += [f"- {_budget_change(b.max_usd)} by the researcher's {b.intervention_id} (event #{b.recorded_at})"
                     for b in state.budget_changes]
 
-    agents = ["Each hypothesis has at most one agent at a time; agents see only their own hypothesis's work.", "",
-              "| Agent | Hypothesis | Role | Started | Status | Runs | Tokens |", "|---|---|---|---|---|---|---|"]
+    agents = ["Each hypothesis has at most one agent at a time; each agent records only for its own hypothesis and "
+              "can read the others' work.", "",
+              "| Agent | Hypothesis | Role | Started | Status | Runs | Spent |", "|---|---|---|---|---|---|---|"]
     for agent in state.agents.values():
         mine = [r for r in state.agent_runs if r.actor_id == agent.agent_id]
         started = (f"approver ({agent.authorization_id})" if agent.started_by.kind is ActorKind.APPROVER else
                    agent.authorization_id or "review window passed")
         status = "active" if agent.active else f"retired: {_short(agent.retire_reason or '', 80)}"
-        limit = f" of {agent.spec.token_budget:,}" if agent.spec.token_budget else ""
-        agents.append(f"| {agent.agent_id} | {ROOT.hyp(agent.hypothesis_id)} | {_cell(agent.spec.role)} | {started} | "
-                      f"{_cell(status)} | {len(mine)} | {state.agent_tokens_used(agent.agent_id):,}{limit} |")
+        limit = f" of {dollars(agent.spec.budget_usd)}" if agent.spec.budget_usd else ""
+        agents.append(f"| {agent.tag} {agent.agent_id} | {ROOT.hyp(agent.hypothesis_id)} | {_cell(agent.spec.role)} | "
+                      f"{started} | {_cell(status)} | {len(mine)} | {dollars(state.agent_cost(agent.agent_id))}{limit} |")
     if not state.agents:
         agents = ["None started yet."]
     if state.proposals:
@@ -1031,12 +1056,14 @@ def _describe(event: RecordedEvent) -> str:
         case WorkbenchRunRecorded():
             return (f"{p.run_id} for {p.hypothesis_id}: {_code(_short(p.run.command, 120))} "
                     f"{p.run.outcome.value} on {p.run.host}")
-        case TokenBudgetChanged():
-            return f"{_budget_change(p.max_tokens)} ({p.intervention_id})"
+        case BudgetChanged():
+            return f"{_budget_change(p.max_usd)} ({p.intervention_id})"
         case MaterialAttached():
             return f"{p.material_id} attached ({p.intervention_id}): {_said(p.name)}"
         case ApproverDecision():
             return f"{p.decision_id}: the approver {_decided(p)}: {_said(p.reason)}"
+        case SynthesisRecorded():
+            return f"{p.synthesis_id}: {len(p.hypotheses)} hypotheses compared: {_said(p.summary)}"
         case NextActionsRecommended():
             taken = ", ".join(p.chosen) or "none for now"
             return (f"{p.recommendation_id}: {len(p.candidates)} next steps compared; taking {taken}: "

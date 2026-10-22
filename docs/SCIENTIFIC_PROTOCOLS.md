@@ -63,9 +63,11 @@ Findings are `ERROR` (reject), `REVIEW` (needs user approval), `WARNING` or `INF
 
 **Job script:** examined against the approved compute profile. The requested walltime and core-hours must also fit the task budget. A task's `budget.cores`, if given, sets the task count of a generated script.
 
-**Local script** (0.2, `execution: local`): `local.sh` is the approved job template without its `#SBATCH` lines, with one `#CEDAR --ntasks=N --time=T` line stating what it may use; the protocol generates it with the allocation's cores here (or the task's, if fewer) and the profile's default walltime, ending at least five minutes before the allocation does. Its commands are examined like a job script's. `#SBATCH` lines in it are an `ERROR`; so is a task count beyond the allocation's cores on this node, a time limit past the allocation's end, a `job.sh` given for a local run (or `local.sh` for a Slurm one), and any local request while CEDAR runs on a login node: "DFT cannot run locally on login nodes". Under 0.1, a local request is an `ERROR`.
+**Local script** (0.2, `execution: local`): `local.sh` is the approved job template without its `#SBATCH` lines, with one `#CEDAR --ntasks=N --time=T` line stating what it may use; the protocol generates it with the cores local DFT may use here (the allocation's on this node less 4, which stay for the agents' workbench commands, or the task's, if fewer) and the profile's default walltime, ending at least five minutes before the allocation does. Its commands are examined like a job script's. `#SBATCH` lines in it are an `ERROR`; so is a task count beyond the cores local DFT may use on this node (an allocation of 4 cores or fewer leaves none), a time limit past the allocation's end, a `job.sh` given for a local run (or `local.sh` for a Slurm one), and any local request while CEDAR runs on a login node: "DFT cannot run locally on login nodes". Under 0.1, a local request is an `ERROR`.
 
-**Duplicates:** inputs identical to a reusable calculation's are an `ERROR`; the agent should link that calculation instead.
+**Duplicates:** inputs identical to a reusable calculation's, any hypothesis's, are an `ERROR`; the agent should link that calculation instead.
+
+**Requested resources:** the examination records what the job script asks for (partition, tasks, walltime, core-hours), which `/pending` shows the researcher.
 
 ### Run checks
 
@@ -91,7 +93,7 @@ A run computed outside CEDAR can be registered from its directory ([`WORKBENCH.m
 
 ### Evidence from a run
 
-Every result taken from the run, a cited reading or an analysis result, gets its quality from the run check:
+Every result taken from the run, a cited reading or an analysis result, gets its quality from the run check. Whether it can support a hypothesis is a separate matter: only if a prediction of that hypothesis named the run before it was submitted.
 
 - every check passed and the job `COMPLETED`: `VALIDATED`, meaning the value at the declared settings from a healthy run
 - a check failed: `INVALID`, or `INCONCLUSIVE` if only `geometry_converged` failed
@@ -102,5 +104,5 @@ A reading must also have every quote found at its lines of the stored output (`c
 
 - Numerical convergence of the quantities taken from a run, and of differences between runs, with respect to k-points, basis, slab thickness and vacuum is not established by a single calculation. It needs a declared convergence comparison.
 - A species block modified by an agent can run only after user review. The examiner does not judge basis quality.
-- A registered run's inputs were not examined before it ran; the settings recorded for it are read from its files, and nothing checks that they produced its output.
+- A registered run's inputs were not examined before it ran; the settings recorded for it are read from its files, and nothing checks that they produced its output. Its outputs existed before any prediction, so its evidence can challenge a hypothesis, not support it.
 - Keyword meanings cover the keywords listed above. Anything else needs review rather than being guessed.

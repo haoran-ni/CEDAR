@@ -9,10 +9,12 @@ from cedar.contracts.base import canonical_json
 from cedar.contracts.examination import ExaminationVerdict, FindingSeverity
 from cedar.contracts.plan import PermissionAction
 from cedar.contracts.status import CalculationState
+from cedar.models.prices import dollars
 from cedar.state.projection import (
     CalculationRecord,
     InvestigationState,
     RecommendationRecord,
+    SynthesisRecord,
     authorization_for,
     evidence_owner,
 )
@@ -20,9 +22,9 @@ from cedar.swarm import agent_label, proposal_note
 from cedar.web import web_summary
 
 
-def calculation_summary(state: InvestigationState, calc: CalculationRecord, *, findings: bool = True,
-                        viewer: str | None = None) -> str:
-    """One calculation; ``viewer`` is the hypothesis whose agent reads it, which then sees only its own work."""
+def calculation_summary(state: InvestigationState, calc: CalculationRecord, *, findings: bool = True) -> str:
+    """One calculation: its state, what it is for, what every hypothesis predicted for it, and its evidence with
+    whose it is. Every agent sees all of it."""
     if calc.registered:
         registration = calc.registration
         owner = "shared with every agent" if calc.shared else f"for {registration.hypothesis_id}"
@@ -38,9 +40,8 @@ def calculation_summary(state: InvestigationState, calc: CalculationRecord, *, f
         if calc.scheduler_job_id:
             job_state = calc.scheduler_state.value if calc.scheduler_state else "submitted"
             head += f"; job {calc.scheduler_job_id} {job_state}"
-        used_by = "" if viewer is not None else f"; for {', '.join(calc.hypothesis_ids)}"
         lines = [head, f"  {calc.task.observable.name} via {calc.task.protocol.name} {calc.task.protocol.version}; "
-                       f"estimand: {calc.task.estimand}{used_by}"]
+                       f"estimand: {calc.task.estimand}; for {', '.join(calc.hypothesis_ids)}"]
     if findings and calc.examination is not None:
         for f in calc.examination.findings:
             if f.severity is not FindingSeverity.INFO or f.code == "generated":
@@ -52,19 +53,19 @@ def calculation_summary(state: InvestigationState, calc: CalculationRecord, *, f
                                         "FAILED " + "; ".join(f"{c.name} ({c.detail or 'no detail'})" for c in failed)))
         lines += [f"  protocol read {r.name} = {r.value.value!r} {r.value.unit} at {r.file} line {r.line_start}: "
                   f"{r.quote}" for r in calc.run_check.readings]
-    if viewer is None:  # what every hypothesis expects of this run, side by side; agents see only their own
-        lines += [f"  predicted by {r.hypothesis_id} ({r.prediction_id}): {r.prediction.expected_outcome}; falsified "
-                  f"if {r.prediction.falsified_if}" for r in state.predictions.values()
-                  if calc.calculation_id in r.prediction.calculation_ids]
+    # What every hypothesis expects of this run, side by side.
+    lines += [f"  predicted by {r.hypothesis_id} ({r.prediction_id}): {r.prediction.expected_outcome}; falsified "
+              f"if {r.prediction.falsified_if}" for r in state.predictions.values()
+              if calc.calculation_id in r.prediction.calculation_ids]
     for evidence_id in calc.evidence_ids:
         evidence = state.evidence[evidence_id].evidence
-        if viewer is not None and evidence_owner(state, evidence) not in (None, viewer):
-            continue  # another hypothesis's reading of a shared run
         value = f"{evidence.value.value!r} {evidence.value.unit}" if evidence.value else "no value"
         failed = [c.name for c in evidence.quality_checks if not c.passed]
         origin = f" (analysis {evidence.analysis_id})" if evidence.analysis_id else ""
-        lines.append(f"  evidence {evidence_id}{origin}: {evidence.quality.value}, {evidence.observable.name} = "
-                     f"{value}" + (f"; failed checks: {', '.join(failed)}" if failed else ""))
+        owner = evidence_owner(state, evidence)
+        lines.append(f"  evidence {evidence_id}{origin}" + (f" for {owner}" if owner else "")
+                     + f": {evidence.quality.value}, {evidence.observable.name} = {value}"
+                     + (f"; failed checks: {', '.join(failed)}" if failed else ""))
     return "\n".join(lines)
 
 
@@ -87,6 +88,25 @@ def recommendation_text(record: RecommendationRecord, *, brief: bool = False) ->
     return "\n".join(lines)
 
 
+def synthesis_text(state: InvestigationState, record: SynthesisRecord) -> str:
+    """The Chief Scientist's comparison across hypotheses, with the values of the evidence it cites."""
+    p = record.synthesis
+    lines = [f"Comparison across hypotheses ({p.synthesis_id}, round {record.round}): {p.summary}"]
+    for h in p.hypotheses:
+        lines.append(f"- {h.hypothesis_id}: {h.standing}" + (f" Accounts for: {h.accounts_for}" if h.accounts_for
+                                                              else ""))
+        for evidence_id in h.evidence_ids:
+            ev = state.evidence[evidence_id].evidence
+            value = f"{ev.value.value!r} {ev.value.unit}" if ev.value else "no value"
+            lines.append(f"  {evidence_id}: {ev.observable.name} = {value} ({ev.quality.value})")
+    lines += [f"- Interaction: {text}" for text in p.interactions]
+    lines.append(f"- Unexplained: {p.residual}")
+    lines += [f"- Cannot be separated: {text}" for text in p.not_separable]
+    if p.new_hypotheses:
+        lines.append(f"- New hypotheses from this comparison: {', '.join(p.new_hypotheses)}")
+    return "\n".join(lines)
+
+
 def task_owner(task) -> str:
     """Who a queued task is for, in words."""
     if task.role == "chief_scientist":
@@ -94,6 +114,38 @@ def task_owner(task) -> str:
     if task.role == "evidence_judge":
         return f"Evidence Judge on {task.hypothesis_id}"
     return f"{task.agent_id} on {task.hypothesis_id}"
+
+
+def awaiting_submission(state: InvestigationState) -> list[str]:
+    """Calculations whose examined inputs wait for the researcher's authorization to be submitted."""
+    if not state.spec.constraints.submit_requires_approval:
+        return []
+    return [c.calculation_id for c in state.calculations.values() if c.state is CalculationState.VALIDATED_INPUT
+            and authorization_for(state, PermissionAction.SUBMIT, c.calculation_id) is None]
+
+
+def requested_by(state: InvestigationState, calc: CalculationRecord) -> str:
+    """The agent that asked for a calculation, by its short name and id, with its hypothesis."""
+    hypothesis_id = calc.hypothesis_ids[0] if calc.hypothesis_ids else None
+    agents = [a for a in state.agents.values() if a.hypothesis_id == hypothesis_id]
+    agent = next((a for a in agents if a.active), agents[-1] if agents else None)
+    return f"{agent.tag} {agent.agent_id} on {hypothesis_id}" if agent else (hypothesis_id or "no hypothesis")
+
+
+def submission_note(state: InvestigationState, calc: CalculationRecord) -> str:
+    """What the researcher needs to decide on a submission: who asks, for what, where it runs and what it costs."""
+    exam = calc.examination
+    where = ("locally, on the interactive node" if calc.task.execution == "local"
+             else f"through Slurm, partition {exam.partition}" if exam.partition else "through Slurm")
+    size = (f"{exam.requested_tasks} tasks × {exam.requested_minutes} min = {exam.requested_core_hours:g} core-hours"
+            if exam.requested_tasks and exam.requested_minutes and exam.requested_core_hours is not None
+            else "size not known")
+    warnings = [f.code for f in exam.findings if f.severity is FindingSeverity.WARNING]
+    parts = [requested_by(state, calc), f"{calc.task.system_label}: {calc.task.estimand}", where, size,
+             f"warnings: {', '.join(warnings)}" if warnings else "no warnings",
+             f"examined inputs ({', '.join(sorted(exam.files))}) in the run directory {calc.workdir}"
+             if calc.workdir else f"examined inputs: {', '.join(sorted(exam.files))}"]
+    return "; ".join(parts)
 
 
 def approval_requests(state: InvestigationState) -> list[tuple[str, str]]:
@@ -110,15 +162,25 @@ def approval_requests(state: InvestigationState) -> list[tuple[str, str]]:
                 and authorization_for(state, PermissionAction.APPROVE_INPUTS, calc.calculation_id) is None):
             reasons = "; ".join(f.message for f in calc.examination.findings if f.severity is FindingSeverity.REVIEW)
             needs.append((f"/approve inputs {calc.calculation_id}", f"needs review: {reasons}"))
-        if (calc.state is CalculationState.VALIDATED_INPUT and state.spec.constraints.submit_requires_approval
-                and calc.calculation_id not in for_approver
-                and authorization_for(state, PermissionAction.SUBMIT, calc.calculation_id) is None):
-            needs.append((f"/approve submit {calc.calculation_id}", f"{calc.task.system_label}: {calc.task.estimand}"))
+        if calc.calculation_id in awaiting_submission(state) and calc.calculation_id not in for_approver:
+            needs.append((f"/approve submit {calc.calculation_id}", submission_note(state, calc)))
     closing = state.pending_closing
     if closing is not None:
         needs.append(("/approve close", f"the Chief Scientist proposes closing the investigation as "
                                         f"{closing.status.value} ({closing.closing_id}): {closing.reason}"))
     return needs
+
+
+def agent_requests(state: InvestigationState) -> list[str]:
+    """What the active agents asked of the researcher in their latest reports."""
+    found = []
+    for agent in state.agents.values():
+        runs = [r for r in state.agent_runs if r.actor_id == agent.agent_id] if agent.active else []
+        report = runs[-1].run.structured if runs else None
+        if report is not None:
+            found += [f"{agent.tag} ({agent.agent_id}) on {agent.hypothesis_id} asks: {r.text}" for r in report.requests
+                      if r.to == "researcher"]
+    return found
 
 
 def pending_approvals(state: InvestigationState) -> list[str]:
@@ -159,6 +221,9 @@ def investigation_summary(state: InvestigationState) -> str:
         lines.append("Calculations:")
         lines += ["  " + line for c in state.calculations.values()
                   for line in calculation_summary(state, c, findings=False).splitlines()]
+    if state.syntheses:
+        latest = list(state.syntheses.values())[-1]
+        lines += ["Latest comparison across hypotheses:", "  " + synthesis_text(state, latest).replace("\n", "\n  ")]
     if state.recommendations:
         latest = list(state.recommendations.values())[-1]
         lines += ["Latest recommendation:", "  " + recommendation_text(latest, brief=True).replace("\n", "\n  ")]
@@ -172,6 +237,13 @@ def investigation_summary(state: InvestigationState) -> str:
     if approvals:
         lines.append("Waiting for the researcher:")
         lines += [f"  {a}" for a in approvals]
-    budget = state.model_token_budget
-    lines.append(f"Model tokens used: {state.model_tokens_used}" + (f" of {budget}" if budget else ""))
+    requests = agent_requests(state)
+    if requests:
+        lines.append("Requests from agents to the researcher (pass them on):")
+        lines += [f"  {r}" for r in requests]
+    budget = state.budget_usd
+    lines.append(f"Spent on models: {dollars(state.model_cost)}" + (f" of the {dollars(budget)} budget, "
+                                                                   f"{dollars(state.budget_left)} left"
+                                                                   if budget is not None else " (no budget)")
+                 + f"; {state.model_tokens_used:,} tokens")
     return "\n".join(lines)

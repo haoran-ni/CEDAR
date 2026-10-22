@@ -9,10 +9,13 @@ from cedar.agents import AgentRunner, AgentTool, RunLimits, ToolFailure, ToolOut
 from cedar.agents.tools import plain_schema
 from cedar.contracts.base import Contract
 from cedar.agents.runtime import MAX_PAUSED_CONTINUATIONS
-from cedar.models import MediaPart, ModelError, ModelSettings, TextPart, ToolCall, ToolResult, Usage, WebAccess
+from cedar.models import (MediaPart, ModelError, ModelPrices, ModelSettings, TextPart, ToolCall, ToolResult, Usage,
+                          WebAccess)
 from cedar.models.scripted import ScriptedModel, reply
 
-SETTINGS = ModelSettings(provider="scripted", model="scripted-model")
+PRICES = ModelPrices(input=1.0, output=5.0, cache_read=0.1, cache_write=1.25)
+"""TEST DOUBLE prices, dollars per million tokens."""
+SETTINGS = ModelSettings(provider="scripted", model="scripted-model", prices=PRICES)
 KEY = "sk-ant-test-0123456789abcdefghij"
 
 
@@ -52,9 +55,10 @@ def transcripts(tmp_path):
     return TranscriptStore(tmp_path / "transcripts")
 
 
-def run(transcripts, script, log=None, limits=RunLimits(), secrets=(), session="s1", instruction="Do it."):
+def run(transcripts, script, log=None, limits=RunLimits(), secrets=(), session="s1", instruction="Do it.",
+        settings=SETTINGS):
     model = ScriptedModel(list(script))
-    runner = AgentRunner(model, SETTINGS, transcripts, secrets=secrets)
+    runner = AgentRunner(model, settings, transcripts, secrets=secrets)
     result = runner.run(session, system="system prompt", tools=tools(log if log is not None else []),
                         instruction=instruction, limits=limits)
     return result, model
@@ -145,7 +149,9 @@ def test_waiting_tool_ends_the_run(transcripts):
 def test_limits(transcripts):
     looping = [reply(call("echo", text="again")) for _ in range(5)]
     assert run(transcripts, looping, limits=RunLimits(max_turns=3))[0].outcome == "turn_limit"
-    assert run(transcripts, looping, limits=RunLimits(max_tokens=20), session="s2")[0].outcome == "token_limit"
+    # Each scripted reply costs 10 input and 5 output tokens: $0.000035.
+    spent = run(transcripts, looping, limits=RunLimits(max_cost_usd=0.00006), session="s2")[0]
+    assert spent.outcome == "budget_limit" and spent.turns == 2 and spent.cost_usd == pytest.approx(0.00007)
 
 
 def test_transcripts_are_resumed_and_only_appended(transcripts):
@@ -175,12 +181,33 @@ def test_schemas_are_inlined_and_keep_title_properties():
     assert schema["properties"]["items"]["items"]["properties"]["title"] == {"type": "string"}
 
 
-def test_cached_input_counts_toward_the_token_limit(transcripts):
+def test_each_kind_of_token_costs_its_own_price(transcripts):
     from cedar.models import Usage
 
-    cached = reply(call("echo", text="x")).model_copy(update={"usage": Usage(input_tokens=1, cache_read_tokens=50)})
-    result, _ = run(transcripts, [cached, reply(TextPart(text="ok"))], limits=RunLimits(max_tokens=40))
-    assert result.outcome == "token_limit" and result.usage.total == 51
+    usage = Usage(input_tokens=1_000, output_tokens=2_000, cache_read_tokens=500_000, cache_write_tokens=4_000,
+                  web_searches=3)
+    priced = ModelPrices(input=4.0, output=20.0, cache_read=0.2, cache_write=5.0, web_search=0.01)
+    assert priced.cost(usage) == pytest.approx(0.004 + 0.04 + 0.1 + 0.02 + 0.03)
+    cached = reply(call("echo", text="x")).model_copy(update={"usage": usage})
+    result, _ = run(transcripts, [cached, reply(TextPart(text="ok"))], limits=RunLimits(max_cost_usd=0.1),
+                    settings=SETTINGS.model_copy(update={"prices": priced}))
+    assert result.outcome == "budget_limit" and result.cost_usd == pytest.approx(0.194)
+
+
+def test_a_model_without_known_prices_does_not_run_under_a_budget(transcripts):
+    unpriced = SETTINGS.model_copy(update={"prices": None})
+    result, model = run(transcripts, [reply(TextPart(text="never"))], limits=RunLimits(max_cost_usd=1.0),
+                        settings=unpriced)
+    assert result.outcome == "budget_limit" and "prices of scripted scripted-model are not known" in result.error
+    assert model.calls == []
+    free, _ = run(transcripts, [reply(TextPart(text="ok"))], settings=unpriced, session="s2")
+    assert free.outcome == "finished" and free.cost_usd is None
+
+
+def test_published_prices_are_known_for_the_current_claude_models():
+    from cedar.models.prices import prices_for
+    assert prices_for(ModelSettings(provider="anthropic", model="claude-opus-5-5")).cache_read == 0.2
+    assert prices_for(ModelSettings(provider="anthropic", model="claude-opus-9")) is None
 
 
 def test_a_run_stops_before_its_next_model_call_when_asked(transcripts):

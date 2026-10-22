@@ -16,6 +16,9 @@ from cedar.contracts.base import (
 )
 from cedar.contracts.task import ProtocolRef, ResourceBudget
 
+DEFAULT_BUDGET_USD = 15.0
+"""What an investigation's agents may spend on models, in dollars, unless the researcher sets another budget."""
+
 
 class SimulationProvenance(Contract):
     label: NonEmptyStr
@@ -107,9 +110,9 @@ class InvestigationConstraints(Contract):
     """With ``curated_only``: the domains agents may search and fetch from."""
     submit_requires_approval: bool = True
     """Cancelling a submitted job always requires user authorization, independent of this."""
-    model_token_budget: int | None = Field(default=None, gt=0)
-    """Tokens the investigation's agents may process in total (input, cached input and output) when it opens;
-    none unless set. The researcher changes it with ``token_budget_changed``."""
+    budget_usd: float | None = Field(default=DEFAULT_BUDGET_USD, gt=0)
+    """Dollars the investigation's agents may spend on models in total when it opens, the Chief Scientist's answers
+    in the chat included; None for no limit. The researcher changes it with ``budget_changed``."""
     agent_review_minutes: int = Field(default=10, ge=0)
     """How long proposed hypothesis agents wait for the researcher's reply before they start."""
 

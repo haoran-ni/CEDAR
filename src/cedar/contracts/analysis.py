@@ -29,6 +29,16 @@ class AnalysisInput(Contract):
     """Files of the run, staged read-only for the script as ``inputs/<calculation_id>/<path>``."""
 
 
+class AnalysisData(Contract):
+    """A file from outside the calculations staged for a script, such as measured data the researcher attached."""
+
+    name: RelativePath
+    """Staged read-only as ``inputs/data/<name>``."""
+    artifact: ArtifactRef
+    origin: NonEmptyStr
+    """Where it came from: an attached material's id, or the path it was read from."""
+
+
 def _unique(checks: tuple[QualityCheck, ...], where: str) -> None:
     names = [c.name for c in checks]
     if len(set(names)) != len(names):
@@ -58,7 +68,9 @@ class AnalysisOutcome(StrEnum):
 class AnalysisRun(Contract):
     purpose: NonEmptyStr
     script: ArtifactRef
-    inputs: tuple[AnalysisInput, ...] = Field(min_length=1)
+    inputs: tuple[AnalysisInput, ...] = ()
+    data: tuple[AnalysisData, ...] = ()
+    """Files from outside the calculations it read."""
     environment: NonEmptyStr
     """Interpreter and scientific library versions the script ran with."""
     outcome: AnalysisOutcome
@@ -87,6 +99,11 @@ class AnalysisRun(Contract):
         calcs = [i.calculation_id for i in self.inputs]
         if len(set(calcs)) != len(calcs):
             raise ValueError("each calculation is staged once")
+        if not self.inputs and not self.data:
+            raise ValueError("an analysis reads the files of a calculation or other staged data")
+        names = [d.name for d in self.data]
+        if len(set(names)) != len(names):
+            raise ValueError("each data file is staged under its own name")
         return self
 
     @property

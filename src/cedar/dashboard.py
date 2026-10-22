@@ -20,6 +20,7 @@ from cedar.contracts.examination import ExaminationVerdict
 from cedar.contracts.plan import PermissionAction
 from cedar.contracts.status import CalculationState, HypothesisStatus, InvestigationMode
 from cedar.dispatch import Activity
+from cedar.models.prices import dollars
 from cedar.models.types import ModelSettings
 from cedar.automation import pending_decisions
 from cedar.contracts.events import HypothesisStatusChanged
@@ -156,6 +157,15 @@ def fit_tasks(rows: Sequence[AgentRow], width: int, headers: Sequence[str]) -> l
     return [_short(r.task, room) for r in rows]
 
 
+def tokens_text(count: int) -> str:
+    """A token count in a few characters: 950, 12k, 3.4M."""
+    if count < 1000:
+        return str(count)
+    if count < 1_000_000:
+        return f"{count / 1000:.0f}k"
+    return f"{count / 1_000_000:.1f}M"
+
+
 def agent_rows(state: InvestigationState | None, events: Sequence[RecordedEvent], activities: Sequence[Activity],
                now: datetime, chief_since: datetime | None = None) -> list[AgentRow]:
     """Every agent of the investigation and what it is doing: the Chief Scientist, the hypothesis agents (working
@@ -209,7 +219,7 @@ def agent_rows(state: InvestigationState | None, events: Sequence[RecordedEvent]
             rows.append(AgentRow(f"proposed:{spec.hypothesis_id}", agent_id_for(state, spec.hypothesis_id),
                                  _short(spec.role, 32), f"proposed · {when}",
                                  ago(at(proposal.recorded_at)), _short(spec.brief, 70), spec.hypothesis_id))
-        rows += [AgentRow(a.agent_id, a.agent_id, _short(a.spec.role, 32), "retired",
+        rows += [AgentRow(a.agent_id, f"{a.tag} {a.agent_id}", _short(a.spec.role, 32), "retired",
                           ago(at(a.retired_at)), _short(a.retire_reason or "—", 70), a.hypothesis_id)
                  for a in state.agents.values() if not a.active]
 
@@ -257,6 +267,9 @@ def _hypothesis_agent_row(state: InvestigationState, agent: AgentRecord, mine: S
     hyp = state.hypotheses[agent.hypothesis_id]
     if working is not None:
         step = f" · step {working.last_step}" if working.last_step else ""
+        if working.calls:
+            spent = dollars(working.cost_usd) if working.cost_usd is not None else f"{tokens_text(working.tokens)} tokens"
+            step += f" · {working.calls} calls, {spent}"
         status = ("working", ago(working.started_at), task_label(state.tasks.get(working.task_id)) + step)
     elif queued:
         status = ("queued", ago(at(queued[0].queued_at)), task_label(queued[0]))
@@ -273,7 +286,7 @@ def _hypothesis_agent_row(state: InvestigationState, agent: AgentRecord, mine: S
             status = ("idle", ago(at(runs[-1].recorded_at)), f"last: {task_label(done)}")
         else:
             status = ("idle", ago(at(agent.started_at)), "not run yet")
-    return AgentRow(agent.agent_id, agent.agent_id, _short(agent.spec.role, 32), *status,
+    return AgentRow(agent.agent_id, f"{agent.tag} {agent.agent_id}", _short(agent.spec.role, 32), *status,
                     hypothesis_id=agent.hypothesis_id)
 
 
@@ -402,13 +415,13 @@ def mode_line(state: InvestigationState | None, web: RetrievalRecord | None = No
 
 
 def status_line(state: InvestigationState, now: datetime) -> str:
-    budget = state.model_token_budget
-    tokens = f"{state.model_tokens_used:,}" + (f" of {budget:,}" if budget else "")
+    budget = state.budget_usd
+    spent = dollars(state.model_cost) + (f" of {dollars(budget)}" if budget is not None else "") + " spent"
     waiting = len(approval_requests(state))
     agents = sum(a.active for a in state.agents.values())
     automation = state.automation
     parts = [state.investigation_id, state.status.value, "setup" if state.round == 0 else f"round {state.round}",
-             f"plan v{state.plan_version}", f"{agents} agent{'' if agents == 1 else 's'}", f"{tokens} tokens"]
+             f"plan v{state.plan_version}", f"{agents} agent{'' if agents == 1 else 's'}", spent]
     proposal = state.pending_proposal
     if proposal is not None:
         n = len(proposal.agents)

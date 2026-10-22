@@ -14,7 +14,7 @@ from test_swarm import INV, investigation, says
 from worlds import World
 
 from cedar.agents.toolkits import ResearchContext, file_tools, research_tools
-from cedar.agents.toolkits.research import agent_file_access
+from cedar.agents.toolkits import agent_access
 from cedar.codes.fhiaims.control import render_control
 from cedar.contracts import (
     CalculationState,
@@ -83,8 +83,7 @@ def researcher_registers(world, directory, note="the researcher's PBE atop run",
 
 
 def agent_tools(world, hypothesis, tmp_path):
-    files = agent_file_access(world.ledger, world.inv, hypothesis, world.runs, data_dir=tmp_path / "data",
-                              workspace=tmp_path / "data" / "workspaces" / hypothesis, deny=[tmp_path / "config"])
+    files = agent_access(deny=[tmp_path / "config"])
     (tmp_path / "data" / "workspaces" / hypothesis).mkdir(parents=True, exist_ok=True)
     registrar = RunRegistrar(world.ledger, world.artifacts, profile=world.site,
                              readable=lambda path: files.resolve(str(path)))
@@ -258,7 +257,7 @@ def test_a_registered_run_cannot_be_predicted(world, tmp_path):
                                                     "description": "my own copy"})
     own = next(c for c in world.state().calculations if c != calc_id)
     assert not outcome.is_error and world.calc(own).hypothesis_ids == [world.hyp]
-    with pytest.raises(RuleViolation, match="already ended"):
+    with pytest.raises(RuleViolation, match="a prediction names calculations before they are submitted"):
         world.ledger.record(world.inv, [draft(agent_for(world.hyp), PredictionRegistered(
             prediction_id="p-late", hypothesis_id=world.hyp, prediction=Prediction(
                 statement="s", observable=Observable(name="e", definition="e"), expected_outcome="x",
@@ -267,7 +266,7 @@ def test_a_registered_run_cannot_be_predicted(world, tmp_path):
 
 # -- who sees what ---------------------------------------------------------------------------------
 
-def test_an_agent_registers_runs_for_its_own_hypothesis_only(world, tmp_path):
+def test_an_agent_registers_runs_for_its_own_hypothesis_and_every_agent_may_use_them(world, tmp_path):
     other = add_hypothesis(world.ledger, world.inv, "hyp-b")
     directory = run_directory(tmp_path / "mine", world.site)
     mine, theirs = agent_tools(world, world.hyp, tmp_path), agent_tools(world, other, tmp_path)
@@ -275,12 +274,12 @@ def test_an_agent_registers_runs_for_its_own_hypothesis_only(world, tmp_path):
     assert not outcome.is_error, outcome.content
     calc_id = next(iter(world.state().calculations))
     assert world.calc(calc_id).hypothesis_ids == [world.hyp] and not world.calc(calc_id).shared
-    for name, arguments in (("run_outputs", {"calculation_id": calc_id}),
-                            ("submit_reading", reading(calc_id, aims_output(energy=ENERGY)))):
-        refused = theirs[name].invoke(arguments)
-        assert refused.is_error and "not one of your hypothesis's calculations" in refused.content
     assert calc_id not in theirs["investigation_overview"].invoke({}).content
     assert calc_id in mine["investigation_overview"].invoke({}).content
+    assert calc_id in theirs["other_agents"].invoke({}).content
+    assert not theirs["run_outputs"].invoke({"calculation_id": calc_id}).is_error
+    assert "VALIDATED" in theirs["submit_reading"].invoke(reading(calc_id, aims_output(energy=ENERGY))).content
+    assert len(hypothesis_evidence(world.state(), other)) == 1 and hypothesis_evidence(world.state(), world.hyp) == []
     # Nothing in CEDAR's own records, or in secrets, can be registered.
     config = tmp_path / "config"
     run_directory(config / "run", world.site)
@@ -296,7 +295,7 @@ def test_shared_runs_serve_every_agent_without_sharing_readings(world, tmp_path)
     (b_reading,) = world.state().evidence
     overview_a = tools_a["investigation_overview"].invoke({}).content
     assert "Registered runs shared with every agent" in overview_a and calc_id in overview_a
-    assert b_reading not in overview_a and b_reading in tools_b["investigation_overview"].invoke({}).content
+    assert f"{b_reading} for {other}" in overview_a  # seen by every agent, but B's
     assert "VALIDATED" in tools_a["submit_reading"].invoke(reading(calc_id, aims_output(energy=ENERGY))).content
     state = world.state()
     assert [r.evidence_id for r in hypothesis_evidence(state, other)] == [b_reading]

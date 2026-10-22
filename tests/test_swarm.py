@@ -29,9 +29,8 @@ from test_orchestration import HARTREE_SCRIPT, make_system
 from worlds import World
 
 from cedar.agents import RunLimits
-from cedar.agents.toolkits import ResearchContext, file_tools, research_tools
+from cedar.agents.toolkits import ResearchContext, agent_access, file_tools, research_tools
 from cedar.agents.toolkits.chief import ChiefContext, chief_tools
-from cedar.agents.toolkits.research import agent_file_access
 from cedar.chat import ChatSession
 from cedar.contracts import (
     Actor,
@@ -63,7 +62,7 @@ from cedar.errors import RuleViolation
 from cedar.models import TextPart, ToolCall
 from cedar.models.scripted import ScriptedModel, reply
 from cedar.notebook import render_notebook, round_file
-from cedar.state.projection import ProposalStatus
+from cedar.state.projection import ProposalStatus, hypothesis_evidence
 from cedar.summaries import calculation_summary
 from cedar.swarm import CHIEF, REVIEW_INSTRUCTION, review_due, review_material, start_drafts
 
@@ -92,7 +91,7 @@ class ByAgent:
         self.order: list[str] = []
 
     def complete(self, *, system, messages, tools, settings, web=None):
-        agent = next(a for a in self.models if f"you are {a}," in system)
+        agent = next(a for a in self.models if f"({a})," in system)
         with self.lock:
             self.busy[agent] += 1
             self.peak[agent] = max(self.peak[agent], self.busy[agent])
@@ -111,7 +110,7 @@ def investigation(system, *hypotheses, budget=None, profile=True) -> ChatSession
     chat."""
     ledger = system["workspace"].ledger
     start_investigation(ledger, INV, compute_profile=system["site"].name if profile else None,
-                        model_token_budget=budget)
+                        **({"budget_usd": budget} if budget is not None else {}))
     for hypothesis in hypotheses:
         add_hypothesis(ledger, INV, hypothesis, agent=False)
     return ChatSession(system["workspace"], system["profiles"], system["clients"], investigation_id=INV,
@@ -175,7 +174,7 @@ def test_proposed_agents_start_after_the_review_window_unless_the_researcher_rep
     assert state.tasks[run.run.task_id].instruction == "Your first task, from the Chief Scientist: test hyp-a"
 
     pages = render_notebook(system["workspace"].store.read_stream(INV))
-    assert ("| agent-hyp-a | [hyp-a](hypotheses/hyp-a.md) | hyp-a specialist | review window passed | active | 1 |"
+    assert ("| A1 agent-hyp-a | [hyp-a](hypotheses/hyp-a.md) | hyp-a specialist | review window passed | active | 1 |"
             in pages["index.md"])
     assert "- p-1 (event #" in pages["index.md"] and "replaced by a later proposal; researcher replied: msg-1" \
         in pages["index.md"]
@@ -191,10 +190,10 @@ def test_the_researcher_can_start_proposed_agents_at_once(system):
     ledger = system["workspace"].ledger
     chat = investigation(system, "hyp-a", "hyp-b")
     assert chat.handle("/approve agents") == "No agents are waiting to start."
-    propose(ledger, "p-1", "hyp-a", "hyp-b", token_budget=5000)
+    propose(ledger, "p-1", "hyp-a", "hyp-b", budget_usd=2.5)
     agents = chat.handle("/agents")
     assert "Proposed by the Chief Scientist (p-1), starts at" in agents and "unless the researcher replies" in agents
-    assert "  - hyp-a: hyp-a specialist (5,000 tokens)\n    first task: test hyp-a" in agents
+    assert "  - hyp-a: hyp-a specialist (budget $2.50)\n    first task: test hyp-a" in agents
     assert any(n.text.startswith("[waiting for you] /approve agents") for n in chat.notices())
 
     # Only the researcher's own command starts agents early.
@@ -206,7 +205,7 @@ def test_the_researcher_can_start_proposed_agents_at_once(system):
     assert {a.authorization_id for a in state.agents.values()} == {"msg-1"}
     assert {t.agent_id for t in state.pending_tasks} == {"agent-hyp-a", "agent-hyp-b"}
     assert state.pending_proposal is None and not state.proposals["p-1"].feedback_ids  # a command is not a reply
-    assert "Agents:\n  - agent-hyp-a (hyp-a specialist) on hyp-a; 0 tokens used of 5,000" in chat.handle("/agents")
+    assert "Agents:\n  - A1 agent-hyp-a (hyp-a specialist) on hyp-a; $0.00 spent of $2.50" in chat.handle("/agents")
 
 
 def test_each_hypothesis_has_at_most_one_agent(system):
@@ -242,7 +241,7 @@ def test_each_hypothesis_has_at_most_one_agent(system):
         propose(ledger, "p-5", "hyp-new")
 
 
-# -- agents cannot reach each other's work --------------------------------------------------------
+# -- agents record only for their own hypothesis -------------------------------------------------
 
 def test_an_agent_acts_only_on_its_own_hypothesis(ledger, store, artifacts, site):
     world = World(ledger, store, artifacts, site)
@@ -262,17 +261,18 @@ def test_an_agent_acts_only_on_its_own_hypothesis(ledger, store, artifacts, site
 
     world.checked(b_calc, output=aims_output(energy=ENERGY))
     validator = Actor(kind=ActorKind.VALIDATOR, id="validator")
-    with pytest.raises(RuleViolation, match="agent-hyp-xc reads only calculations linked to hyp-xc"):
-        ledger.record(world.inv, [draft(validator, EvidenceRecorded(evidence_id="ev-x", evidence=computed_evidence(
-            b_calc).model_copy(update={"interpreted_by": agent_a})))])
+    # A may read B's run for its own hypothesis; the reading is A's.
+    ledger.record(world.inv, [draft(validator, EvidenceRecorded(evidence_id="ev-x", evidence=computed_evidence(
+        b_calc).model_copy(update={"interpreted_by": agent_a})))])
+    assert [r.evidence_id for r in hypothesis_evidence(ledger.load(world.inv), a)] == ["ev-x"]
+    assert hypothesis_evidence(ledger.load(world.inv), b) == []
     ledger.record(world.inv, [draft(Actor(kind=ActorKind.ANALYSIS_RUNNER, id="analysis-runner"), AnalysisRecorded(
         analysis_id="an-b", hypothesis_id=b, run=analysis_run(b_calc, files=dict(world.calc(b_calc).run_check.outputs))))])
     with pytest.raises(RuleViolation, match="analysis an-b was not run for hyp-xc"):
         ledger.record(world.inv, [draft(validator, EvidenceRecorded(evidence_id="ev-y", evidence=analysis_evidence(
             "an-b", b_calc).model_copy(update={"interpreted_by": agent_a})))])
-    with pytest.raises(RuleViolation, match="an analysis uses only its own hypothesis's runs"):
-        ledger.record(world.inv, [draft(Actor(kind=ActorKind.ANALYSIS_RUNNER, id="analysis-runner"), AnalysisRecorded(
-            analysis_id="an-x", hypothesis_id=a, run=analysis_run(b_calc, files=dict(world.calc(b_calc).run_check.outputs))))])
+    ledger.record(world.inv, [draft(Actor(kind=ActorKind.ANALYSIS_RUNNER, id="analysis-runner"), AnalysisRecorded(
+        analysis_id="an-x", hypothesis_id=a, run=analysis_run(b_calc, files=dict(world.calc(b_calc).run_check.outputs))))])
     with pytest.raises(RuleViolation, match="no active agent agent-nobody"):
         ledger.record(world.inv, [draft(USER, AgentTaskQueued(task_id="t-x", role="hypothesis_agent", hypothesis_id=a,
                                                               agent_id="agent-nobody", instruction="x"))])
@@ -291,10 +291,10 @@ def test_an_agent_acts_only_on_its_own_hypothesis(ledger, store, artifacts, site
 
 
 def tools_for(world, hypothesis, actor, tmp_path):
-    access = agent_file_access(world.ledger, world.inv, hypothesis, world.runs, deny=[tmp_path / "config"])
+    access = agent_access(deny=[tmp_path / "config"])
     ctx = ResearchContext(ledger=world.ledger, investigation_id=world.inv, hypothesis_id=hypothesis, actor=actor,
                           registry=world.registry, artifacts=world.artifacts, engine=world.engine,
-                          validator=world.validator, files=access, analysis=world.analysis)
+                          validator=world.validator, files=access, analysis=world.analysis, runs_root=world.runs)
     return {tool.name: tool for tool in research_tools(ctx) + file_tools(access)}
 
 
@@ -307,46 +307,42 @@ def reading(calculation_id, output):
                                                   "quote": lines[line - 1].strip()}]}
 
 
-def test_agents_see_only_their_own_work(ledger, store, artifacts, site, tmp_path):
+def test_agents_see_and_use_each_others_work(ledger, store, artifacts, site, tmp_path):
     world = World(ledger, store, artifacts, site)
     a, b = world.hyp, add_hypothesis(ledger, world.inv, "hyp-b")
     tools_a = tools_for(world, a, agent_for(a), tmp_path)
     tools_b = tools_for(world, b, agent_for(b), tmp_path)
-    shared = ledger.request_calculation(world.inv, agent_for(b), b, world.task(), "b's baseline").calculation_id
+    theirs = ledger.request_calculation(world.inv, agent_for(b), b, world.task(), "b's baseline").calculation_id
     output = aims_output(energy=ENERGY)
-    world.checked(shared, output=output)
-    aims_out = str(world.runs / world.calc(shared).workdir / "aims.out")
+    world.checked(theirs, output=output)
+    directory = world.runs / world.calc(theirs).workdir
+    assert "Reading recorded as evidence" in tools_b["submit_reading"].invoke(reading(theirs, output)).content
+    (b_reading,) = world.state().evidence
 
-    # The other hypothesis's calculation is out of reach in every way.
-    for name, arguments in (("run_outputs", {"calculation_id": shared}), ("submit_reading", reading(shared, output)),
-                            ("run_analysis", {"purpose": "peek", "script": "print(1)",
-                                              "inputs": [{"calculation_id": shared}]})):
-        outcome = tools_a[name].invoke(arguments)
-        assert outcome.is_error and "is not one of your hypothesis's calculations" in outcome.content
-    outcome = tools_a["read_file"].invoke({"path": aims_out})
-    assert outcome.is_error and "not readable by agents" in outcome.content
-
-    # Its own agent reads it, computes from it and records both.
-    assert not tools_b["read_file"].invoke({"path": aims_out}).is_error
-    assert "Reading recorded as evidence" in tools_b["submit_reading"].invoke(reading(shared, output)).content
-    assert not tools_b["run_analysis"].invoke({"purpose": "energy in Hartree", "script": HARTREE_SCRIPT.format(
-        calc=shared), "inputs": [{"calculation_id": shared}]}).is_error
-    analysis = next(iter(world.state().analyses))
-    outcome = tools_a["record_result"].invoke({"analysis_id": analysis, "result_name": "total_energy_ha",
-                                               "observable_name": "e", "observable_definition": "e", "summary": "s"})
-    assert outcome.is_error and f"{analysis} is not one of your analyses" in outcome.content
-
-    # Asking for the identical calculation shares the run, but not what the other agent made of it.
-    assert ledger.request_calculation(world.inv, agent_for(a), a, world.task(), "reuse").reused
-    assert not tools_a["read_file"].invoke({"path": aims_out}).is_error
+    # A sees where B's run is and what B found, reads its files, and uses it for its own hypothesis.
+    team = tools_a["other_agents"].invoke({}).content
+    assert f"files in {directory}" in team and b_reading in team and "(yours)" in team
+    assert not tools_a["read_file"].invoke({"path": str(directory / "aims.out")}).is_error
+    assert theirs in tools_a["run_outputs"].invoke({"calculation_id": theirs}).content
+    assert "Reading recorded as evidence" in tools_a["submit_reading"].invoke(reading(theirs, output)).content
+    assert not tools_a["run_analysis"].invoke({"purpose": "energy in Hartree", "script": HARTREE_SCRIPT.format(
+        calc=theirs), "inputs": [{"calculation_id": theirs}]}).is_error
     state = world.state()
-    (b_reading,) = state.calculations[shared].evidence_ids
-    overview = tools_a["investigation_overview"].invoke({}).content
-    assert shared in overview and b_reading not in overview and "hyp-b" not in overview
-    assert b_reading in tools_b["investigation_overview"].invoke({}).content
-    assert b_reading in calculation_summary(state, state.calculations[shared])  # the Chief and the Judge see all
-    assert "Reading recorded as evidence" in tools_a["submit_reading"].invoke(reading(shared, output)).content
-    assert len(world.state().calculations[shared].evidence_ids) == 2
+    a_reading = next(e for e in state.evidence if e != b_reading)
+    assert [r.evidence_id for r in hypothesis_evidence(state, b)] == [b_reading]
+    assert [r.evidence_id for r in hypothesis_evidence(state, a)] == [a_reading]
+    assert f"{b_reading} for {b}" in calculation_summary(state, state.calculations[theirs])
+
+    # What A records is still only for A: B's analyses are B's to record.
+    tools_b["run_analysis"].invoke({"purpose": "energy in Hartree", "script": HARTREE_SCRIPT.format(calc=theirs),
+                                    "inputs": [{"calculation_id": theirs}]})
+    b_analysis = next(r.analysis_id for r in world.state().analyses.values() if r.hypothesis_id == b)
+    outcome = tools_a["record_result"].invoke({"analysis_id": b_analysis, "result_name": "total_energy_ha",
+                                               "observable_name": "e", "observable_definition": "e", "summary": "s"})
+    assert outcome.is_error and f"{b_analysis} is not one of your analyses" in outcome.content
+
+    # Asking for the identical calculation links the run instead of running it again.
+    assert ledger.request_calculation(world.inv, agent_for(a), a, world.task(), "reuse").reused
 
 
 # -- agents running at the same time ---------------------------------------------------------------
@@ -376,8 +372,9 @@ def test_agents_run_at_the_same_time_but_never_twice_at_once(system):
     assert router.peak_total == 2 and router.peak["agent-hyp-a"] == 1
     reports = [r.run.report for r in ledger.load(INV).agent_runs]
     assert sorted(reports) == ["A again.", "A first.", "B."]
-    sessions = {r.session_id for r in ledger.load(INV).agent_runs}
-    assert sessions == {f"{INV}.agent-hyp-a", f"{INV}.agent-hyp-b"}
+    runs = ledger.load(INV).agent_runs
+    assert {r.session_id for r in runs} == {f"{INV}.{r.actor_id}.{r.run.task_id}" for r in runs}  # one per task
+    assert len({r.session_id for r in runs}) == 3
 
 
 def test_job_polling_goes_on_while_agents_work(system):
@@ -422,31 +419,37 @@ def test_job_polling_goes_on_while_agents_work(system):
     assert not loop.is_alive() and any("ran t-slow" in n and "finished" in n for n in notes)
 
 
-def test_running_agents_set_their_tokens_aside(system):
+def test_running_agents_share_the_budget(system):
     ledger, clients = system["workspace"].ledger, system["clients"]
-    chat = investigation(system, "hyp-a", "hyp-b", budget=100)
+    chat = investigation(system, "hyp-a", "hyp-b", budget=0.05)
     dispatcher = Dispatcher(system["workspace"], system["profiles"], clients, backend=system["scheduler"],
-                            clock=system["clock"], chief_reviews=False,
-                            limits=RunLimits(max_turns=5, max_tokens=100))
+                            clock=system["clock"], chief_reviews=False)
     propose(ledger, "p-1", "hyp-a", "hyp-b")
     chat.handle("/approve agents")
-    agents_answer(system, **{"hyp-a": [says("A.")], "hyp-b": [says("B.")]})
-    dispatcher.tick()  # hyp-a's run sets aside all 100 tokens, so hyp-b waits
-    assert [r.actor_id for r in ledger.load(INV).agent_runs] == ["agent-hyp-a"]
-    dispatcher.tick()  # hyp-a used 15; hyp-b may use the remaining 85
-    assert [r.actor_id for r in ledger.load(INV).agent_runs] == ["agent-hyp-a", "agent-hyp-b"]
+    looking = [reply(ToolCall(id=f"c{n}", name="investigation_overview", arguments={})) for n in range(3)]
+    agents_answer(system, **{"hyp-a": [*looking, says("A.")], "hyp-b": [*looking, says("B.")]})
+    dispatcher.tick()  # both start: nothing is set aside; each checks what all have spent before every call
+    runs = ledger.load(INV).agent_runs
+    assert sorted(r.actor_id for r in runs) == ["agent-hyp-a", "agent-hyp-b"]
+    assert {r.run.outcome for r in runs} == {"budget_limit"}
+    # Each reply costs $0.035: together they overspend $0.05 by at most one call each.
+    assert ledger.load(INV).model_cost <= 0.05 + 2 * 0.035 + 1e-9
+    ledger.record(INV, [draft(CHIEF, AgentTaskQueued(task_id="t-more", role="hypothesis_agent", hypothesis_id="hyp-a",
+                                                     agent_id="agent-hyp-a", instruction="more"))])
+    assert f"{INV}: the budget is spent; queued agent work waits until the researcher raises it with /budget" in \
+        dispatcher.tick()
 
 
 def test_an_agent_stops_at_its_own_budget(system):
     ledger, dispatcher = system["workspace"].ledger, system["dispatcher"]
     chat = investigation(system, "hyp-a")
-    propose(ledger, "p-1", "hyp-a", token_budget=10)
+    propose(ledger, "p-1", "hyp-a", budget_usd=0.02)
     chat.handle("/approve agents")
     agents_answer(system, **{"hyp-a": [says("A.")]})
     dispatcher.tick()
     ledger.record(INV, [draft(CHIEF, AgentTaskQueued(task_id="t-more", role="hypothesis_agent", hypothesis_id="hyp-a",
                                                      agent_id="agent-hyp-a", instruction="more"))])
-    assert f"{INV}: agent-hyp-a has used its budget of 10 tokens; its queued work waits" in dispatcher.tick()
+    assert f"{INV}: agent-hyp-a has spent its budget of $0.020; its queued work waits" in dispatcher.tick()
     assert [t.task_id for t in ledger.load(INV).pending_tasks] == ["t-more"]
 
 
@@ -497,11 +500,11 @@ def test_the_chief_scientist_reviews_once_every_agent_has_reported(tmp_path, sit
     notes = dispatcher.tick()
     assert f"{INV}: queued the Chief Scientist's review of the agents' reports" in notes
     (review,) = [r for r in ledger.load(INV).agent_runs if r.role == "chief_scientist"]
-    assert review.session_id == f"{INV}.chief-review" and review.run.task_id is not None
+    assert review.session_id == f"{INV}.chief-review.{review.run.task_id}"
     instruction = clients.models["chief_scientist"].calls[0].messages[-1].text
-    assert "[agent-hyp-a (hyp-a specialist) on hyp-a; run finished]\nA found the hollow site" in instruction
-    assert "[agent-hyp-b (hyp-b specialist) on hyp-b; run finished]\nB found no coverage effect" in instruction
-    assert "background review" in instruction and "Agents never see each other's work" in instruction
+    assert "[A1 agent-hyp-a (hyp-a specialist) on hyp-a; run finished]\nA found the hollow site" in instruction
+    assert "[A2 agent-hyp-b (hyp-b specialist) on hyp-b; run finished]\nB found no coverage effect" in instruction
+    assert "background review" in instruction and "comparing across hypotheses" in instruction
     assert not any("review" in n for n in dispatcher.tick())  # nothing new came in
     assert not review_due(ledger.load(INV))
 
@@ -577,10 +580,11 @@ def test_a_review_can_start_another_round_that_builds_on_the_first(tmp_path, sit
                                       "an agent for C."), texts.index(next(t for t in texts if rec_id in t))
     assert review < recommended and "Taking: a1, a2." in texts[recommended]
 
-    dispatcher.tick()  # A's follow-up runs at once, in A's own conversation
-    follow_up = router.models["agent-hyp-a"].calls[-1].messages
-    assert follow_up[1].text == "A: the effect halves with method X but remains."
-    assert follow_up[-1].text.endswith("agent-hyp-b found confounder B1. Repeat your test controlling for it.")
+    dispatcher.tick()  # A's follow-up runs at once, in a new conversation briefed from the record
+    (follow_up,) = router.models["agent-hyp-a"].calls[-1].messages
+    assert "Your earlier reports, the latest last:" in follow_up.text
+    assert "A: the effect halves with method X but remains." in follow_up.text
+    assert follow_up.text.endswith("agent-hyp-b found confounder B1. Repeat your test controlling for it.")
     assert not any("review" in n for n in dispatcher.tick())  # not while C's agent waits to start
     assert not review_due(ledger.load(INV))
 
@@ -593,10 +597,11 @@ def test_a_review_can_start_another_round_that_builds_on_the_first(tmp_path, sit
     assert len([r for r in ledger.load(INV).agent_runs if r.role == "chief_scientist"]) == 2
     second = clients.models["chief_scientist"].calls[-1].messages
     material = second[-1].text
-    assert "[agent-hyp-a (hyp-a specialist) on hyp-a; run finished]\nA: with B1 controlled" in material
-    assert "[agent-hyp-c (C specialist) on hyp-c; run finished]\nC: tested C" in material
+    assert "[A1 agent-hyp-a (hyp-a specialist) on hyp-a; run finished]\nA: with B1 controlled" in material
+    assert "[A3 agent-hyp-c (C specialist) on hyp-c; run finished]\nC: tested C" in material
     assert "B: confounder B1" not in material and "the effect halves" not in material  # only what is new
-    assert any(m.text.startswith("Not resolved: an effect remains.") for m in second[:-1])  # its first review
+    assert len(second) == 1  # a new conversation, briefed with what its first review concluded
+    assert "What your latest background reviews concluded" in material and "Not resolved: an effect remains." in material
 
 
 def test_proposed_agents_hold_the_review_back_only_while_they_can_start(system):
@@ -682,14 +687,20 @@ def test_a_review_proposes_closing_and_only_the_researcher_closes(tmp_path, site
 
     message = "I propose closing the investigation as COMPLETED: A answered it. /approve close closes it."
     clients.add("chief_scientist", chief("c1", "set_investigation_status", status="REVIEWING", reason="A reported"),
-                chief("c2", "propose_closing", status="COMPLETED", reason="A answered the question."), says(message))
+                chief("c2", "propose_closing", status="COMPLETED", reason="A answered the question."),
+                chief("c3", "record_synthesis", summary="Only A was tested; it answers the question.",
+                      hypotheses=[{"hypothesis_id": "hyp-a", "standing": "answered by A's test"}],
+                      residual="nothing known remains"),
+                chief("c4", "propose_closing", status="COMPLETED", reason="A answered the question."), says(message))
     dispatcher.tick()
     state = ledger.load(INV)
     assert state.status is InvestigationStatus.REVIEWING
     closing = state.pending_closing
     assert (closing.status, closing.reason) == (InvestigationStatus.COMPLETED, "A answered the question.")
     (review,) = [r for r in state.agent_runs if r.role == "chief_scientist"]
-    assert (review.run.outcome, review.run.turns) == ("finished", 3)
+    assert (review.run.outcome, review.run.turns) == ("finished", 5)
+    first_try = clients.models["chief_scientist"].calls[2].messages[-1].parts[0].content
+    assert "closing needs a comparison across hypotheses (record_synthesis)" in first_try
     assert "If you proposed closing the investigation, say so first" in \
         clients.models["chief_scientist"].calls[0].messages[-1].text
 
@@ -714,6 +725,8 @@ def test_a_review_proposes_closing_and_only_the_researcher_closes(tmp_path, site
     assert "Investigation moved to COMPLETED, authorized by msg-2" in pages["timeline.md"]
     assert f"- Closing as COMPLETED proposed by Chief Scientist ({closing.closing_id})" in \
         pages[round_file(state.round)]
+    assert "Comparison across hypotheses by Chief Scientist" in pages[round_file(state.round)]
+    assert "- Unexplained: “nothing known remains”" in pages[round_file(state.round)]
 
 
 def test_closing_needs_the_chiefs_proposal_and_the_researchers_command(system):
@@ -737,6 +750,13 @@ def test_closing_needs_the_chiefs_proposal_and_the_researchers_command(system):
     use("set_investigation_status", status="REVIEWING", reason="reports in")
     with pytest.raises(RuleViolation, match="only the researcher closes an investigation"):
         close(CHIEF, InvestigationStatus.COMPLETED)
+    refused = use("propose_closing", status="INCONCLUSIVE", reason="the budget is spent")
+    assert refused.is_error and "closing needs a comparison across hypotheses" in refused.content
+    missing = use("record_synthesis", summary="s", hypotheses=[{"hypothesis_id": "hyp-x", "standing": "?"}],
+                  residual="all of it")
+    assert missing.is_error and "unknown hypotheses hyp-x" in missing.content
+    assert not use("record_synthesis", summary="Untested.", residual="all of it",
+                   hypotheses=[{"hypothesis_id": "hyp-a", "standing": "never tested"}]).is_error
     assert "as INCONCLUSIVE" in use("propose_closing", status="INCONCLUSIVE", reason="the budget is spent").content
     with pytest.raises(RuleViolation, match="no proposal to close the investigation as COMPLETED"):
         close(USER, InvestigationStatus.COMPLETED)
@@ -753,9 +773,15 @@ def test_closing_waits_for_jobs_the_dispatcher_still_follows(system):
 
     from cedar.contracts import ClosingProposed
 
+    from cedar.contracts import HypothesisStanding, SynthesisRecorded
+
     calc = halted_system(system)
     ledger = system["workspace"].ledger
+    open_ones = [h for h, hyp in ledger.load(OPEN).hypotheses.items() if hyp.status.value not in ("DISCARDED",
+                                                                                                  "SUPERSEDED")]
     ledger.record(OPEN, [draft(CHIEF, InvestigationStatusChanged(status=InvestigationStatus.REVIEWING, reason="r")),
+                         draft(CHIEF, SynthesisRecorded(synthesis_id="synth-1", summary="s", residual="r", hypotheses=tuple(
+                             HypothesisStanding(hypothesis_id=h, standing="s") for h in open_ones))),
                          draft(CHIEF, ClosingProposed(closing_id="close-1", status=InvestigationStatus.COMPLETED,
                                                       reason="done"))])
     answer = system["chat"].handle("/approve close")
@@ -783,7 +809,9 @@ def test_halt_still_stops_a_review_in_progress(tmp_path, site, monkeypatch):
     clients.add("chief_scientist", halt_while_thinking, says("never asked"))
     dispatcher.tick()
     (review,) = [r for r in ledger.load(INV).agent_runs if r.role == "chief_scientist"]
-    assert review.run.outcome == "stopped" and review.run.report == "stopped: the investigation is PAUSED"
+    assert review.run.outcome == "stopped" and review.run.report_by_cedar
+    assert review.run.report.startswith("No report from the agent: it ended stopped (stopped: the investigation is "
+                                        "PAUSED) after 1 model call")
     assert len(clients.models["chief_scientist"].calls) == 1
 
 
@@ -801,12 +829,12 @@ def test_the_chief_scientist_proposes_delegates_and_retires_agents(system):
     assert outcome.is_error and "hyp-a has no agent; propose one with propose_agents" in outcome.content
     outcome = use("propose_agents", rationale="XC first; coverage can wait",
                   agents=[{"hypothesis_id": "hyp-a", "role": "exchange-correlation specialist",
-                           "brief": "Compare PBE and PBE0 site energies.", "token_budget": 50_000}])
+                           "brief": "Compare PBE and PBE0 site energies.", "budget_usd": 3}])
     assert not outcome.is_error and "10 minutes from now) unless the researcher replies" in outcome.content
     outcome = use("delegate", hypothesis_id="hyp-a", instruction="go")
     assert outcome.is_error and "proposed but has not started" in outcome.content
     listing = use("agents").content
-    assert "  - hyp-a: exchange-correlation specialist (50,000 tokens)" in listing
+    assert "  - hyp-a: exchange-correlation specialist (budget $3.00)" in listing
     assert listing.endswith("Open hypotheses without an agent: hyp-b")
     first = ledger.load(INV).pending_proposal.proposal_id
     outcome = use("propose_agents", rationale="both after all", agents=[
@@ -816,7 +844,7 @@ def test_the_chief_scientist_proposes_delegates_and_retires_agents(system):
 
     chat.handle("/approve agents")
     assert not use("delegate", hypothesis_id="hyp-a", instruction="Now relax the slab.").is_error
-    assert "Retired agent-hyp-a (exchange-correlation specialist)" in use(
+    assert "Retired A1 agent-hyp-a (exchange-correlation specialist)" in use(
         "retire_agent", hypothesis_id="hyp-a", reason="its question is settled").content
     state = ledger.load(INV)
     assert [t.agent_id for t in state.pending_tasks] == ["agent-hyp-b"]  # hyp-a's queued work was dropped
@@ -1089,7 +1117,9 @@ def test_halt_stops_an_agent_run_in_progress_at_its_next_model_call(system, monk
     notes = dispatcher.tick()
     assert any("ran" in n and "stopped" in n for n in notes), notes
     (run,) = [r for r in ledger.load(INV).agent_runs if r.role == "hypothesis_agent"]
-    assert run.run.outcome == "stopped" and run.run.report == "stopped: agent-hyp-a was retired"
+    assert run.run.outcome == "stopped" and run.run.report_by_cedar
+    assert run.run.report.startswith("No report from the agent: it ended stopped (stopped: agent-hyp-a was retired)")
+    assert "- its hypothesis is now PLANNING_TEST" in run.run.report
     assert len(router.models["agent-hyp-a"].calls) == 1 and run.run.turns == 1  # its tokens still count
 
 

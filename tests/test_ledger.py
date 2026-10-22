@@ -59,7 +59,7 @@ from cedar.contracts import (
     QualityCheck,
     RoundStarted,
     SchedulerState,
-    TokenBudgetChanged,
+    BudgetChanged,
     UserInterventionRecorded,
 )
 from cedar.errors import InvalidTransition, RuleViolation
@@ -200,23 +200,42 @@ class TestDuplicateCalculations:
 
 
 class TestPreregistration:
-    def test_prediction_after_the_job_ended_is_refused(self, ledger, inv, hyp):
+    def test_a_calculation_is_predicted_before_it_is_submitted(self, ledger, inv, hyp):
         calc = request(ledger, inv, hyp).calculation_id
         submit(ledger, inv, calc)
-        move(ledger, inv, calc, MONITOR, CalculationState.SCHEDULER_TERMINAL,
-             scheduler_state=SchedulerState.COMPLETED)
-        with pytest.raises(RuleViolation, match="too late"):
+        with pytest.raises(RuleViolation, match="a prediction names calculations before they are submitted"):
             predict(ledger, inv, hyp, calculation_ids=(calc,))
 
-    def test_evidence_seen_before_any_prediction_cannot_support(self, ledger, inv, hyp):
+    def test_only_a_predicted_calculation_can_support(self, ledger, inv, hyp):
         calc = request(ledger, inv, hyp).calculation_id
         run_to_parsing(ledger, inv, calc)
         record_evidence(ledger, inv, calc)
-        predict(ledger, inv, hyp)
-        with pytest.raises(RuleViolation, match="before any prediction"):
+        predict(ledger, inv, hyp)  # after the outcome, and naming no calculation
+        with pytest.raises(RuleViolation, match="SUPPORTED needs evidence from a calculation that a prediction"):
             assess(ledger, inv, hyp, Assessment.SUPPORTED, "ev-1")
+        # What was not predicted can still challenge the hypothesis, or leave it open.
+        assert assess(ledger, inv, hyp, Assessment.CHALLENGED, "ev-1").state.hypotheses[hyp].assessment \
+            is Assessment.CHALLENGED
         assert assess(ledger, inv, hyp, Assessment.INCONCLUSIVE, "ev-1").state.hypotheses[hyp].assessment \
             is Assessment.INCONCLUSIVE
+
+    def test_a_calculation_predicted_in_time_supports(self, ledger, inv, hyp):
+        calc = request(ledger, inv, hyp).calculation_id
+        predict(ledger, inv, hyp, calculation_ids=(calc,))
+        run_to_parsing(ledger, inv, calc)
+        record_evidence(ledger, inv, calc)
+        assert assess(ledger, inv, hyp, Assessment.SUPPORTED, "ev-1").state.hypotheses[hyp].assessment \
+            is Assessment.SUPPORTED
+
+    def test_an_agent_may_predict_another_hypothesis_calculation(self, ledger, inv, hyp):
+        other = add_hypothesis(ledger, inv, "hyp-b")
+        calc = request(ledger, inv, hyp).calculation_id
+        ledger.record(inv, [draft(acting_for(ledger, inv, other), PredictionRegistered(
+            prediction_id="pred-b", hypothesis_id=other, prediction=Prediction(
+                statement="B expects this run to show no site change.", observable=SITE_ENERGY,
+                expected_outcome="E(atop) - E(fcc) stays positive", falsified_if="it becomes negative",
+                calculation_ids=(calc,))))])
+        assert ledger.load(inv).predictions["pred-b"].prediction.calculation_ids == (calc,)
 
     def test_predictions_are_immutable(self, ledger, inv, hyp):
         predict(ledger, inv, hyp)
@@ -629,16 +648,16 @@ class TestAnalyses:
                                                                   evidence=analysis_evidence("an-1", calc)))])
 
 
-def test_only_the_researcher_sets_the_token_budget(ledger):
-    start_investigation(ledger, "inv-1", model_token_budget=500)
-    assert ledger.load("inv-1").model_token_budget == 500  # as it was opened
-    ledger.record("inv-1", [draft(USER, UserInterventionRecorded(intervention_id="msg-1", text="/budget 2M"))])
-    raised = TokenBudgetChanged(max_tokens=2_000_000, intervention_id="msg-1")
+def test_only_the_researcher_sets_the_budget(ledger):
+    start_investigation(ledger, "inv-1", budget_usd=5)
+    assert ledger.load("inv-1").budget_usd == 5  # as it was opened
+    ledger.record("inv-1", [draft(USER, UserInterventionRecorded(intervention_id="msg-1", text="/budget 20"))])
+    raised = BudgetChanged(max_usd=20, intervention_id="msg-1")
     with pytest.raises(RuleViolation, match="may not record"):
         ledger.record("inv-1", [draft(CHIEF, raised)])
     with pytest.raises(RuleViolation, match="cites their recorded command"):
         ledger.record("inv-1", [draft(USER, raised.model_copy(update={"intervention_id": "msg-7"}))])
     ledger.record("inv-1", [draft(USER, raised)])
-    assert ledger.load("inv-1").model_tokens_remaining == 2_000_000
-    ledger.record("inv-1", [draft(USER, TokenBudgetChanged(intervention_id="msg-1"))])
-    assert (ledger.load("inv-1").model_token_budget, ledger.load("inv-1").model_tokens_remaining) == (None, None)
+    assert ledger.load("inv-1").budget_left == 20
+    ledger.record("inv-1", [draft(USER, BudgetChanged(intervention_id="msg-1"))])
+    assert (ledger.load("inv-1").budget_usd, ledger.load("inv-1").budget_left) == (None, None)

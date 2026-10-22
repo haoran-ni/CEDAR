@@ -12,6 +12,7 @@ from cedar.automation import mode_summary, pending_decisions
 from cedar.contracts.base import Actor, Contract, Identifier, NonEmptyStr, new_id
 from cedar.contracts.events import ApproverDecision, EventDraft, ProposalWithdrawn
 from cedar.contracts.plan import PermissionAction
+from cedar.models.prices import dollars
 from cedar.state.ledger import ResearchLedger
 from cedar.state.projection import InvestigationState
 from cedar.summaries import calculation_summary, investigation_summary, recommendation_text
@@ -45,8 +46,7 @@ def decisions_text(state: InvestigationState) -> str:
             proposal = state.pending_proposal
             lines += ["", f"Agents proposed by the Chief Scientist ({proposal.proposal_id}). Why: {proposal.rationale}"]
             for spec in proposal.agents:
-                limits = ", ".join(x for x in (f"{spec.token_budget:,} tokens" if spec.token_budget else "",
-                                               f"{spec.max_turns} turns per run" if spec.max_turns else "") if x)
+                limits = f"budget {dollars(spec.budget_usd)}" if spec.budget_usd else ""
                 lines.append(f"  - {spec.hypothesis_id} ({state.hypotheses[spec.hypothesis_id].spec.statement}): "
                              f"{spec.role}" + (f" ({limits})" if limits else "") + f"; first task: {spec.brief}")
         else:

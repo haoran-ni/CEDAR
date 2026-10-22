@@ -13,6 +13,7 @@ from cedar.models.types import (
     Message,
     ModelClient,
     ModelError,
+    ModelPrices,
     ModelReply,
     ModelSettings,
     TextPart,
@@ -37,6 +38,6 @@ def create_client(settings: ModelSettings, credentials: CredentialStore) -> Mode
 
 __all__ = [
     "ADAPTERS", "CredentialStore", "InsecureCredentials", "MediaPart", "Message", "MissingCredential", "ModelClient",
-    "ModelConfig", "ModelError", "ModelReply", "ModelSettings", "TextPart", "ToolCall", "ToolResult", "ToolSpec",
+    "ModelConfig", "ModelError", "ModelPrices", "ModelReply", "ModelSettings", "TextPart", "ToolCall", "ToolResult", "ToolSpec",
     "Usage", "WebAccess", "create_client", "load_model_config", "redact", "scrubbed_environment", "write_starter",
 ]

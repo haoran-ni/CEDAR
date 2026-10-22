@@ -85,9 +85,9 @@ def test_full_cycle(world, agent, tmp_path):
             "expected_outcome": "a validated total energy", "falsified_if": "the run fails its checks",
             "calculation_ids": [calc_id(call)]})),
         lambda call: reply(TextPart(text="Requested the baseline; waiting."), ToolCall(
-            id="t5", name="wait_for_calculations",
-            arguments={"calculation_ids": [re.search(r"calc_[0-9a-f]{32}", str(call.messages)).group(0)],
-                       "reason": "baseline energy needed"})),
+            id="t5", name="submit_report",
+            arguments={"outcome": "waiting_for_calculations", "summary": "baseline energy needed",
+                       "wait_for": [re.search(r"calc_[0-9a-f]{32}", str(call.messages)).group(0)]})),
     ]
     result, model = run_agent(world, agent, tmp_path, first_script, "Plan a first test.")
     assert result.outcome == "waiting"
@@ -188,13 +188,16 @@ def test_requests_define_their_observable(world, agent, tmp_path):
     assert world.state().calculations == {}
 
 
-@pytest.mark.parametrize("budget, shown", [(None, None), (5000, "Model tokens remaining for this investigation: 5000")])
-def test_overview_shows_the_token_budget_when_one_is_set(ledger, store, artifacts, site, budget, shown):
-    world = World(ledger, store, artifacts, site, **({"model_token_budget": budget} if budget else {}))
+@pytest.mark.parametrize("budget, shown", [("none", None), (None, "Budget left for this investigation's model use: "
+                                                                    "$15.00"),
+                                           (40, "Budget left for this investigation's model use: $40.00")])
+def test_overview_shows_the_budget_left_when_there_is_one(ledger, store, artifacts, site, budget, shown):
+    constraints = {"budget_usd": None} if budget == "none" else {"budget_usd": budget} if budget else {}
+    world = World(ledger, store, artifacts, site, **constraints)
     access = FileAccess(roots=[world.runs])
     ctx = ResearchContext(ledger=world.ledger, investigation_id=world.inv, hypothesis_id=world.hyp, actor=AGENT,
                           registry=world.registry, artifacts=world.artifacts, engine=world.engine,
                           validator=world.validator, files=access, analysis=world.analysis)
     overview = {t.name: t for t in research_tools(ctx)}["investigation_overview"].invoke({}).content
     assert "Your hypothesis" in overview
-    assert (shown in overview) if shown else ("Model tokens remaining" not in overview)
+    assert (shown in overview) if shown else ("Budget left" not in overview)

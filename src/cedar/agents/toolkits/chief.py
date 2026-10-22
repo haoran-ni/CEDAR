@@ -17,6 +17,7 @@ from typing import Literal
 from pydantic import Field
 
 from cedar.agents.tools import AgentTool, ToolFailure
+from cedar.briefing import investigation_facts
 from cedar.contracts.base import (
     Actor,
     Contract,
@@ -41,8 +42,10 @@ from cedar.contracts.events import (
     HypothesisStatusChanged,
     InvestigationCreated,
     InvestigationStatusChanged,
+    HypothesisStanding,
     NextActionsRecommended,
     ObservableAlignmentRecorded,
+    SynthesisRecorded,
     PlanRevised,
     RoundStarted,
 )
@@ -86,6 +89,10 @@ class ChiefContext:
     """Registers runs computed outside CEDAR for an investigation, by its id."""
     where: Callable[[], str] | None = None
     """Where CEDAR runs, and so whether calculations can run locally."""
+    running: Callable[[], list[str]] | None = None
+    """The hypothesis agents of the investigation whose runs are in progress now, by name."""
+    warn: Callable[[str], None] | None = None
+    """Shows the researcher a warning, such as that agents at work are being stopped."""
 
 
 class NoArgs(Contract):
@@ -153,6 +160,9 @@ class OpenArgs(Contract):
 class InvestigationStatusArgs(Contract):
     status: Literal["ALIGNING_OBSERVABLES", "PLANNING", "INVESTIGATING", "REVIEWING", "PAUSED", "BLOCKED"]
     reason: NonEmptyStr
+    confirm_stopping_agents: bool = Field(default=False, description="Leaving INVESTIGATING stops the hypothesis "
+                                          "agents at work; the first attempt is refused with a warning naming them, "
+                                          "and goes ahead only when you call again with this set to true.")
 
 
 class ClosingArgs(Contract):
@@ -211,10 +221,9 @@ class AgentArg(Contract):
                                                            "'exchange-correlation specialist'.")
     brief: NonEmptyStr = Field(description="Its first task: what to test, with which protocol, and within what "
                                            "limits.")
-    token_budget: int | None = Field(default=None, gt=0, description="Tokens it may process over its lifetime; "
-                                                                     "omit to leave only the investigation's budget.")
-    max_turns: int | None = Field(default=None, ge=1, le=200, description="Model calls per run; omit for the "
-                                                                         "default.")
+    budget_usd: float | None = Field(default=None, gt=0, description="Dollars it may spend on models over its "
+                                                                     "lifetime; omit to leave only the "
+                                                                     "investigation's budget.")
 
 
 class ProposeArgs(Contract):
@@ -229,6 +238,27 @@ class RecommendArgs(Contract):
     candidates: list[CandidateAction] = Field(min_length=1, description="The next steps worth considering, compared.")
     chosen: list[Identifier] = Field(default=[], description="Candidate ids you take now; none is a valid choice.")
     reason: NonEmptyStr = Field(description="Why the chosen ones over the others, or why none now.")
+
+
+class StandingArg(Contract):
+    hypothesis_id: Identifier
+    standing: NonEmptyStr = Field(description="Where it stands now, in the light of the evidence and of the other "
+                                              "hypotheses.")
+    accounts_for: str | None = Field(default=None, description="How much of the discrepancy it accounts for, in "
+                                     "words, citing the evidence; do not type values, the record shows those of "
+                                     "the evidence. Omit when that is not known.")
+    evidence_ids: list[Identifier] = []
+
+
+class SynthesisArgs(Contract):
+    summary: NonEmptyStr = Field(description="The comparison in a few sentences.")
+    hypotheses: list[StandingArg] = Field(min_length=1, description="Every open hypothesis, once.")
+    interactions: list[NonEmptyStr] = Field(default=[], description="Conflicts, confounders and interactions "
+                                                                     "between hypotheses.")
+    residual: NonEmptyStr = Field(description="What of the discrepancy remains unexplained.")
+    not_separable: list[NonEmptyStr] = Field(default=[], description="Contributions the evidence cannot tell apart.")
+    new_hypotheses: list[Identifier] = Field(default=[], description="Hypotheses you proposed because of this "
+                                                                     "comparison; propose them first.")
 
 
 class RetireArgs(Contract):
@@ -329,7 +359,8 @@ def chief_tools(ctx: ChiefContext) -> list[AgentTool]:
         return f"Opened investigation {args.investigation_id} (status CREATED). Next: align the observables.{note}"
 
     def investigation_state(_: NoArgs) -> str:
-        summary = investigation_summary(ctx.ledger.load(current()))
+        state = ctx.ledger.load(current())
+        summary = "\n".join(investigation_facts(state)) + "\n\n" + investigation_summary(state)
         if ctx.dispatcher is not None:
             summary += (f"\nDispatcher (the process that carries out queued agent work and submissions; the "
                         f"researcher starts it with `cedar dispatch`): {ctx.dispatcher()}")
@@ -339,7 +370,22 @@ def chief_tools(ctx: ChiefContext) -> list[AgentTool]:
 
     def set_investigation_status(args: InvestigationStatusArgs) -> str:
         state = ctx.ledger.load(current())
-        change = InvestigationStatusChanged(status=InvestigationStatus(args.status), reason=args.reason)
+        target = InvestigationStatus(args.status)
+        working = ctx.running() if ctx.running is not None else []
+        reason = args.reason
+        if state.status is InvestigationStatus.INVESTIGATING and target is not state.status and working:
+            stops = (f"Moving the investigation to {target.value} stops {', '.join(working)} at their next step; their "
+                     "tasks continue when it is INVESTIGATING again.")
+            if not args.confirm_stopping_agents:
+                raise ToolFailure(f"not moved: {stops} If that is what you want, call set_investigation_status again "
+                                  "with confirm_stopping_agents true; otherwise leave it INVESTIGATING until they "
+                                  "report.")
+            if ctx.warn is not None:
+                ctx.warn(f"The Chief Scientist moved the investigation to {target.value}, which stops "
+                         f"{', '.join(working)} at their next step; their tasks continue when it is INVESTIGATING "
+                         "again.")
+            reason += f" (this stops {', '.join(working)} at their next step)"
+        change = InvestigationStatusChanged(status=target, reason=reason)
         # Each stretch of investigating, after planning or after a review, is a new round.
         if change.status is InvestigationStatus.INVESTIGATING and state.status in (InvestigationStatus.PLANNING,
                                                                                   InvestigationStatus.REVIEWING):
@@ -425,6 +471,18 @@ def chief_tools(ctx: ChiefContext) -> list[AgentTool]:
                 "sees it in the chat and the notebook. It authorizes nothing: carry out the chosen steps with your "
                 f"tools, giving recommendation_id {recommendation_id} when you delegate, request a judgement or "
                 "propose agents for them. A measurement is a suggestion for the researcher.")
+
+    def record_synthesis(args: SynthesisArgs) -> str:
+        synthesis_id = new_id("synth")
+        record(SynthesisRecorded(
+            synthesis_id=synthesis_id, summary=args.summary, residual=args.residual,
+            hypotheses=tuple(HypothesisStanding(hypothesis_id=h.hypothesis_id, standing=h.standing,
+                                                accounts_for=h.accounts_for, evidence_ids=tuple(h.evidence_ids))
+                             for h in args.hypotheses),
+            interactions=tuple(args.interactions), not_separable=tuple(args.not_separable),
+            new_hypotheses=tuple(args.new_hypotheses)))
+        return (f"Recorded {synthesis_id}. The round page of the notebook shows it, with the values of the evidence it "
+                "cites. Act on it: delegate, propose agents for new hypotheses, or propose closing.")
 
     def retire_agent(args: RetireArgs) -> str:
         agent = ctx.ledger.load(current()).active_agent(args.hypothesis_id)
@@ -541,10 +599,15 @@ def chief_tools(ctx: ChiefContext) -> list[AgentTool]:
                   "cost and feasibility, and a qualitative priority with the reason; then which you take now and "
                   "why. No numerical scores or probabilities. It authorizes nothing.", RecommendArgs,
                   recommend_next_actions),
-        AgentTool("agents", "List the agents, their roles and token use, and any proposal waiting for the "
+        AgentTool("record_synthesis", "Record your comparison across hypotheses: for every open hypothesis where it "
+                  "stands and how much of the discrepancy it accounts for (citing evidence, no typed values), their "
+                  "conflicts and interactions, what remains unexplained, what cannot be separated, and the new "
+                  "hypotheses the comparison led you to propose. Record one at every review; closing needs one newer "
+                  "than the latest evidence.", SynthesisArgs, record_synthesis),
+        AgentTool("agents", "List the agents, their roles and what they spent, and any proposal waiting for the "
                   "researcher.", NoArgs, agents),
-        AgentTool("delegate", "Queue further work for the agent of a hypothesis. It sees only its own hypothesis: "
-                  "include any other agent's finding its test needs, citing the evidence id.",
+        AgentTool("delegate", "Queue further work for the agent of a hypothesis. It can see the other agents' "
+                  "work: name the calculations or evidence of others that its test needs.",
                   TaskArgs, lambda a: queue("hypothesis_agent", a)),
         AgentTool("retire_agent", "Retire a hypothesis's agent when its hypothesis needs no more work, or to "
                   "replace it with an agent in a different role. Queued work for it is dropped; its record stays.",

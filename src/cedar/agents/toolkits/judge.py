@@ -11,12 +11,13 @@ from typing import Literal
 from pydantic import Field
 
 from cedar.agents.tools import AgentTool, ToolFailure
+from cedar.briefing import investigation_facts
 from cedar.contracts.base import Actor, Contract, Identifier, NonEmptyStr
 from cedar.contracts.events import AssessmentRecorded, EventDraft
 from cedar.contracts.status import Assessment, Completeness
 from cedar.contracts.task import compare_tasks
 from cedar.state.ledger import ResearchLedger
-from cedar.state.projection import hypothesis_evidence
+from cedar.state.projection import hypothesis_evidence, predicted_by
 from cedar.store.artifacts import ArtifactStore
 
 SCRIPT_SHOWN_CHARS = 4000
@@ -56,6 +57,7 @@ class AssessmentArgs(Contract):
 def _analysis_lines(run, artifacts: ArtifactStore | None) -> list[str]:
     lines = [f"  analysis purpose: {run.purpose}; ran with {run.environment}"]
     lines += [f"  staged from {i.calculation_id}: {', '.join(i.files)}" for i in run.inputs]
+    lines += [f"  staged data inputs/data/{d.name}, from {d.origin}" for d in run.data]
     if artifacts is not None:
         script = artifacts.read(run.script).decode(errors="replace")
         shown = script if len(script) <= SCRIPT_SHOWN_CHARS else script[:SCRIPT_SHOWN_CHARS] + "\n…[script truncated]"
@@ -72,7 +74,8 @@ def judge_tools(ctx: JudgeContext) -> list[AgentTool]:
         hyp = state.hypotheses.get(args.hypothesis_id)
         if hyp is None:
             raise ToolFailure(f"unknown hypothesis {args.hypothesis_id}")
-        lines = [f"Hypothesis {hyp.hypothesis_id} ({hyp.status.value}; current assessment {hyp.assessment.value})",
+        lines = [*investigation_facts(state), "",
+                 f"Hypothesis {hyp.hypothesis_id} ({hyp.status.value}; current assessment {hyp.assessment.value})",
                  f"Statement: {hyp.spec.statement}", f"Rationale: {hyp.spec.rationale}",
                  f"Falsifiers: {'; '.join(hyp.spec.falsifiers)}"]
         if hyp.spec.assumptions:
@@ -110,6 +113,10 @@ def judge_tools(ctx: JudgeContext) -> list[AgentTool]:
             lines.append(f"Evidence {record.evidence_id} (recorded at event {record.recorded_at}) from {source}: "
                          f"{ev.quality.value}; {ev.observable.name} ({ev.observable.definition}) = {value}")
             lines.append(f"  summary by {ev.interpreted_by.id if ev.interpreted_by else 'the validator'}: {ev.summary}")
+            tested = predicted_by(state, hyp.hypothesis_id, record)
+            lines.append(f"  tests prediction {tested}: it named the calculation before it was submitted" if tested else
+                         "  not a test of a prediction (it existed before, or was not predicted): it can challenge the "
+                         "hypothesis or accompany a test, not support it")
             lines += [f"  check {c.name}: {'passed' if c.passed else 'FAILED'} - {c.detail or ''}"
                       for c in ev.quality_checks]
             lines += [f"  limitation: {text}" for text in ev.limitations]

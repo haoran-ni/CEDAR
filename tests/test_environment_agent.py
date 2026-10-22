@@ -154,7 +154,7 @@ def test_cli_setup_then_review_and_approve(home, monkeypatch, capsys):
     monkeypatch.setattr("cedar.hpc.queries.SchedulerQueries", lambda: SchedulerQueries(runner=fake_runner([])))
     monkeypatch.setattr(cli, "_ask_in_terminal", lambda question: "only compute")
     cli.main(["models", "init"])
-    assert cli.main(["setup", "--name", "synthetic", "--root", str(home["site"].runs_root)]) == 0
+    assert cli.main(["setup", "--name", "synthetic"]) == 0
     out = capsys.readouterr().out
     assert "- read_file" in out and "! propose_profile" in out and "cedar profile approve synthetic" in out
     log = json.loads((home["config"] / "setup_runs.jsonl").read_text().splitlines()[-1])

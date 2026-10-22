@@ -30,7 +30,7 @@ from pathlib import Path
 
 from cedar.contracts.status import SchedulerState
 from cedar.hpc.jobscript import local_resources
-from cedar.hpc.node import CorePool, ExecutionHost
+from cedar.hpc.node import WORKBENCH_CORES, CorePool, ExecutionHost
 from cedar.hpc.slurm import SchedulerError, SchedulerObservation
 from cedar.secrets import scrubbed_environment
 
@@ -105,8 +105,10 @@ class LocalBackend:
         resources = local_resources(Path(script).read_text())
         if resources is None:
             raise SchedulerError(f"{script} states no task count and time limit")
-        if resources.ntasks > host.cores:
-            raise SchedulerError(f"{resources.ntasks} tasks exceed the allocation's {host.cores} cores here")
+        if resources.ntasks > host.dft_cores:
+            raise SchedulerError(f"{resources.ntasks} tasks exceed the {host.dft_cores} cores local DFT may use here: "
+                                 f"the allocation has {host.cores}, and {WORKBENCH_CORES} are kept for the agents' "
+                                 "commands")
         left = host.seconds_left()
         if left is not None and resources.walltime_minutes * 60 > left - MARGIN_SECONDS:
             raise SchedulerError(f"{resources.walltime_minutes} minutes would run past the end of allocation "
@@ -221,7 +223,7 @@ class LocalBackend:
                 continue
             if record["allocation"] != host.allocation:
                 continue
-            cpus = self._pool.take(record["ntasks"]) if self._pool is not None else ()
+            cpus = self._pool.take(record["ntasks"], keep=WORKBENCH_CORES) if self._pool is not None else ()
             if cpus is None:
                 return  # first come, first served
             record["cpus"], record["launched_at"] = list(cpus), time.time()

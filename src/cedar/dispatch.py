@@ -5,9 +5,10 @@ Each pass, for every open investigation:
 2. poll the scheduler and record job state changes;
 3. check the health of every run that ended and store its outputs;
 4. start proposed agents whose review window has passed without a reply from the researcher;
-5. wake hypothesis agents whose awaited calculations have all ended;
+5. wake hypothesis agents whose awaited calculations have all ended, or any of whose calculations has ended
+   since their last run started;
 6. queue a review by the Chief Scientist once every agent given work has reported;
-7. start queued agent work, within the token budgets.
+7. start queued agent work, within the budgets, in dollars.
 
 Evidence comes only from agents' cited readings and recorded analyses, after the run check.
 Steps 1-3 need the investigation's approved compute profile. Without one, agents still run,
@@ -19,8 +20,10 @@ of the Evidence Judge or of the Chief Scientist's review in one investigation. H
 agents run only while their investigation is INVESTIGATING; the Evidence Judge and the
 Chief Scientist's reviews also while it is REVIEWING. A run in progress stops at its next
 model call once that no longer holds or its agent is retired, as when the researcher halts
-the investigation. Nothing is submitted while an investigation is paused or blocked. Each agent run sets aside the tokens
-it may use, so agents running together cannot overspend a budget.
+the investigation. Nothing is submitted while an investigation is paused or blocked. Agents running together share the
+investigation's budget: before every model call each checks what has been recorded and what every run in progress has
+spent so far, so together they overspend it by at most one call each. A run whose model has no known prices does not
+start while a budget applies.
 
 The dispatcher then regenerates the research notebook of every investigation whose log
 grew, closed ones included.
@@ -52,12 +55,14 @@ from pathlib import Path
 from cedar.agents import AgentRunner, RunLimits, record_agent_run
 from cedar.agents.prompts import APPROVER, CHIEF_SCIENTIST, EVIDENCE_JUDGE, HYPOTHESIS_AGENT
 from cedar.agents.toolkits import file_tools, research_tools
+from cedar.agents.toolkits.files import agent_access
 from cedar.agents.toolkits.approver import ApproverContext, approver_tools, decisions_text
 from cedar.agents.toolkits.chief import ChiefContext, chief_tools
 from cedar.agents.toolkits.judge import JudgeContext, judge_tools
 from cedar.agents.toolkits.materials import material_tools, recorded_materials
 from cedar.contracts.base import Actor, ActorKind, new_id
 from cedar.automation import approver_due, judgements_due
+from cedar.briefing import agent_briefing, review_briefing, role_briefing, session_name
 from cedar.contracts.events import (
     AgentTaskQueued,
     EventDraft,
@@ -80,17 +85,23 @@ from cedar.hpc.local import LocalBackend
 from cedar.hpc.node import local_dft
 from cedar.hpc.profile import ProfileNotApproved, ProfileStore
 from cedar.hpc.slurm import SchedulerBackend, SchedulerError
+from cedar.models.prices import dollars, prices_for
 from cedar.notebook import update_notebook
 from cedar.state.projection import AgentTaskRecord, InvestigationState, authorization_for, review_deadline
 from cedar.summaries import calculation_summary, task_owner
 from cedar.swarm import (
     CHIEF,
+    MAX_CONTINUATIONS,
     REVIEW_INSTRUCTION,
     WAKE_TASK,
+    account_of_run,
     agent_prompt,
+    continuation_text,
+    ended_unseen,
     review_due,
     review_material,
     start_drafts,
+    task_chain,
 )
 from cedar.web import web_access
 from cedar.workspace import (ModelClients, Services, Workspace, investigation_registrar, profile_for, registry_for,
@@ -115,6 +126,9 @@ _WORKING = frozenset({InvestigationStatus.INVESTIGATING, InvestigationStatus.REV
 """Investigation states in which work goes on: submissions, the Evidence Judge and reviews."""
 _LIVE = frozenset({CalculationState.SUBMISSION_PENDING, CalculationState.SUBMITTED, CalculationState.QUEUED,
                    CalculationState.RUNNING, CalculationState.SCHEDULER_TERMINAL, CalculationState.PARSING})
+_RESTING = frozenset({HypothesisStatus.PAUSED, HypothesisStatus.DISCARDED, HypothesisStatus.SUPERSEDED,
+                      HypothesisStatus.FAILED})
+"""Hypotheses whose agents are not woken for results."""
 
 
 def needs_dispatcher(state: InvestigationState) -> bool:
@@ -129,7 +143,7 @@ def needs_dispatcher(state: InvestigationState) -> bool:
     if any(Dispatcher._runnable(state, t) for t in state.pending_tasks) or review_due(state):
         return True
     if state.automation is not None and (approver_due(state) or judgements_due(state)
-                                         or state.automation_tokens_left <= 0):
+                                         or state.automation_cost_left <= 0):
         return True
     for calc in state.calculations.values():
         if calc.state in _LIVE:
@@ -155,6 +169,12 @@ class Activity:
     last_step: str | None = None
     """The tool the agent called most recently."""
     last_step_at: datetime | None = None
+    calls: int = 0
+    """Model calls so far."""
+    tokens: int = 0
+    """Tokens processed so far, cached input included."""
+    cost_usd: float | None = None
+    """Dollars spent so far, when the model's prices are known."""
 
 
 def _write_atomically(path: Path, text: str) -> None:
@@ -167,8 +187,8 @@ def _write_atomically(path: Path, text: str) -> None:
 class _Run:
     investigation_id: str
     task: AgentTaskRecord
-    tokens: int | None
-    """Tokens set aside for it until it ends."""
+    spent: float = 0.0
+    """Dollars it has spent so far."""
     note: str = ""
     done: threading.Event = field(default_factory=threading.Event)
     thread: threading.Thread | None = None
@@ -177,7 +197,7 @@ class _Run:
 class Dispatcher:
     def __init__(self, workspace: Workspace, profiles: ProfileStore, clients: ModelClients, *,
                  backend: SchedulerBackend | None = None, deny: list[Path] = (),
-                 limits: RunLimits = RunLimits(max_turns=40), max_agents: int = 4,
+                 limits: RunLimits = RunLimits(), max_agents: int = 4,
                  analysis_slots: int = 2, chief_reviews: bool = True,
                  clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
                  workbench: Workbench | None = None) -> None:
@@ -417,43 +437,55 @@ class Dispatcher:
         return [f"the review window of {proposal.proposal_id} passed without a reply; started {', '.join(started)}"]
 
     def _wake(self, investigation_id: str) -> list[str]:
+        """Wake an agent once the calculations it waits for have all ended, or, when it is not waiting, once any of
+        its calculations has ended that it has not been told of: since its last run started."""
         state = self.workspace.ledger.load(investigation_id)
         notes = []
         for hyp in state.hypotheses.values():
-            if hyp.status is not HypothesisStatus.WAITING_FOR_JOB:
-                continue
             agent = state.active_agent(hyp.hypothesis_id)
-            awaited = [state.calculations[c] for c in hyp.awaiting_calculation_ids]
-            if agent is None or not all(c.state in _ENDED for c in awaited):
+            if agent is None:
                 continue
-            summaries = "\n".join(calculation_summary(state, c, findings=False, viewer=hyp.hypothesis_id)
-                                  for c in awaited)
+            drafts = []
+            if hyp.status is HypothesisStatus.WAITING_FOR_JOB:
+                ended = [state.calculations[c] for c in hyp.awaiting_calculation_ids]
+                if not all(c.state in _ENDED for c in ended):
+                    continue
+                drafts.append(EventDraft(actor=SYSTEM, payload=HypothesisStatusChanged(
+                    hypothesis_id=hyp.hypothesis_id, status=HypothesisStatus.ANALYZING,
+                    reason="the calculations it was waiting for have ended")))
+            else:
+                runs = [r for r in state.agent_runs if r.actor_id == agent.agent_id]
+                if (not runs or hyp.status in _RESTING or state.plan.priority(hyp.hypothesis_id) is Priority.ON_HOLD
+                        or any(t.agent_id == agent.agent_id for t in state.pending_tasks)):
+                    continue
+                last = runs[-1]
+                since = last.run.started_version if last.run.started_version is not None else last.recorded_at
+                ended = [state.calculations[c] for c in ended_unseen(state, hyp.hypothesis_id, since)]
+                if not ended:
+                    continue
+            summaries = "\n".join(calculation_summary(state, c, findings=False) for c in ended)
             instruction = (WAKE_TASK + "\n" + summaries + "\nLook at "
                            "the outputs (run_outputs, file tools). Record the values that matter: a value printed in "
                            "an output with submit_reading, citing its lines; anything that must be computed with "
                            "run_analysis and then record_result. Say what the results mean for your hypothesis, then "
                            "set its status (ASSESSED, or PLANNING_TEST if another test is needed).")
-            self.workspace.ledger.record(investigation_id, [
-                EventDraft(actor=SYSTEM, payload=HypothesisStatusChanged(
-                    hypothesis_id=hyp.hypothesis_id, status=HypothesisStatus.ANALYZING,
-                    reason="the calculations it was waiting for have ended")),
-                EventDraft(actor=SYSTEM, payload=AgentTaskQueued(
-                    task_id=new_id("task"), role="hypothesis_agent", hypothesis_id=hyp.hypothesis_id,
-                    agent_id=agent.agent_id, instruction=instruction)),
-            ])
+            drafts.append(EventDraft(actor=SYSTEM, payload=AgentTaskQueued(
+                task_id=new_id("task"), role="hypothesis_agent", hypothesis_id=hyp.hypothesis_id,
+                agent_id=agent.agent_id, instruction=instruction)))
+            self.workspace.ledger.record(investigation_id, drafts)
             notes.append(f"woke the agent for {hyp.hypothesis_id}")
         return notes
 
     def _end_spent_automation(self, investigation_id: str) -> list[str]:
-        """Once full automation's token allowance is used up, switch back to human-in-the-loop and pause."""
+        """Once full automation's spending allowance is used up, switch back to human-in-the-loop and pause."""
         state = self.workspace.ledger.load(investigation_id)
-        if state.automation is None or state.automation_tokens_left > 0:
+        if state.automation is None or state.automation_cost_left > 0:
             return []
-        reason = (f"full automation's allowance of {state.automation.max_tokens:,} tokens is used up; the "
-                  "investigation waits for the researcher")
+        reason = (f"full automation's allowance of {dollars(state.automation.max_usd)} is spent; the investigation "
+                  "waits for the researcher")
 
         def build(current: InvestigationState) -> list[EventDraft]:
-            if current.automation is None or current.automation_tokens_left > 0:
+            if current.automation is None or current.automation_cost_left > 0:
                 return []
             drafts = [EventDraft(actor=SYSTEM, payload=ModeChanged(mode=InvestigationMode.HUMAN_IN_THE_LOOP,
                                                                    reason=reason))]
@@ -532,32 +564,38 @@ class Dispatcher:
             return False
         return state.status in (InvestigationStatus.INVESTIGATING, InvestigationStatus.REVIEWING)
 
+    def _shared_left(self, investigation_id: str, run: "_Run | None" = None, own: float = 0.0) -> float | None:
+        """What the investigation's budget and full automation's allowance have left once the runs in progress have
+        spent what they have (``run``, spending ``own``, among them); None if neither applies."""
+        state = self.workspace.ledger.load(investigation_id)
+        live = sum(r.spent for r in list(self._runs.values()) if r.investigation_id == investigation_id and r is not run)
+        caps = [left - live - own for left in (state.budget_left, state.automation_cost_left) if left is not None]
+        return min(caps) if caps else None
+
     def _limits(self, state: InvestigationState, task: AgentTaskRecord) -> tuple[RunLimits | None, str | None]:
-        """The run's limits, within what the investigation and the agent have left; or why it must wait."""
-        investigation_left = state.model_tokens_remaining
-        automation_left = state.automation_tokens_left
-        if automation_left is not None:  # full automation's allowance caps every run, like a budget
-            investigation_left = automation_left if investigation_left is None else min(investigation_left,
-                                                                                        automation_left)
-        if investigation_left is not None:
-            if investigation_left <= 0:
-                return None, ("the model token budget is spent; queued agent work waits until the researcher "
-                              "raises it with /budget")
-            investigation_left -= sum(r.tokens or 0 for r in self._runs.values()
-                                      if r.investigation_id == state.investigation_id)
-            if investigation_left <= 0:
-                return None, None  # set aside for the agents running now
-        agent_left, max_turns = None, self.limits.max_turns
+        """The run's limits: what its agent has left to spend (the budget it shares with the other runs is checked
+        before every model call); or why it must wait."""
+        shared = self._shared_left(state.investigation_id)
+        if shared is not None and shared <= 0:
+            if any(left is not None and left <= 0 for left in (state.budget_left, state.automation_cost_left)):
+                return None, ("the budget is spent; queued agent work waits until the researcher raises it with "
+                              "/budget")
+            return None, None  # the runs in progress are spending what is left
+        agent_left = None
         if task.agent_id is not None:
             spec = state.agents[task.agent_id].spec
-            max_turns = spec.max_turns or max_turns
-            if spec.token_budget is not None:
-                agent_left = spec.token_budget - state.agent_tokens_used(task.agent_id)
+            if spec.budget_usd is not None:
+                agent_left = spec.budget_usd - state.agent_cost(task.agent_id)
                 if agent_left <= 0:
-                    return None, (f"{task.agent_id} has used its budget of {spec.token_budget:,} tokens; its queued "
+                    return None, (f"{task.agent_id} has spent its budget of {dollars(spec.budget_usd)}; its queued "
                                   "work waits")
-        caps = [c for c in (self.limits.max_tokens, investigation_left, agent_left) if c is not None]
-        return RunLimits(max_turns=max_turns, max_tokens=min(caps) if caps else None), None
+        caps = [c for c in (self.limits.max_cost_usd, agent_left) if c is not None]
+        settings = self.clients.settings(task.role)
+        if (caps or shared is not None) and prices_for(settings) is None:
+            return None, (f"the prices of {settings.provider} {settings.model}, the {task.role.replace('_', ' ')}'s "
+                          "model, are not known, so its spending cannot be kept within the budget; set them in "
+                          "models.toml")
+        return RunLimits(max_turns=self.limits.max_turns, max_cost_usd=min(caps) if caps else None), None
 
     def _launch(self, investigation_id: str, services: Services | None) -> list[str]:
         state = self.workspace.ledger.load(investigation_id)
@@ -578,7 +616,7 @@ class Dispatcher:
                 if problem and problem not in notes:
                     notes.append(problem)
                 continue
-            run = _Run(investigation_id, task, limits.max_tokens)
+            run = _Run(investigation_id, task)
             run.thread = threading.Thread(target=self._execute, args=(run, services, limits), daemon=True,
                                           name=f"cedar {key}")
             self._runs[key] = run
@@ -615,6 +653,7 @@ class Dispatcher:
                              secrets=self.clients.secrets())
         instruction = f"[task {task.task_id}, queued by {task.queued_by}] {task.instruction}"
         state = self.workspace.ledger.load(investigation_id)
+        transcripts, notebook = self.workspace.transcripts.root, self.workspace.notebook_dir(investigation_id)
         if role == "hypothesis_agent":
             agent = state.agents[task.agent_id]
             context = research_context(self.workspace, investigation_id, agent, services, deny=self.deny,
@@ -622,17 +661,22 @@ class Dispatcher:
                                        should_stop=lambda: self._interruption(investigation_id, task) is not None)
             actor = context.actor
             tools = research_tools(context) + file_tools(context.files)
-            system, session = HYPOTHESIS_AGENT + agent_prompt(agent), f"{investigation_id}.{agent.agent_id}"
+            system, session = HYPOTHESIS_AGENT + agent_prompt(agent), session_name(investigation_id, agent.agent_id,
+                                                                                  task.task_id)
+            briefing = agent_briefing(state, agent, workspace=context.workspace, runs_root=context.runs_root,
+                                      transcripts=transcripts, notebook=notebook)
         elif role == "evidence_judge":
             actor = JUDGE
             tools = judge_tools(JudgeContext(ledger=self.workspace.ledger, investigation_id=investigation_id,
                                              actor=actor, artifacts=self.workspace.artifacts))
-            system, session = EVIDENCE_JUDGE, f"{investigation_id}.judge"
+            system, session = EVIDENCE_JUDGE, session_name(investigation_id, "judge", task.task_id)
+            briefing = role_briefing(state, transcripts=transcripts, notebook=notebook, actor_id=actor.id, role=role)
         elif role == "approver":
             actor = APPROVER_ACTOR
             tools = approver_tools(ApproverContext(ledger=self.workspace.ledger, investigation_id=investigation_id,
                                                    actor=actor))
-            system, session = APPROVER, f"{investigation_id}.approver"
+            system, session = APPROVER, session_name(investigation_id, "approver", task.task_id)
+            briefing = role_briefing(state, transcripts=transcripts, notebook=notebook, actor_id=actor.id, role=role)
             instruction += "\n\n" + decisions_text(state)
         else:
             actor = CHIEF
@@ -641,10 +685,17 @@ class Dispatcher:
                 registry_for=lambda name: registry_for(self.profiles.load_approved(name)), clock=self.clock,
                 dispatcher=lambda: "running; it is carrying out this review",
                 registrar=lambda inv: investigation_registrar(self.workspace, self.profiles, inv, deny=self.deny),
-                where=lambda: local_dft(self.workbench.host())))
-            system, session = CHIEF_SCIENTIST, f"{investigation_id}.chief-review"
+                where=lambda: local_dft(self.workbench.host()),
+                running=lambda: [f"{state.agents[r.task.agent_id].tag} ({r.task.agent_id})"
+                                 for r in list(self._runs.values()) if r.investigation_id == investigation_id
+                                 and r.task.role == "hypothesis_agent" and r.task.agent_id in state.agents]))
+            system, session = CHIEF_SCIENTIST, session_name(investigation_id, "chief-review", task.task_id)
+            briefing = review_briefing(state, transcripts=transcripts, notebook=notebook, actor_id=actor.id)
             instruction += "\n\n" + review_material(state, task)
+        instruction = f"{briefing}\n\n{instruction}"
         ledger = self.workspace.ledger
+        if role != "hypothesis_agent":  # every agent reads any file but credentials
+            tools += file_tools(agent_access(self.deny))
         tools += material_tools(lambda: recorded_materials(ledger.load(investigation_id)), self.workspace.artifacts)
         activity = {"investigation_id": investigation_id, "task_id": task.task_id, "role": role,
                     "hypothesis_id": task.hypothesis_id, "agent_id": task.agent_id,
@@ -658,16 +709,64 @@ class Dispatcher:
             _write_atomically(activity_path, json.dumps(activity))
             self._beat()
 
+        run = self._runs.get(self._key(investigation_id, task))
+
+        def turn(so_far) -> None:
+            activity.update(calls=so_far.turns, tokens=so_far.usage.total, cost_usd=so_far.cost_usd)
+            _write_atomically(activity_path, json.dumps(activity))
+            if run is not None:
+                run.spent = so_far.cost_usd or 0.0
+
         _write_atomically(activity_path, json.dumps(activity))
         try:
-            result = runner.run(session[:128], system=system, tools=tools, instruction=instruction, limits=limits,
+            result = runner.run(session, system=system, tools=tools, instruction=instruction, limits=limits,
                                 observer=step, should_stop=lambda: self._interruption(investigation_id, task),
-                                web=web_access(state.retrieval, role))
+                                web=web_access(state.retrieval, role), on_turn=turn,
+                                spend_left=lambda own: self._shared_left(investigation_id, run, own))
         finally:
             activity_path.unlink(missing_ok=True)
-        record_agent_run(self.workspace.ledger, investigation_id, actor, session_id=session[:128], role=role,
-                         settings=settings, result=result, task_id=task.task_id)
-        return result.outcome
+        structured = context.report if role == "hypothesis_agent" else None
+        account = None
+        if structured is None and not result.final_text.strip():  # no report: say from the record what it did
+            account = account_of_run(self.workspace.ledger.load(investigation_id), task, actor.id, state.version,
+                                     outcome=result.outcome, error=result.error, turns=result.turns,
+                                     last_step=activity.get("last_step"))
+        record_agent_run(self.workspace.ledger, investigation_id, actor, session_id=session, role=role,
+                         settings=settings, result=result, task_id=task.task_id, started_version=state.version,
+                         account=account, structured=structured)
+        continued = self._continue(investigation_id, task, result)
+        return result.outcome + (f"; {continued}" if continued else "")
+
+    def _continue(self, investigation_id: str, task: AgentTaskRecord, result) -> str | None:
+        """Carry on with a task whose run was cut off by a temporary model-service error, or because the
+        investigation left the states its role works in; the new task runs once it can. Not after a halt or a
+        retirement, nor more than ``MAX_CONTINUATIONS`` times."""
+        if task.role == "approver":
+            return None
+        state = self.workspace.ledger.load(investigation_id)
+        if state.status in INVESTIGATION_MACHINE.terminal:
+            return None
+        if task.agent_id is not None and not state.agents[task.agent_id].active:
+            return None
+        if result.outcome == "model_error" and result.retryable:
+            why = f"a temporary model-service error: {result.error}"
+        elif result.outcome == "stopped" and state.status not in (InvestigationStatus.INVESTIGATING,
+                                                                  InvestigationStatus.REVIEWING):
+            why = result.error or "the investigation stopped"
+        elif result.outcome == "stopped" and task.role == "hypothesis_agent" \
+                and state.status is not InvestigationStatus.INVESTIGATING:
+            why = result.error or "the investigation stopped"
+        else:
+            return None
+        record = state.tasks[task.task_id]
+        if len(task_chain(state, record)) > MAX_CONTINUATIONS:
+            return None
+        task_id = new_id("task")
+        self.workspace.ledger.record(investigation_id, [EventDraft(actor=SYSTEM, payload=AgentTaskQueued(
+            task_id=task_id, role=task.role, hypothesis_id=task.hypothesis_id, agent_id=task.agent_id,
+            instruction=continuation_text(state, record, why), recommendation_id=task.recommendation_id,
+            continues=task.task_id))])
+        return f"to be continued as {task_id}"
 
     def _clear_activity(self) -> None:
         directory = self.workspace.root / ACTIVITY
@@ -783,5 +882,6 @@ def current_activity(workspace: Workspace) -> list[Activity]:
             investigation_id=data["investigation_id"], task_id=data["task_id"], role=data["role"],
             hypothesis_id=data.get("hypothesis_id"), agent_id=data.get("agent_id"),
             started_at=datetime.fromisoformat(data["started_at"]), last_step=data.get("last_step"),
-            last_step_at=datetime.fromisoformat(data["last_step_at"]) if data.get("last_step_at") else None))
+            last_step_at=datetime.fromisoformat(data["last_step_at"]) if data.get("last_step_at") else None,
+            calls=data.get("calls", 0), tokens=data.get("tokens", 0), cost_usd=data.get("cost_usd")))
     return sorted(found, key=lambda a: a.started_at)

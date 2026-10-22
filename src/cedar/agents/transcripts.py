@@ -11,26 +11,46 @@ from pathlib import Path
 from pydantic import TypeAdapter
 
 from cedar.contracts.base import Identifier
-from cedar.models.types import Message
+from cedar.models.types import MediaPart, Message, TextPart, ToolCall, ToolResult
 
 _SESSION = TypeAdapter(Identifier)
+MEDIA_TOKENS = 1600
+"""A rough size for an image or a PDF page shown to a model."""
+
+
+def estimated_tokens(messages: list[Message]) -> int:
+    """A rough count of the tokens a conversation takes up: four characters a token, a fixed size per image."""
+    chars, media = 0, 0
+    for message in messages:
+        for part in message.parts:
+            if isinstance(part, TextPart):
+                chars += len(part.text)
+            elif isinstance(part, ToolCall):
+                chars += len(str(part.arguments))
+            elif isinstance(part, ToolResult):
+                chars += len(part.content)
+                media += len(part.media)
+            elif isinstance(part, MediaPart):
+                media += 1
+    return chars // 4 + media * MEDIA_TOKENS
 
 
 class TranscriptStore:
     def __init__(self, root: str | Path) -> None:
         self.root = Path(root)
 
-    def _path(self, session_id: str) -> Path:
+    def path(self, session_id: str) -> Path:
+        """The session's file: one JSON message per line."""
         return self.root / f"{_SESSION.validate_python(session_id)}.jsonl"
 
     def load(self, session_id: str) -> list[Message]:
-        path = self._path(session_id)
+        path = self.path(session_id)
         if not path.exists():
             return []
         return [Message.model_validate_json(line) for line in path.read_text().splitlines() if line.strip()]
 
     def append(self, session_id: str, message: Message) -> None:
-        path = self._path(session_id)
+        path = self.path(session_id)
         self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
         with os.fdopen(fd, "a") as stream:

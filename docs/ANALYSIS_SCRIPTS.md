@@ -15,11 +15,12 @@ Analysis scripts are not the agent's general-purpose commands: those run in its 
    - imports modules that start processes, open network connections, load foreign code or import dynamically (`subprocess`, `socket`, `urllib`, `multiprocessing`, `ctypes`, `importlib`, …)
    - calls `os.system`, `os.popen`, `os.exec*`, `os.spawn*`, `os.fork` or `os.kill`
    - uses `eval`, `exec`, `compile` or `__import__`
-2. **Staging.** For each calculation it names, which must be one of its own hypothesis's or a registered run shared with every agent, the requested files are copied read-only to `inputs/<calculation_id>/` in a fresh working directory: by default the run's stored outputs and its input files, or any file of the run directory (for a registered run, the directory it came from) named by relative path. Each file is identified by its content hash, and a file the run check already stored must be that same file.
+2. **Staging.** For each calculation it names, any of the investigation's (its own hypothesis's, another agent's, or a registered run), the requested files are copied read-only to `inputs/<calculation_id>/` in a fresh working directory: by default the run's stored outputs and its input files, or any file of the run directory (for a registered run, the directory it came from) named by relative path. Attached materials and other readable files it names, such as a measured spectrum or a reference structure in the agent's workspace, are copied to `inputs/data/<file name>`. Each file is identified by its content hash, and a file the run check already stored must be that same file.
 3. **Execution.** The script runs on the login node with the Python environment CEDAR runs in (NumPy, SciPy, ASE and matplotlib available), with:
+   - isolation with bubblewrap, where it works: an empty filesystem holding only the Python installation, system files and the working directory, and no network. The staged files are the only data the script can see, so its result rests on exactly the files recorded. The run records how it was isolated
    - a clean environment: no credentials, a private home and temporary directory, single-threaded numerical libraries
    - limits: 10 minutes of CPU, 15 minutes of wall-clock time, 4 GiB of memory, 200 MiB per file written; at most two scripts run at once, whichever agents started them
-   - an audit hook that refuses to read anything but the staged inputs, the Python installation and system libraries; to write, delete or rename anything outside the working directory; to start any program; or to open a socket
+   - an audit hook that refuses to read anything but the staged inputs, the Python installation and system libraries (`sqlite3` databases included); to write, delete or rename anything outside the working directory; to start any program; or to open a socket
 4. **Collection.** What the script printed, every file it wrote, and the results and checks it reported are stored by content hash. The run is recorded as an `analysis_recorded` event whether it completed, failed or timed out. The working directory is then removed.
 
 ## Results and checks
@@ -49,7 +50,7 @@ Both kinds are recorded on the evidence. The script's checks appear with the pre
 
 A script cannot start a program, so it cannot launch a DFT code, an MPI job or a shell command. Calculations run only as examined jobs through the job manager, through Slurm or locally on an interactive node, after the researcher authorizes them.
 
-The guards stop mistakes and naive misuse. They are not a security boundary against code written to evade them: Python audit hooks can be bypassed from native code, and shared login nodes often do not allow operating-system sandboxes. Agents are instructed never to work around the guards.
+With bubblewrap, the script's filesystem is a security boundary: files that were not staged do not exist for it. Where bubblewrap does not work, only the audit hook remains, which stops mistakes and naive misuse but not code written to evade it (audit hooks can be bypassed from native code). Agents are instructed never to work around the guards.
 
 ## Correctness
 
@@ -67,6 +68,7 @@ Each piece of evidence from an analysis:
 - carries every check the script reported for that result; the record refuses evidence that leaves one out
 - links the script, every staged input, what the script printed and its products
 - is `VALIDATED` only if every run it used ended `COMPLETED` and passed its run checks, and every script check on it passed. A failed run gives the run's failure quality (`INVALID`, or `INCONCLUSIVE` for an unconverged relaxation); a failed script check gives `INCONCLUSIVE`
+- names the data from outside the calculations it read, if any, as a limitation; an analysis of such data alone rests on no calculation, so it cannot support a hypothesis
 - states as a limitation that the script has not been reviewed by an independent agent or person
 
 The Evidence Judge's dossier shows the script behind each analysis result, so the Judge can see how a decisive value was obtained.
@@ -83,7 +85,7 @@ The evidence record already keeps everything such a review needs: the script, th
 
 ## Where it is implemented
 
-- `src/cedar/engine/analysis.py`: examination, staging, execution, collection
+- `src/cedar/engine/analysis.py`: examination, staging, isolation and execution, collection
 - `src/cedar/engine/analysis_guard.py`: limits and the audit hook, run in the child process
 - `src/cedar/engine/results.py`: run checks, readings and analysis results as evidence
 - `src/cedar/agents/toolkits/research.py`: the agent's `run_outputs`, `submit_reading`, `run_analysis` and `record_result` tools

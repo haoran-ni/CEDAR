@@ -193,7 +193,8 @@ def test_what_is_next_lists_unfinished_work_and_approvals(workspace):
     examine(workspace.ledger, inv, calc)
     move(workspace.ledger, inv, calc, ENGINE, CalculationState.VALIDATED_INPUT)
     upcoming = section(render_notebook(workspace.store.read_stream(inv))["round-00.md"], "What is next?")
-    assert f"- Waiting for the researcher: `/approve submit {calc}` (CO/Cu(111) p(2x2): " in upcoming
+    assert f"- Waiting for the researcher: `/approve submit {calc}` (A1 agent-hyp-xc on hyp-xc; CO/Cu(111) p(2x2): " \
+        in upcoming
     assert f"- {calc} not finished: VALIDATED_INPUT" in upcoming
     assert "Nothing is queued" not in upcoming
 

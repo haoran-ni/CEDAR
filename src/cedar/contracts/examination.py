@@ -86,6 +86,11 @@ class InputExamination(Contract):
     verdict: ExaminationVerdict
     requested_core_hours: float | None = Field(default=None, ge=0)
     """What the job script asks of the scheduler (tasks times walltime), if the protocol can read it."""
+    requested_tasks: int | None = Field(default=None, ge=1)
+    requested_minutes: int | None = Field(default=None, ge=1)
+    """The walltime the script asks for."""
+    partition: str | None = None
+    """The Slurm partition it asks for; "local" for a run on the interactive node."""
 
     @model_validator(mode="after")
     def _consistent(self) -> "InputExamination":

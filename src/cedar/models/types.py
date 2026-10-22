@@ -119,11 +119,33 @@ class ModelReply(Contract):
     changed since they were made, e.g. tool definitions updated by a new CEDAR version."""
 
 
+class ModelPrices(Contract):
+    """What a model's tokens cost, in US dollars per million tokens of each kind, and a web search in dollars."""
+
+    input: float = Field(ge=0)
+    """Fresh input."""
+    output: float = Field(ge=0)
+    cache_read: float = Field(ge=0)
+    """Input read from the prompt cache."""
+    cache_write: float = Field(ge=0)
+    """Input written to the prompt cache."""
+    web_search: float = Field(default=0.0, ge=0)
+    """Per search the provider runs."""
+
+    def cost(self, usage: "Usage") -> float:
+        """What ``usage`` cost, in dollars."""
+        tokens = (usage.input_tokens * self.input + usage.output_tokens * self.output
+                  + usage.cache_read_tokens * self.cache_read + usage.cache_write_tokens * self.cache_write)
+        return tokens / 1_000_000 + usage.web_searches * self.web_search
+
+
 class ModelSettings(Contract):
     """Which model a role uses. Configuration, never hard-coded."""
 
     provider: NonEmptyStr
     model: NonEmptyStr
+    prices: ModelPrices | None = None
+    """What its tokens cost; None takes the prices published for the model, if CEDAR knows them."""
     max_output_tokens: int = Field(default=64000, gt=0)
     effort: Literal["low", "medium", "high", "xhigh", "max"] | None = None
     """Reasoning effort, for providers that support it."""

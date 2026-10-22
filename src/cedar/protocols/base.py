@@ -76,6 +76,11 @@ class Protocol(ABC):
 
     def requested_core_hours(self, files: Mapping[str, bytes]) -> float | None:
         """Core-hours the examined job script asks for, if this protocol can read them."""
+        resources = self.requested_resources(files)
+        return resources.core_hours if resources is not None else None
+
+    def requested_resources(self, files: Mapping[str, bytes]):
+        """What the examined job script asks for (partition, tasks, walltime), if this protocol can read it."""
         return None
 
     @abstractmethod

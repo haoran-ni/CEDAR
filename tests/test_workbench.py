@@ -239,14 +239,14 @@ def test_an_agent_runs_commands_through_its_tools(tmp_path, site):
     context = research_context(workspace, INV, agent, services, deny=[tmp_path / "config"], workbench=workbench)
     tools = {t.name: t for t in research_tools(context)}
     view = context.bench.view()
-    assert workspace.root.resolve() in view.hidden and tmp_path.joinpath("config").resolve() in view.hidden
+    assert workspace.root.resolve() not in view.hidden and tmp_path.joinpath("config").resolve() in view.hidden
     assert site.codes["fhi-aims"].binary in {str(p) for p in view.hidden}
 
     out = tools["run_command"].invoke({"command": f"python -c \"import ase; print('ase', ase.__version__)\" && "
                                                   f"{site.codes['fhi-aims'].binary}; ls {workspace.root}",
                                        "purpose": "check the Python environment"})
     assert out.content.startswith("Workbench run wb_") and "ase 3." in out.content
-    assert "synthetic test binary" not in out.content and "events.sqlite" not in out.content
+    assert "synthetic test binary" not in out.content and "events.sqlite" in out.content  # CEDAR's records too
     assert "login node login1" in tools["workbench_runs"].invoke({}).content
 
     assert chat.handle("/workbench").startswith("The workbench is on for this investigation")

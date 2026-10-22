@@ -1,17 +1,18 @@
 """Full automation: while the researcher is away, an approver takes their routine decisions, and the Evidence
 Judge assesses new evidence before every review of the Chief Scientist.
 
-The researcher switches it on for one investigation with ``/mode full-automation <core-hours> <tokens>`` and off
+The researcher switches it on for one investigation with ``/mode full-automation <core-hours> <dollars>`` and off
 with ``/mode human-in-the-loop`` or ``/halt``. The approver decides whether proposed agents start and whether
 calculations are submitted, within the core-hours allowed; inputs needing review, cancellations and closing stay
 with the researcher. Each pending item is offered to the approver once per stretch of full automation; one it
-leaves undecided, or one over the core-hours left, waits for the researcher. When the token allowance is used up,
-the dispatcher switches the investigation back to human-in-the-loop and pauses it.
+leaves undecided, or one over the core-hours left, waits for the researcher. When the dollars allowed for model use
+are spent, the dispatcher switches the investigation back to human-in-the-loop and pauses it.
 """
 
 from dataclasses import dataclass
 
 from cedar.contracts.plan import PermissionAction, Priority
+from cedar.models.prices import dollars
 from cedar.contracts.status import CalculationState, InvestigationStatus
 from cedar.state.projection import InvestigationState, authorization_for, hypothesis_evidence
 
@@ -95,4 +96,4 @@ def mode_summary(state: InvestigationState) -> str:
     if automation is None:
         return "human-in-the-loop"
     return (f"full automation: {max(state.automation_core_hours_left, 0):g} of {automation.max_core_hours:g} "
-            f"core-hours and {max(state.automation_tokens_left, 0):,} of {automation.max_tokens:,} tokens left")
+            f"core-hours and {dollars(max(state.automation_cost_left, 0))} of {dollars(automation.max_usd)} left")

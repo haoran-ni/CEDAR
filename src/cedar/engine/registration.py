@@ -79,6 +79,10 @@ class RunRegistrar:
         source = self._readable(path) if self._readable is not None else path.resolve()
         if not source.is_dir():
             return RegistrationOutcome(None, (f"{source} is not a directory",))
+        if self._profile is not None and source.is_relative_to(Path(self._profile.runs_root).resolve()):
+            return RegistrationOutcome(None, (f"{source} is a run directory of CEDAR's own calculations; use that "
+                                              "calculation directly instead of registering it as a run computed "
+                                              "outside CEDAR",))
         names = (*INPUT_FILES, output_file)
         missing = [name for name in names if not (source / name).is_file()]
         if missing:

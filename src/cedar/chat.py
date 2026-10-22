@@ -9,7 +9,9 @@ own command.
 
 The Chief Scientist also reviews the agents' reports in the background, in a conversation
 of its own; what it concluded is shown here, and passed to it at the start of its next
-turn in this conversation.
+turn in this conversation. Once this conversation has grown past ``fresh_after_tokens``, it
+continues in a new one that opens with a briefing built from the record, the latest exchanges
+included.
 
 With ``auto_dispatch`` the session starts a dispatcher in the background whenever the
 investigation has work for one and none is running, so approved agents start without the
@@ -20,8 +22,10 @@ terminal interface does this); every record they make is built from the state at
 moment it is written.
 
 ``/web`` sets whether the agents may use the web, ``/attach`` gives them a file to view, and
-``/budget`` sets the investigation's total token budget, which also limits the Chief
-Scientist's answers here. All three work before the investigation exists: what they set is
+``/budget`` sets what the investigation's agents may spend on models in total, in dollars
+($15 unless the researcher sets another amount), which also limits the Chief Scientist's
+answers here. The size of this conversation is a separate, token limit: past
+``fresh_after_tokens`` it continues in a new one. All three work before the investigation exists: what they set is
 recorded, with the researcher's command, the moment it opens, and the Chief Scientist works
 under it meanwhile.
 """
@@ -39,8 +43,11 @@ from pathlib import Path
 from cedar.agents import AgentRunner, RunLimits, RunResult, record_agent_run
 from cedar.agents.tools import ToolOutcome
 from cedar.agents.prompts import CHIEF_SCIENTIST
+from cedar.agents.transcripts import estimated_tokens
+from cedar.briefing import chat_briefing, session_name, sessions_of
 from cedar.agents.media import viewable
 from cedar.agents.toolkits.chief import ChiefContext, chief_tools
+from cedar.agents.toolkits.files import agent_access, file_tools
 from cedar.agents.toolkits.materials import Material, material_line, material_tools, recorded_materials
 from cedar.contracts.base import Actor, ActorKind
 from pydantic import ValidationError
@@ -52,11 +59,11 @@ from cedar.contracts.events import (
     MaterialAttached,
     ModeChanged,
     RetrievalPolicyChanged,
-    TokenBudgetChanged,
+    BudgetChanged,
     UserInterventionRecorded,
     WorkbenchPolicyChanged,
 )
-from cedar.contracts.investigation import RetrievalPolicy
+from cedar.contracts.investigation import DEFAULT_BUDGET_USD, RetrievalPolicy
 from cedar.contracts.plan import Authorization, PermissionAction
 from cedar.contracts.status import INVESTIGATION_MACHINE, CalculationState, InvestigationMode
 from cedar.errors import RuleViolation
@@ -64,6 +71,7 @@ from cedar.hpc.profile import ProfileStore
 from cedar.hpc.profile import ProfileNotApproved
 from cedar.hpc.node import ExecutionHost, HostWatch, local_dft
 from cedar.hpc.slurm import SchedulerBackend, SchedulerError
+from cedar.models.prices import dollars
 from cedar.models.types import ToolCall
 from cedar.dashboard import dispatcher_status
 from cedar.dispatch import (
@@ -79,9 +87,12 @@ from cedar.dispatch import (
 )
 from cedar.notebook import round_file, update_notebook
 from cedar.paths import config_dir
-from cedar.state.projection import AgentRunRecord, InvestigationState, RetrievalRecord
+from cedar.state.projection import AgentRunRecord, InvestigationState, RetrievalRecord, find_agent
 from cedar.summaries import (
+    agent_requests,
     approval_requests,
+    awaiting_submission,
+    submission_note,
     calculation_summary,
     investigation_summary,
     pending_approvals,
@@ -112,15 +123,17 @@ COMMANDS = (
     Command("/approve agents", "start the proposed agents now instead of after the review window"),
     Command("/pending", "what waits for your approval"),
     Command("/approve submit <calc>", "allow a calculation with approved inputs to be submitted"),
+    Command("/approve submit all", "allow every calculation waiting for submission"),
+    Command("/approve submit <agent>", "allow the calculations one agent waits to submit, e.g. A2"),
     Command("/approve inputs <calc>", "allow inputs the examiner could not verify"),
     Command("/approve close", "close the investigation for good, as the Chief Scientist proposes"),
     Command("/mode", "show the mode: human-in-the-loop, or full automation and what it has left"),
     Command("/mode human-in-the-loop", "take your decisions back: agent proposals and submissions wait for you"),
-    Command("/mode full-automation <core-hours> <tokens>", "while you are away, an approver decides on agents and "
+    Command("/mode full-automation <core-hours> <dollars>", "while you are away, an approver decides on agents and "
             "submissions and the Evidence Judge assesses new evidence, within these limits"),
-    Command("/budget", "show the investigation's total token budget and what is used"),
-    Command("/budget <tokens>", "limit the tokens all its agents may process in total, e.g. 5M or 800k"),
-    Command("/budget off", "no total limit (the default)"),
+    Command("/budget", "show what the investigation's agents have spent on models, and the budget"),
+    Command("/budget <dollars>", "limit what all its agents may spend on models in total, e.g. 40 ($15 by default)"),
+    Command("/budget off", "no limit on spending"),
     Command("/web", "show whether the agents may use the web"),
     Command("/web on", "let the Chief Scientist and the hypothesis agents search and read the web"),
     Command("/web only <domains>", "the same, limited to these domains, e.g. arxiv.org doi.org"),
@@ -184,12 +197,12 @@ class ChatSession:
     investigation_id: str | None = None
     user: Actor = field(default_factory=lambda: Actor(kind=ActorKind.USER, id=getpass.getuser()))
     backend: SchedulerBackend | None = None
-    limits: RunLimits = field(default_factory=lambda: RunLimits(max_turns=30))
-    """For each answer of the Chief Scientist; what the token budget has left also caps it."""
+    limits: RunLimits = field(default_factory=RunLimits)
+    """For each answer of the Chief Scientist: no limit on model calls; what the budget has left caps it."""
     clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc)
     _unrecorded: list[tuple] = field(default_factory=list)
     """What the researcher said and set before the investigation existed, in order: ("message", text),
-    ("web", line, policy, domains), ("attach", line, Material) and ("budget", line, max_tokens)."""
+    ("web", line, policy, domains), ("attach", line, Material) and ("budget", line, max_usd)."""
     _announced_materials: set[str] = field(default_factory=set)
     _unrecorded_runs: list[RunResult] = field(default_factory=list)
     _seen_runs: int = 0
@@ -202,7 +215,11 @@ class ChatSession:
     """How to start one; by default ``start_background_dispatcher``."""
     host: Callable[[], ExecutionHost] = field(default_factory=HostWatch)
     """Where the chat runs: a login node, or an interactive node inside a Slurm allocation."""
+    fresh_after_tokens: int = 800_000
+    """Once the conversation's input has grown this large, it continues in a new conversation, briefed."""
     _last_start: float | None = None
+    _context_tokens: int | None = None
+    _warnings: list[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         if self.investigation_id is not None:
@@ -282,7 +299,9 @@ class ChatSession:
         if name == "/mode":
             return self._mode(args, line)
         if name == "/pending":
-            return "\n".join(pending_approvals(state)) or "Nothing waits for your approval."
+            requests = agent_requests(state)
+            text = "\n".join(pending_approvals(state)) or "Nothing waits for your approval."
+            return text + ("\n\nRequests from agents:\n" + "\n".join(f"  {r}" for r in requests) if requests else "")
         if name == "/report":
             update = update_notebook(self.workspace, self.investigation_id)
             return (f"Research notebook ({update.summary}): {update.index}\n"
@@ -315,6 +334,8 @@ class ChatSession:
 
     def _authorize(self, action: PermissionAction, given: str, line: str) -> str:
         state = self.workspace.ledger.load(self.investigation_id)
+        if action is PermissionAction.SUBMIT and (given.lower() == "all" or find_agent(state, given) is not None):
+            return self._authorize_many(state, given, line)
         calculation_id, problem = self._find_calculation(state, given)
         if calculation_id is None:
             return problem
@@ -327,6 +348,24 @@ class ChatSession:
                 return f"Recorded your approval ({intervention}), but the inputs could not be validated: {exc}"
             return f"Inputs of {calculation_id} approved ({intervention}). They still need /approve submit to run."
         return f"Submission of {calculation_id} authorized ({intervention}). The dispatcher submits it on its next tick."
+
+    def _authorize_many(self, state: InvestigationState, given: str, line: str) -> str:
+        """Authorize every submission waiting for the researcher, or those of one agent's hypothesis."""
+        waiting = [state.calculations[c] for c in awaiting_submission(state)]
+        if given.lower() != "all":
+            agent = find_agent(state, given)
+            waiting = [c for c in waiting if agent.hypothesis_id in c.hypothesis_ids]
+            whose = f" of {agent.tag} {agent.agent_id}"
+        else:
+            whose = ""
+        if not waiting:
+            return f"No calculation{whose} waits for your authorization to be submitted."
+        ids = tuple(c.calculation_id for c in waiting)
+        intervention = self._record_message(line, (Authorization(action=PermissionAction.SUBMIT, target_ids=ids),))
+        lines = [f"Submission of {len(ids)} calculation{'s' * (len(ids) != 1)}{whose} authorized ({intervention}). "
+                 "The dispatcher submits them on its next tick:"]
+        lines += [f"  - {c.calculation_id}: {submission_note(state, c)}" for c in waiting]
+        return "\n".join(lines)
 
     def _start_agents(self, line: str) -> str:
         found = []
@@ -352,7 +391,7 @@ class ChatSession:
                 "their first tasks.")
 
     def _mode(self, args: list[str], line: str) -> str:
-        usage = "Usage: /mode, /mode human-in-the-loop, or /mode full-automation <core-hours> <tokens>"
+        usage = "Usage: /mode, /mode human-in-the-loop, or /mode full-automation <core-hours> <dollars>"
         if not args:
             state = self.workspace.ledger.load(self.investigation_id)
             return f"{self.investigation_id} is in {mode_summary(state)}.\n{usage}"
@@ -362,9 +401,10 @@ class ChatSession:
         elif wanted == "full-automation" and len(args) == 3:
             mode = InvestigationMode.FULL_AUTOMATION
             try:
-                limits = {"max_core_hours": float(args[1].replace(",", "")),
-                          "max_tokens": int(float(args[2].replace(",", "")))}
+                limits = {"max_core_hours": float(args[1].replace(",", "")), "max_usd": self._amount(args[2])}
             except ValueError:
+                return usage
+            if limits["max_usd"] is None:
                 return usage
         else:
             return usage
@@ -387,69 +427,82 @@ class ChatSession:
         return (f"{self.investigation_id} is in full automation ({message_id}). While you are away, an approver "
                 "decides on agent proposals and submissions, and the Evidence Judge assesses new evidence before each "
                 f"review of the Chief Scientist, within {limits['max_core_hours']:g} core-hours and "
-                f"{limits['max_tokens']:,} tokens from now. When the tokens are used up, the investigation switches "
+                f"{dollars(limits['max_usd'])} of model use from now. When that is spent, the investigation switches "
                 "back to human-in-the-loop and pauses. /approve inputs, /approve close, /cancel and /halt stay yours; "
                 "/mode human-in-the-loop takes everything back.")
 
-    # -- the token budget ---------------------------------------------------------------------
+    # -- the budget -----------------------------------------------------------------------------
 
-    def _tokens(self) -> tuple[int, int | None]:
-        """Tokens used and the total budget, None for none; before the investigation exists, the Chief
-        Scientist's answers so far and the researcher's latest /budget."""
+    def _spending(self) -> tuple[float, float | None]:
+        """Dollars spent and the budget, None for none; before the investigation exists, the Chief Scientist's
+        answers so far and the researcher's latest /budget, else the default."""
         if self.investigation_id is not None:
             state = self.workspace.ledger.load(self.investigation_id)
-            return state.model_tokens_used, state.model_token_budget
+            return state.model_cost, state.budget_usd
         budgets = [entry[2] for entry in self._unrecorded if entry[0] == "budget"]
-        return sum(r.usage.total for r in self._unrecorded_runs), budgets[-1] if budgets else None
+        return (sum(r.cost_usd or 0 for r in self._unrecorded_runs),
+                budgets[-1] if budgets else DEFAULT_BUDGET_USD)
 
-    def _tokens_left(self) -> int | None:
-        used, budget = self._tokens()
-        return None if budget is None else max(0, budget - used)
+    def _budget_left(self) -> float | None:
+        spent, budget = self._spending()
+        return None if budget is None else max(0.0, budget - spent)
+
+    def _shared_left(self, own: float) -> float | None:
+        """What the budget has left while the Chief Scientist answers, given what it has spent on this answer and
+        what the dispatcher's agent runs in progress have spent; None for no budget."""
+        left = self.workspace.ledger.load(self.investigation_id).budget_left
+        if left is None:
+            return None
+        live = sum(a.cost_usd or 0 for a in current_activity(self.workspace)
+                   if a.investigation_id == self.investigation_id)
+        return left - live - own
 
     @staticmethod
-    def _token_count(text: str) -> int | None:
-        match = re.fullmatch(r"(\d+(?:\.\d+)?)([kKmM]?)", text.replace(",", "").replace("_", ""))
+    def _amount(text: str) -> float | None:
+        """Dollars as the researcher types them: 15, $15, 7.50, 1,000."""
+        match = re.fullmatch(r"\$?(\d+(?:\.\d+)?)", text.replace(",", "").replace("_", ""))
         if match is None:
             return None
-        count = float(match.group(1)) * {"": 1, "k": 1e3, "m": 1e6}[match.group(2).lower()]
-        return int(count) if count >= 1 else None
+        amount = float(match.group(1))
+        return amount if amount > 0 else None
 
     def _budget(self, args: list[str], line: str) -> str:
-        usage = "Usage: /budget, /budget <tokens> (e.g. 5M, 800k or 2,000,000), or /budget off"
-        used, budget = self._tokens()
+        usage = "Usage: /budget, /budget <dollars> (e.g. 15 or $40), or /budget off"
+        spent, budget = self._spending()
         if not args:
             if budget is None:
-                return f"No token budget: agents may process any number of tokens. {used:,} used so far.\n{usage}"
-            return f"Token budget: {used:,} of {budget:,} used, {max(0, budget - used):,} left.\n{usage}"
+                return f"No budget: agents may spend any amount on models. {dollars(spent)} spent so far.\n{usage}"
+            return (f"Budget: {dollars(spent)} of {dollars(budget)} spent on models, "
+                    f"{dollars(max(0.0, budget - spent))} left.\n{usage}")
         if len(args) != 1:
             return usage
         if args[0].lower() == "off":
-            max_tokens = None
+            max_usd = None
         else:
-            max_tokens = self._token_count(args[0])
-            if max_tokens is None:
+            max_usd = self._amount(args[0])
+            if max_usd is None:
                 return usage
         if self.investigation_id is None:
-            self._unrecorded.append(("budget", line, max_tokens))
+            self._unrecorded.append(("budget", line, max_usd))
             recorded = "it is recorded when the investigation opens"
         else:
             try:
-                recorded = self._record_budget(line, max_tokens)
+                recorded = self._record_budget(line, max_usd)
             except RuleViolation as exc:
                 return f"The budget could not be changed: {exc}"
-        if max_tokens is None:
-            return f"No token budget from now on ({recorded}). {used:,} tokens used so far."
-        if used >= max_tokens:
-            return (f"Token budget {max_tokens:,} ({recorded}): {used:,} are already used, so no agent works and the "
-                    "Chief Scientist does not answer until you raise it.")
-        return (f"Token budget {max_tokens:,} ({recorded}): {used:,} used, {max_tokens - used:,} left for all agents "
-                "together, the Chief Scientist's answers included. Every token counts, cached input too.")
+        if max_usd is None:
+            return f"No budget from now on ({recorded}). {dollars(spent)} spent so far."
+        if spent >= max_usd:
+            return (f"Budget {dollars(max_usd)} ({recorded}): {dollars(spent)} is already spent, so no agent works and "
+                    "the Chief Scientist does not answer until you raise it.")
+        return (f"Budget {dollars(max_usd)} ({recorded}): {dollars(spent)} spent, {dollars(max_usd - spent)} left for "
+                "all agents together, the Chief Scientist's answers included, at the price of each kind of token.")
 
-    def _record_budget(self, line: str, max_tokens: int | None) -> str:
+    def _record_budget(self, line: str, max_usd: float | None) -> str:
         def build(state: InvestigationState) -> list[EventDraft]:
             message = self._message_draft(state, line, ())
-            return [message, EventDraft(actor=self.user, payload=TokenBudgetChanged(
-                max_tokens=max_tokens, intervention_id=message.payload.intervention_id))]
+            return [message, EventDraft(actor=self.user, payload=BudgetChanged(
+                max_usd=max_usd, intervention_id=message.payload.intervention_id))]
 
         return self.workspace.ledger.record_with(self.investigation_id, build).events[0].payload.intervention_id
 
@@ -720,17 +773,18 @@ class ChatSession:
     # -- the Chief Scientist ------------------------------------------------------------------
 
     def _ask_chief(self, text: str, observer: Callable[[ToolCall, ToolOutcome], None] | None = None) -> str:
-        left = self._tokens_left()
+        left = self._budget_left()
         if left == 0:
-            return ("Not sent: the investigation's token budget is used up. Raise it with /budget <tokens>, or remove "
-                    "it with /budget off.")
+            return ("Not sent: the investigation's budget is spent. Raise it with /budget <dollars>, or remove it with "
+                    "/budget off.")
         limits = self.limits
         if left is not None:
-            limits = replace(limits, max_tokens=left if limits.max_tokens is None else min(left, limits.max_tokens))
+            limits = replace(limits, max_cost_usd=left if limits.max_cost_usd is None else min(left, limits.max_cost_usd))
         attached = self._newly_attached()
         if self.investigation_id is not None:
+            fresh = self._fresh_start()
             message_id = self._record_message(text)
-            instruction = (self._reviews_since_last_turn() + attached
+            instruction = (fresh + self._reviews_since_last_turn() + attached
                            + f"[researcher, recorded as {message_id}] {text}")
         else:
             self._unrecorded.append(("message", text))
@@ -741,14 +795,17 @@ class ChatSession:
                                dispatcher=self._dispatcher_status,
                                registrar=lambda inv: investigation_registrar(self.workspace, self.profiles, inv,
                                                                              deny=[config_dir()]),
-                               where=self._where)
+                               where=self._where, running=self._agents_at_work, warn=self._warnings.append)
         settings = self.clients.settings("chief_scientist")
         runner = AgentRunner(self.clients.client("chief_scientist"), settings, self.workspace.transcripts,
                              secrets=self.clients.secrets())
-        tools = chief_tools(context) + material_tools(self._materials, self.workspace.artifacts)
+        tools = (chief_tools(context) + file_tools(agent_access([config_dir()]))
+                 + material_tools(self._materials, self.workspace.artifacts))
         result = runner.run(self.chief_session, system=CHIEF_SCIENTIST, tools=tools, instruction=instruction,
                             limits=limits, observer=observer,
-                            web=web_access(self.web_setting(), "chief_scientist"))
+                            web=web_access(self.web_setting(), "chief_scientist"),
+                            spend_left=self._shared_left if self.investigation_id is not None else None)
+        self._context_tokens = result.context_tokens
         if self.investigation_id is None:
             self._unrecorded_runs.append(result)
         else:
@@ -756,10 +813,35 @@ class ChatSession:
                 record_agent_run(self.workspace.ledger, self.investigation_id, CHIEF, session_id=self.chief_session,
                                  role="chief_scientist", settings=settings, result=earlier)
             self._unrecorded_runs.clear()
-        reply = result.final_text or ""
+        reply = "".join(f"[warning] {w}\n\n" for w in self._warnings) + (result.final_text or "")
+        self._warnings.clear()
         if result.outcome != "finished":
             reply += f"\n[the Chief Scientist stopped: {result.outcome}{': ' + result.error if result.error else ''}]"
         return reply.strip()
+
+    def _agents_at_work(self) -> list[str]:
+        """The hypothesis agents of this investigation that the dispatcher is running now."""
+        if self.investigation_id is None:
+            return []
+        state = self.workspace.ledger.load(self.investigation_id)
+        return [f"{state.agents[a.agent_id].tag} ({a.agent_id})" for a in current_activity(self.workspace)
+                if a.investigation_id == self.investigation_id and a.role == "hypothesis_agent"
+                and a.agent_id in state.agents]
+
+    def _fresh_start(self) -> str:
+        """If the conversation has grown past ``fresh_after_tokens``, continue in a new one and return the briefing
+        that opens it; otherwise nothing."""
+        size = self._context_tokens
+        if size is None:
+            size = estimated_tokens(self.workspace.transcripts.load(self.chief_session))
+        if size < self.fresh_after_tokens:
+            return ""
+        state = self.workspace.ledger.load(self.investigation_id)
+        earlier = list(dict.fromkeys([*sessions_of(state, CHIEF.id, reviews=False), self.chief_session]))
+        self.chief_session = session_name(self.investigation_id, "chief", str(len(earlier) + 1))
+        self._context_tokens = None
+        return chat_briefing(state, transcripts=self.workspace.transcripts.root,
+                             notebook=self.workspace.notebook_dir(self.investigation_id), sessions=earlier) + "\n\n"
 
     def _where(self) -> str:
         """Whether calculations can run locally: they start where the dispatcher runs, which the chat starts here."""
@@ -856,9 +938,11 @@ class ChatSession:
                                                          "message)").strip(), review=True))
                 continue
             agent = state.agents.get(run.actor_id)
-            who = f"{agent_label(agent)}" if agent else f"{run.role} {run.actor_id}"
+            who = agent_label(agent) if agent else f"{run.role} {run.actor_id}"
             report = (run.run.report or "(no report)").strip().splitlines()[0][:300]
             notices.append(Notice(f"[{who}: {run.run.outcome}] {report}"))
+            asked = run.run.structured.requests if run.run.structured is not None else ()
+            notices += [Notice(f"[{who} asks you] {r.text}") for r in asked if r.to == "researcher"]
         notices += [Notice(f"[{recommendation_text(r)}]") for r in recommended]
         for a in decided:
             what = (f"the agents of {a.target_id}" if a.action is PermissionAction.START_AGENTS else

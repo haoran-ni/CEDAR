@@ -75,7 +75,7 @@ class ProtocolEngine:
         refs = {name: self._artifacts.put_bytes(data, label=name) for name, data in sorted(files.items())}
         execution = tuple(name for name in protocol.execution_files if name in refs)
         input_hash = scientific_input_hash(protocol.ref, protocol.code_version, refs, execution)
-        duplicate = calculation_with_inputs(state, input_hash, calc.hypothesis_ids)
+        duplicate = calculation_with_inputs(state, input_hash)
         if duplicate is not None:
             message = (f"these inputs are identical to registered run {duplicate}, which already has outputs; read "
                        "or analyse it instead of running it again" if state.calculations[duplicate].registered else
@@ -84,7 +84,7 @@ class ProtocolEngine:
         verdict = verdict_for(findings)
         examination = InputExamination(protocol=protocol.ref, code_version=protocol.code_version, files=refs,
                                        execution_files=execution, input_hash=input_hash, findings=tuple(findings),
-                                       verdict=verdict, requested_core_hours=protocol.requested_core_hours(files))
+                                       verdict=verdict, **_requested(protocol.requested_resources(files)))
         workdir = f"{investigation_id}/{calculation_id}"
         if verdict is not ExaminationVerdict.REJECTED:
             self._write_run_directory(self._runs_root / workdir, files)
@@ -133,3 +133,11 @@ class ProtocolEngine:
                 continue
             path.write_bytes(data)
             os.chmod(path, 0o444)
+
+
+def _requested(resources) -> dict:
+    """What the job script asks for, as the examination records it."""
+    if resources is None:
+        return {}
+    return {"requested_core_hours": resources.core_hours, "requested_tasks": resources.ntasks,
+            "requested_minutes": resources.walltime_minutes, "partition": resources.partition}

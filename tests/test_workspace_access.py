@@ -1,17 +1,16 @@
-"""What a hypothesis agent may read and write: any file but secrets and CEDAR's own records, and only its workspace.
+"""What an agent may read and write: any file but credentials, and only its own workspace.
 
 Everything here is a SYNTHETIC directory tree under the test's temporary directory; the FakeScheduler TEST
 DOUBLE runs nothing.
 """
 
 import pytest
-from factories import AGENT, add_hypothesis
+from factories import AGENT
 from sites import co_on_cu111, declared, geometry_text
 from worlds import World
 
 import cedar.agents.toolkits.files as files_module
-from cedar.agents.toolkits import ResearchContext, file_tools, research_tools, workspace_tools
-from cedar.agents.toolkits.research import agent_file_access
+from cedar.agents.toolkits import ResearchContext, agent_access, file_tools, research_tools, workspace_tools
 from cedar.contracts import CalculationState
 
 
@@ -41,10 +40,8 @@ def tree(tmp_path, monkeypatch, world):
             "config": tmp_path / "config"}
 
 
-def access_for(world, tree, hypothesis=None):
-    hypothesis = hypothesis or world.hyp
-    return agent_file_access(world.ledger, world.inv, hypothesis, world.runs, data_dir=tree["data"],
-                             workspace=tree["data"] / "workspaces" / "inv-1" / hypothesis, deny=[tree["config"]])
+def access_for(world, tree):
+    return agent_access(deny=[tree["config"]])
 
 
 def tools(access):
@@ -60,11 +57,15 @@ def test_agents_read_the_researchers_files_anywhere(world, tree):
     assert not out.is_error and "1: PBE prefers fcc" in out.content
 
 
-@pytest.mark.parametrize("secret", ["home/.ssh/id_ed25519", "config/credentials.toml", "data/events.sqlite",
-                                    "data/workspaces/inv-1/hyp-b/their-notes.txt"])
-def test_secrets_and_cedars_records_are_never_readable(world, tree, tmp_path, secret):
+@pytest.mark.parametrize("secret", ["home/.ssh/id_ed25519", "config/credentials.toml"])
+def test_credentials_are_never_readable(world, tree, tmp_path, secret):
     out = read(access_for(world, tree), tmp_path / secret)
     assert out.is_error and "not readable by agents" in out.content
+
+
+@pytest.mark.parametrize("record", ["data/events.sqlite", "data/workspaces/inv-1/hyp-b/their-notes.txt"])
+def test_cedars_records_and_the_other_agents_workspaces_are_readable(world, tree, tmp_path, record):
+    assert not read(access_for(world, tree), tmp_path / record).is_error
 
 
 def test_pseudo_filesystems_are_not_files(world, tree):
@@ -74,17 +75,14 @@ def test_pseudo_filesystems_are_not_files(world, tree):
         assert out.is_error and "not readable by agents" in out.content
 
 
-def test_the_own_workspace_is_readable_inside_the_denied_data_directory(world, tree):
+def test_searches_find_everything_but_credentials(world, tree):
     (tree["workspace"] / "slab.in").write_text("atom 0 0 0 Cu\n")
     access = access_for(world, tree)
-    assert not read(access, tree["workspace"] / "slab.in").is_error
     found = tools(access)["find_files"].invoke({"root": str(tree["data"].parent), "name_pattern": "*.*"}).content
     assert str((tree["workspace"] / "slab.in").resolve()) in found
-    assert "their-notes" not in found and "data/events.sqlite" not in found and "credentials" not in found
+    assert "their-notes" in found and "events.sqlite" in found and "credentials" not in found
     listing = tools(access)["list_directory"].invoke({"path": str(tree["data"].parent)}).content
     assert "data/" in listing and "config  (not readable by agents)" in listing
-    refused = tools(access)["list_directory"].invoke({"path": str(tree["data"])})
-    assert refused.is_error and "not readable by agents" in refused.content
 
 
 def test_a_link_out_of_the_workspace_reaches_nothing_denied(world, tree):
@@ -159,6 +157,4 @@ def test_a_structure_written_in_the_workspace_can_be_requested(world, tree):
     (calc,) = world.state().calculations.values()
     assert calc.state is CalculationState.VALIDATED_INPUT
     assert world.artifacts.read(calc.task.structure).decode() == geometry_text(slab, fixed=bottom)
-    other = add_hypothesis(world.ledger, world.inv, "hyp-c")
-    refused = read(access_for(world, tree, other), tree["workspace"] / "atop/geometry.in")
-    assert refused.is_error and "not readable by agents" in refused.content
+    assert not read(access_for(world, tree), tree["workspace"] / "atop/geometry.in").is_error  # any agent reads it

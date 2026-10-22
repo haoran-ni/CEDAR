@@ -20,6 +20,8 @@ from datetime import datetime, timedelta, timezone
 from cedar.secrets import scrubbed_environment
 
 Runner = Callable[..., subprocess.CompletedProcess]
+WORKBENCH_CORES = 4
+"""Cores of the allocation that local DFT never uses: they stay free for the agents' workbench commands."""
 WAIT_SECONDS = 120.0
 """How long a workbench command waits for cores or a slot before it is refused as busy."""
 
@@ -39,6 +41,11 @@ class ExecutionHost:
     @property
     def interactive(self) -> bool:
         return self.allocation is not None
+
+    @property
+    def dft_cores(self) -> int:
+        """Cores a local DFT run may use here: the allocation's, less the ones kept for the workbench."""
+        return max(self.cores - WORKBENCH_CORES, 0) if self.interactive else 0
 
     def seconds_left(self, now: datetime | None = None) -> float | None:
         if self.ends_at is None:
@@ -113,8 +120,13 @@ def detect_host(environ: Mapping[str, str] = os.environ, *, runner: Runner = sub
 
 def local_dft(host: ExecutionHost) -> str:
     """Whether calculations can run locally where CEDAR runs, in words for the agents and the researcher."""
+    if host.interactive and host.dft_cores == 0:
+        return (f"not possible: CEDAR runs on the {host.describe()}, and {WORKBENCH_CORES} cores are always kept for "
+                "the agents' commands, which leaves none for DFT. The researcher can ask for a larger allocation; "
+                "otherwise calculations run through Slurm")
     if host.interactive:
-        return f"possible: CEDAR runs on the {host.describe()}"
+        return (f"possible: CEDAR runs on the {host.describe()}; a local run may use up to {host.dft_cores} cores, "
+                f"since {WORKBENCH_CORES} are kept for the agents' commands")
     return (f"not possible: CEDAR runs on the {host.describe()}, and DFT cannot run locally on login nodes. The "
             "researcher can start CEDAR on an interactive node (inside a Slurm allocation) to run calculations "
             "locally; otherwise they run through Slurm")
@@ -167,10 +179,11 @@ class CorePool:
             self._running -= 1
             self._changed.notify_all()
 
-    def take(self, count: int) -> tuple[int, ...] | None:
-        """``count`` CPUs for a local run, if that many are free now; a run is not a command."""
+    def take(self, count: int, keep: int = 0) -> tuple[int, ...] | None:
+        """``count`` CPUs for a local run, if that many are free now with ``keep`` more left over; a run is not a
+        command."""
         with self._changed:
-            if len(self._free) < count:
+            if len(self._free) - count < keep or len(self._free) < count:
                 return None
             taken, self._free = tuple(self._free[-count:]), self._free[:-count]
             return taken

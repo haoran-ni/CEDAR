@@ -3,9 +3,8 @@
 With bubblewrap (``bwrap``), a command runs in new namespaces:
 
 - the whole filesystem is visible read-only, as the researcher sees it, except hidden paths
-  (secrets, CEDAR's own records, other hypotheses' run directories, the DFT codes' binaries
-  and the MPI launchers), which appear empty; paths the agent may read inside a hidden
-  directory, such as its own run directories, are shown again, read-only;
+  (credentials, the DFT codes' binaries and the MPI and Slurm launchers), which appear empty;
+  paths that may be read inside a hidden directory can be shown again, read-only;
 - only one directory, the agent's workspace, is writable, besides a private ``/tmp`` (where
   the machine's own ``/tmp`` entries are visible, read-only);
 - there is no network, so no web, ssh or scheduler (Slurm commands cannot reach their

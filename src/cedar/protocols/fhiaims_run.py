@@ -48,7 +48,7 @@ from cedar.hpc.jobscript import (
     render_job_script,
     render_local_script,
 )
-from cedar.hpc.node import ExecutionHost, HostWatch
+from cedar.hpc.node import WORKBENCH_CORES, ExecutionHost, HostWatch
 from cedar.hpc.profile import ComputeProfile
 from cedar.protocols.base import Protocol, Reading, RunReport
 
@@ -312,7 +312,13 @@ class FhiAimsRun(Protocol):
         elif script not in present and script == "local.sh":
             if self.runs_locally and self._host().interactive:
                 resources = self._default_local_resources(task)
-                if resources is None:
+                host = self._host()
+                if resources is None and host.dft_cores == 0:
+                    findings.append(Finding(severity=_E, code="no_cores_for_dft",
+                                            message=f"the allocation has {host.cores} cores here, and "
+                                                    f"{WORKBENCH_CORES} are kept for the agents' commands, which "
+                                                    "leaves none for a local run; run it through Slurm"))
+                elif resources is None:
                     findings.append(Finding(severity=_E, code="budget_too_small",
                                             message="the task budget or the allocation's time left does not allow "
                                                     "a local run of one minute"))
@@ -363,7 +369,9 @@ class FhiAimsRun(Protocol):
         """The allocation's cores here (or the task's, if fewer), for the profile's default walltime, ending well
         before the allocation does."""
         host = self._host()
-        ntasks = min(task.budget.cores or host.cores, host.cores)
+        if host.dft_cores == 0:
+            return None
+        ntasks = min(task.budget.cores or host.dft_cores, host.dft_cores)
         minutes = self._profile.limits.default_walltime_minutes
         if task.budget.max_walltime_hours is not None:
             minutes = min(minutes, math.floor(task.budget.max_walltime_hours * 60))
@@ -421,10 +429,11 @@ class FhiAimsRun(Protocol):
         if not host.interactive:
             return []
         findings = []
-        if resources.ntasks > host.cores:
+        if resources.ntasks > host.dft_cores:
             findings.append(Finding(severity=_E, code="too_many_tasks", file="local.sh",
-                                    message=f"{resources.ntasks} tasks exceed the allocation's {host.cores} cores on "
-                                            f"{host.hostname}"))
+                                    message=f"{resources.ntasks} tasks exceed the {host.dft_cores} cores local DFT may "
+                                            f"use on {host.hostname}: the allocation has {host.cores}, and "
+                                            f"{WORKBENCH_CORES} are kept for the agents' commands"))
         left = host.seconds_left()
         if left is not None and resources.walltime_minutes > left / 60 - LOCAL_MARGIN_MINUTES:
             findings.append(Finding(severity=_E, code="past_the_allocation", file="local.sh",
@@ -432,7 +441,7 @@ class FhiAimsRun(Protocol):
                                             f"allocation {host.allocation}, {left / 60:.0f} minutes from now"))
         return findings
 
-    def requested_core_hours(self, files: Mapping[str, bytes]) -> float | None:
+    def requested_resources(self, files: Mapping[str, bytes]):
         if "local.sh" in files:
             script = examine_local_script(files["local.sh"].decode(errors="replace"), self._profile, self._code,
                                           output_file="aims.out")
@@ -441,7 +450,7 @@ class FhiAimsRun(Protocol):
                                         output_file="aims.out")
         else:
             return None
-        return script.resources.core_hours if script.resources is not None else None
+        return script.resources
 
     def _examine_geometry(self, geometry: Geometry, values: Mapping[str, object]) -> list[Finding]:
         f = "geometry.in"

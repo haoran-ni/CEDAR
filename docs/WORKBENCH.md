@@ -6,7 +6,7 @@ runs they bring into the record.
 
 | | What it is | Approved by the researcher | Evidence |
 |---|---|---|---|
-| Read access | Any file the researcher can read, except the files listed below | — | no |
+| Read access | Any file the researcher can read, except credentials; every agent | — | no |
 | Workspace | A writable directory per hypothesis | — | no |
 | Workbench | Shell commands and scripts in the workspace, in a sandbox | no; `/workbench off` turns it off | no |
 | Registered run | A finished FHI-aims run computed outside CEDAR, brought into the record | no; nothing runs | yes, marked as computed outside CEDAR |
@@ -14,21 +14,22 @@ runs they bring into the record.
 
 ## What agents read and write
 
-A hypothesis agent's file tools read the whole filesystem with the researcher's Unix
-permissions, except:
+Every agent (the Chief Scientist, the hypothesis agents, the Evidence Judge, the approver
+and the setup agent) reads the whole filesystem with the researcher's Unix permissions,
+except credentials (`agent_access` in `agents/toolkits/files.py`):
 
-- secrets: CEDAR's configuration directory (API keys, profiles) and well-known credential
-  stores (`~/.ssh`, `~/.gnupg`, `~/.netrc`, `~/.aws`, `~/.config/gcloud`, `~/.kube`,
-  `~/.docker`);
-- other hypotheses' work: CEDAR's data directory (event log, stored files, transcripts,
-  other workspaces) and the compute profile's runs directory, except the run directories of
-  the agent's own calculations;
+- CEDAR's configuration directory (API keys, profiles) and well-known credential stores
+  (`~/.ssh`, `~/.gnupg`, `~/.netrc`, `~/.aws`, `~/.config/gcloud`, `~/.kube`, `~/.docker`);
 - `/proc`, `/sys` and `/dev`, which are not files.
 
-The agent's own workspace, `<data>/workspaces/<investigation>/<hypothesis>/`, and the
-directories its own and the shared registered runs came from stay readable. Reads are
-streamed: a large file is read only up to the requested lines, and a search stops after
-2 GiB (`agents/toolkits/files.py`).
+CEDAR's data directory (event log, stored files, conversations, every agent's workspace)
+and every run directory are readable, so agents see each other's work: `other_agents`
+lists every agent with its index (A1, A2, ...), hypothesis, calculations and the directories
+their files are in, evidence and latest report. An agent may read and analyse any
+calculation of the investigation and record what it finds as evidence for its own
+hypothesis; it records predictions, calculations, evidence and status only for its own.
+Reads are streamed: a large file is read only up to the requested lines, and a search
+stops after 2 GiB.
 
 An agent writes only in its workspace: `write_file`, `delete_file`, and its workbench
 commands. `request_calculation` takes a structure or input file from the workspace by path,
@@ -42,9 +43,8 @@ inspect a structure with ASE, test a script on a sample file, search outputs, ru
 
 With bubblewrap, a command:
 
-- sees the filesystem read-only, with the paths above hidden (empty), and the profile's DFT
-  binaries and the MPI and Slurm launchers hidden too; the agent's run directories are shown
-  again inside the hidden runs directory;
+- sees the filesystem read-only, with the credentials above hidden (empty), and the
+  profile's DFT binaries and the MPI and Slurm launchers hidden too;
 - writes only in the workspace and a private `/tmp` (the machine's own `/tmp` entries are
   visible, read-only); its `$HOME` is `.home` in the workspace;
 - has no network, so no web, ssh or scheduler;
@@ -58,7 +58,7 @@ the same way, writes only in the workspace, no programs, no sockets.
 
 | | Login node | Interactive node |
 |---|---|---|
-| Cores per command | 1 | what the allocation has free |
+| Cores per command | 1 | what the allocation has free; local DFT never takes the last 4 |
 | Commands at once | 2, across all agents | as cores allow |
 | Time per command | 10 minutes by default, at most 30 | 10 by default, at most 60, never past the allocation's end |
 | Memory, disk | no limit | no limit |
@@ -94,11 +94,13 @@ researcher's allocation, under `fhiaims.run` 0.2:
 
 - its script, `local.sh`, is the approved job template without its `#SBATCH` lines, plus one
   `#CEDAR --ntasks=N --time=T` line; the examiner checks it like a job script, and its task
-  count and time limit against the allocation's cores and time left (with five minutes to
-  spare);
+  count and time limit against the cores local DFT may use and the allocation's time left
+  (with five minutes to spare). Local DFT uses at most the allocation's cores on this node
+  less 4, which always stay free for the agents' commands; an allocation of 4 cores or fewer
+  runs no local DFT;
 - on a login node the request is rejected at once: "DFT cannot run locally on login nodes";
-- submission needs the researcher's `/approve submit <calc>` (or the approver, in full
-  automation), as for Slurm.
+- submission needs the researcher's `/approve submit <calc>`, `/approve submit <agent>` or
+  `/approve submit all` (or the approver, in full automation), as for Slurm.
 
 The local backend (`hpc/local.py`) has the scheduler adapter's interface, so the journaled
 submission, reconciliation by job name, the job monitor, run checks and agent wake-ups are
@@ -130,6 +132,8 @@ Readings of a registered run are `archived_computation` evidence; analyses of it
 evidence carrying the limitation that it was computed outside CEDAR. Both are VALIDATED only
 if its health checks passed. A registered run cannot be predicted: its outputs existed before
 any prediction, so its evidence establishes the discrepancy or checks a hypothesis rather
-than testing a prediction. An agent's registered runs are its hypothesis's alone; runs the
-researcher or the Chief Scientist registers for no hypothesis are shared by every agent, but
-each agent's readings of them stay its own.
+than testing a prediction. An agent's registered runs belong to its hypothesis, and every agent may
+read and analyse them; runs the researcher or the Chief Scientist registers for no hypothesis
+are shared by every agent and listed in each agent's briefing. Each agent's readings of a run
+are its own evidence. A run directory of CEDAR's own calculations is never registered: the
+calculation itself is used.

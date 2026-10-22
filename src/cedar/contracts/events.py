@@ -9,7 +9,7 @@ from typing import Annotated, Literal
 
 from pydantic import AfterValidator, AwareDatetime, Field, JsonValue, StringConstraints, model_validator
 
-from cedar.contracts.agents import AgentSpec
+from cedar.contracts.agents import AgentReport, AgentSpec
 from cedar.contracts.analysis import AnalysisRun
 from cedar.contracts.base import (
     Actor,
@@ -87,6 +87,43 @@ class ClosingProposed(Contract):
         return self
 
 
+class HypothesisStanding(Contract):
+    """Where one hypothesis stands in a comparison across hypotheses."""
+
+    hypothesis_id: Identifier
+    standing: NonEmptyStr
+    """Where it stands now, in the light of the evidence and the other hypotheses."""
+    accounts_for: str | None = None
+    """How much of the discrepancy it accounts for, in words: the values are those of the evidence it cites, never
+    typed here. None when that is not known."""
+    evidence_ids: tuple[Identifier, ...] = ()
+
+
+class SynthesisRecorded(Contract):
+    """The Chief Scientist's comparison across hypotheses at a review: where each stands, how they interact, what of
+    the discrepancy is explained and what is not, and the new hypotheses the comparison suggests."""
+
+    type: Literal["synthesis_recorded"] = "synthesis_recorded"
+    synthesis_id: Identifier
+    summary: NonEmptyStr
+    hypotheses: tuple[HypothesisStanding, ...] = Field(min_length=1)
+    interactions: tuple[NonEmptyStr, ...] = ()
+    """Conflicts, confounders and interactions between hypotheses."""
+    residual: NonEmptyStr
+    """What of the discrepancy remains unexplained."""
+    not_separable: tuple[NonEmptyStr, ...] = ()
+    """Contributions the evidence cannot tell apart."""
+    new_hypotheses: tuple[Identifier, ...] = ()
+    """Hypotheses proposed because of this comparison."""
+
+    @model_validator(mode="after")
+    def _each_hypothesis_once(self) -> "SynthesisRecorded":
+        ids = [h.hypothesis_id for h in self.hypotheses]
+        if len(set(ids)) != len(ids):
+            raise ValueError("a comparison names each hypothesis once")
+        return self
+
+
 class NextActionsRecommended(Contract):
     """The Chief Scientist's candidate next steps, compared, and the ones it takes now.
 
@@ -113,23 +150,23 @@ class NextActionsRecommended(Contract):
 
 class ModeChanged(Contract):
     """The researcher switches the investigation between human-in-the-loop and full automation; the system
-    switches it back, and pauses it, once full automation's token allowance is used up."""
+    switches it back, and pauses it, once full automation's spending allowance is used up."""
 
     type: Literal["mode_changed"] = "mode_changed"
     mode: InvestigationMode
     reason: NonEmptyStr
     max_core_hours: float | None = Field(default=None, gt=0)
     """Full automation: the core-hours the approver may approve from now on, as job scripts request them."""
-    max_tokens: int | None = Field(default=None, gt=0)
-    """Full automation: the model tokens all agents together may process from now on."""
+    max_usd: float | None = Field(default=None, gt=0)
+    """Full automation: the dollars all agents together may spend on models from now on."""
     intervention_id: Identifier | None = None
     """The researcher's command, when it was the researcher who switched."""
 
     @model_validator(mode="after")
     def _limits_only_for_automation(self) -> "ModeChanged":
         automated = self.mode is InvestigationMode.FULL_AUTOMATION
-        if automated != (self.max_core_hours is not None) or automated != (self.max_tokens is not None):
-            raise ValueError("full automation needs a core-hour and a token limit; human-in-the-loop takes none")
+        if automated != (self.max_core_hours is not None) or automated != (self.max_usd is not None):
+            raise ValueError("full automation needs a core-hour and a dollar limit; human-in-the-loop takes none")
         return self
 
 
@@ -149,12 +186,12 @@ class RetrievalPolicyChanged(Contract):
         return self
 
 
-class TokenBudgetChanged(Contract):
-    """The researcher sets the investigation's total token budget, or removes it. Every token its agents have
-    processed since it opened counts, cached input included."""
+class BudgetChanged(Contract):
+    """The researcher sets what the investigation's agents may spend on models in total, in dollars, or removes the
+    limit. Everything spent since it opened counts, at the price of each kind of token."""
 
-    type: Literal["token_budget_changed"] = "token_budget_changed"
-    max_tokens: int | None = Field(default=None, gt=0)
+    type: Literal["budget_changed"] = "budget_changed"
+    max_usd: float | None = Field(default=None, gt=0)
     """None: no limit."""
     intervention_id: Identifier
     """The researcher's command."""
@@ -498,6 +535,8 @@ class AgentTaskQueued(Contract):
     instruction: NonEmptyStr
     recommendation_id: Identifier | None = None
     """The Chief Scientist's recommendation this carries out, if any."""
+    continues: Identifier | None = None
+    """The task this one carries on with, after the run carrying it out was cut off."""
 
     @model_validator(mode="after")
     def _names_what_its_role_needs(self) -> "AgentTaskQueued":
@@ -530,10 +569,19 @@ class AgentRunRecorded(Contract):
     outcome: NonEmptyStr
     report: str | None = None
     """The agent's final message: its stated summary and justification, not hidden reasoning."""
+    structured: AgentReport | None = None
+    """A hypothesis agent's report in fields, when it ended its task with one; ``report`` is then its text."""
     dropped_reasoning_blocks: int = Field(default=0, ge=0)
     """Earlier reasoning blocks the provider left out because the conversation changed under them."""
     web_searches: int = Field(default=0, ge=0)
     web_fetches: int = Field(default=0, ge=0)
+    cost_usd: float | None = Field(default=None, ge=0)
+    """What the run cost, at the prices known for its model; None when they are not known."""
+    started_version: int | None = Field(default=None, ge=0)
+    """The stream version the run started from, the one its briefing showed; what was recorded later it had not
+    been told of."""
+    report_by_cedar: bool = False
+    """The run ended without the agent's own report, so ``report`` is CEDAR's account of it, built from the record."""
 
 
 class EvidenceRecorded(Contract):
@@ -557,9 +605,10 @@ EventPayload = Annotated[
     | InvestigationStatusChanged
     | ClosingProposed
     | NextActionsRecommended
+    | SynthesisRecorded
     | ModeChanged
     | RetrievalPolicyChanged
-    | TokenBudgetChanged
+    | BudgetChanged
     | WorkbenchPolicyChanged
     | MaterialAttached
     | ApproverDecision

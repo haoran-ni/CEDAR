@@ -62,10 +62,16 @@ def _models_init(args) -> int:
 def _models_show(args) -> int:
     from cedar.models import load_model_config
 
+    from cedar.models.prices import prices_for
+
     config = load_model_config(_models_path())
     for role, settings in sorted(config.roles.items()):
         effort = f", effort {settings.effort}" if settings.effort else ""
-        print(f"{role}: {settings.provider} {settings.model}{effort}")
+        prices = prices_for(settings)
+        priced = (f"; ${prices.input:g} input, ${prices.cache_read:g} cached input, ${prices.output:g} output per "
+                  f"million tokens ({'as configured' if settings.prices else 'as published'})" if prices else
+                  "; prices unknown: set [roles." + role + ".prices], or no budget can be kept")
+        print(f"{role}: {settings.provider} {settings.model}{effort}{priced}")
     return 0
 
 
@@ -111,15 +117,27 @@ def _show_progress(call, outcome) -> None:
         print("    " + outcome.content.splitlines()[0][:200])
 
 
+def _dollars_or_off(text: str) -> float | None:
+    if text.lower() == "off":
+        return None
+    try:
+        amount = float(text.lstrip("$"))
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"not an amount of dollars: {text}") from None
+    if amount <= 0:
+        raise argparse.ArgumentTypeError("give a positive amount, or 'off'")
+    return amount
+
+
 def _setup(args) -> int:
     from cedar.agents import AgentRunner, RunLimits, TranscriptStore
     from cedar.agents.prompts import ENVIRONMENT_SETUP
-    from cedar.agents.toolkits import FileAccess, file_tools
+    from cedar.agents.toolkits import file_tools
+    from cedar.agents.toolkits.files import agent_access
     from cedar.agents.toolkits.environment import SetupSession, environment_tools
     from cedar.hpc.queries import SchedulerQueries
     from cedar.models import create_client, load_model_config
 
-    roots = [Path.home(), *[Path(r).resolve() for r in args.root]]
     deny = [config_dir()]
     settings = load_model_config(_models_path()).for_role("environment_setup")
     credentials = _credentials()
@@ -133,7 +151,7 @@ def _setup(args) -> int:
     else:
         session_id = f"setup-{args.name}-{started:%Y%m%d%H%M%S}"
     session = SetupSession.load(transcripts / f"{session_id}.sources.json")
-    access = FileAccess(roots=roots, deny=deny)
+    access = agent_access(deny)
     tools = file_tools(access, on_read=session.file_read) + environment_tools(
         _profiles(), SchedulerQueries(), session, _ask_in_terminal, deny=deny)
     if args.resume:
@@ -141,20 +159,21 @@ def _setup(args) -> int:
                        "you stopped and propose the profile.")
     else:
         instruction = (
-            f"Propose a compute profile named {args.name!r} for this system. You can read files under: "
-            + ", ".join(str(r) for r in roots)
-            + ". You can inspect any other path without reading it. The researcher is at the terminal to answer "
-              "questions."
+            f"Propose a compute profile named {args.name!r} for this system. You can read any file the researcher "
+            f"can, except credentials; the researcher's home directory is {Path.home()}. The researcher is at the "
+            "terminal to answer questions."
         )
     runner = AgentRunner(create_client(settings, credentials), settings, TranscriptStore(transcripts),
                          secrets=credentials.secrets())
     print(f"Environment-setup agent ({settings.provider} {settings.model}) is working; its steps are listed below.")
     result = runner.run(session_id, system=ENVIRONMENT_SETUP, tools=tools, instruction=instruction,
-                        limits=RunLimits(max_turns=args.max_turns, max_tokens=args.max_tokens), observer=_show_progress)
+                        limits=RunLimits(max_cost_usd=args.max_cost), observer=_show_progress)
     session.save(transcripts / f"{session_id}.sources.json")
     print("\n" + (result.final_text or result.error or ""))
     usage = result.usage
-    print(f"\n[{result.outcome}; {result.turns} turns; served by {', '.join(result.served_models) or '-'}; tokens: "
+    cost = f"${result.cost_usd:.2f}" if result.cost_usd is not None else "cost unknown"
+    print(f"\n[{result.outcome}; {result.turns} turns; {cost}; served by {', '.join(result.served_models) or '-'}; "
+          f"tokens: "
           f"{usage.input_tokens} input, {usage.cache_read_tokens} cached input read, {usage.cache_write_tokens} "
           f"written to cache, {usage.output_tokens} output]")
     config_dir().mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -372,11 +391,9 @@ def main(argv: list[str] | None = None) -> int:
 
     setup = commands.add_parser("setup", help="let the environment-setup agent propose a compute profile")
     setup.add_argument("--name", required=True, help="profile name, e.g. mycluster-cpu")
-    setup.add_argument("--root", action="append", default=[], metavar="PATH",
-                       help="another directory the agent may read (your home directory is always included)")
-    setup.add_argument("--max-turns", type=int, default=60)
-    setup.add_argument("--max-tokens", type=int, default=None,
-                       help="stop after processing this many tokens, cached input included (default: no limit)")
+    setup.add_argument("--max-cost", type=_dollars_or_off, default=15.0, metavar="DOLLARS",
+                       help="stop once the session has spent this much on the model; 'off' for no limit "
+                            "(default: 15)")
     setup.add_argument("--resume", action="store_true", help="continue the last setup session for this name")
     setup.set_defaults(handler=_setup)
 

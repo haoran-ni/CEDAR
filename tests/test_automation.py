@@ -125,14 +125,14 @@ def test_the_researcher_switches_modes_and_sees_which_one_is_on(system, monkeypa
     monkeypatch.setattr(cedar.chat, "stop_dispatcher", lambda ws, timeout, force: "Stopped.")
     ledger, chat = system["workspace"].ledger, system["chat"]
     open_and_start(system)  # msg-1 and msg-2
-    usage = "Usage: /mode, /mode human-in-the-loop, or /mode full-automation <core-hours> <tokens>"
+    usage = "Usage: /mode, /mode human-in-the-loop, or /mode full-automation <core-hours> <dollars>"
     assert chat.handle("/mode") == f"{INV} is in human-in-the-loop.\n{usage}"
     assert chat.handle("/mode full-automation 500") == usage
     assert chat.handle("/mode full-automation 0 1000").startswith("The mode could not be changed:")
     chat.handle("/mode Full-Automation 500 2000000")
     state = ledger.load(INV)
     assert state.mode is InvestigationMode.FULL_AUTOMATION and state.automation.intervention_id == "msg-3"
-    left = "500 of 500 core-hours and 2,000,000 of 2,000,000 tokens left"
+    left = "500 of 500 core-hours and $2,000,000.00 of $2,000,000.00 left"
     assert f"  mode: full automation: {left}" in investigation_summary(state)
     assert mode_line(state) == ("Mode: full-automation · Web: off", True)
     assert chat.handle("/mode").startswith(f"{INV} is in full automation: {left}.")
@@ -144,7 +144,7 @@ def test_the_researcher_switches_modes_and_sees_which_one_is_on(system, monkeypa
     state = ledger.load(INV)
     assert state.mode is InvestigationMode.HUMAN_IN_THE_LOOP and state.status is InvestigationStatus.PAUSED
     timeline = render_notebook(system["workspace"].store.read_stream(INV))["timeline.md"]
-    assert ("Full automation, within 500 core-hours and 2,000,000 tokens: “switched by the researcher (msg-3)”"
+    assert ("Full automation, within 500 core-hours and $2,000,000.00 of model use: “switched by the researcher (msg-3)”"
             in timeline)
     assert "Back to human-in-the-loop: “halted by the researcher (msg-6)" in timeline
 
@@ -172,7 +172,7 @@ def test_the_approver_decides_only_in_full_automation_and_within_its_core_hours(
                          reason="r")
     with pytest.raises(RuleViolation, match="only the researcher switches full automation on"):
         ledger.record(INV, [draft(SYSTEM, ModeChanged(mode=InvestigationMode.FULL_AUTOMATION, reason="r",
-                                                      max_core_hours=1, max_tokens=1))])
+                                                      max_core_hours=1, max_usd=1))])
 
     # A submission over the core-hours left is not offered to the approver: it waits for the researcher.
     chat.handle(f"/mode full-automation {hours / 2:g} 1000000")
@@ -202,24 +202,24 @@ def test_the_approver_decides_only_in_full_automation_and_within_its_core_hours(
     assert ledger.load(INV).mode is InvestigationMode.HUMAN_IN_THE_LOOP
 
 
-def test_full_automation_ends_and_pauses_once_its_tokens_are_used(system):
+def test_full_automation_ends_and_pauses_once_its_allowance_is_spent(system):
     ledger, chat, dispatcher = system["workspace"].ledger, system["chat"], system["dispatcher"]
     open_and_start(system)
-    chat.handle("/mode full-automation 100 50")
+    chat.handle("/mode full-automation 100 5")
     chat.notices()
     ledger.record(INV, [draft(agent_for(HYP), AgentRunRecorded(
         session_id="s", role="hypothesis_agent", provider="p", requested_model="m", turns=1, input_tokens=60,
-        output_tokens=0, cache_read_tokens=0, cache_write_tokens=0, outcome="finished"))])
+        output_tokens=0, cache_read_tokens=0, cache_write_tokens=0, outcome="finished", cost_usd=5.2))])
     notes = dispatcher.tick()
-    assert (f"{INV}: full automation's allowance of 50 tokens is used up; the investigation waits for the "
+    assert (f"{INV}: full automation's allowance of $5.00 is spent; the investigation waits for the "
             "researcher: back to human-in-the-loop, paused") in notes
     state = ledger.load(INV)
     assert state.mode is InvestigationMode.HUMAN_IN_THE_LOOP and state.status is InvestigationStatus.PAUSED
     assert state.modes[-1].actor.kind is ActorKind.SYSTEM
     assert [n.text for n in chat.notices() if n.text.startswith("[full automation ended]")] == [
-        "[full automation ended] full automation's allowance of 50 tokens is used up; the investigation waits for "
-        "the researcher. It is paused: ask the Chief Scientist to resume it, or switch full automation on again "
-        "with /mode."]
+        "[full automation ended] full automation's allowance of $5.00 is spent; the investigation waits for the "
+        "researcher. It is paused: ask the Chief Scientist to resume it, or switch full automation on again with "
+        "/mode."]
 
 
 def test_a_declined_proposal_is_withdrawn_and_the_chief_reviews_why(tmp_path, site):

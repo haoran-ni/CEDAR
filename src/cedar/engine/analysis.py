@@ -1,22 +1,26 @@
-"""Running the analysis scripts agents write, on the login node, under guards.
+"""Running the analysis scripts agents write, on the login node, isolated with their inputs.
 
-An agent writes a Python script to read or compute quantities from finished runs. The
-runner:
+An agent writes a Python script to read or compute quantities from finished runs, and from
+data outside them such as a measured spectrum the researcher attached. The runner:
 
 1. examines the script and refuses one that imports process, network or foreign-code
    modules, calls ``os.system`` and the like, or uses ``eval``/``exec``;
 2. stages the requested files of each run, by content hash, read-only under
-   ``inputs/<calculation_id>/`` in a fresh working directory;
+   ``inputs/<calculation_id>/`` in a fresh working directory, and other data files under
+   ``inputs/data/``;
 3. runs the script with this environment's Python and a clean environment (no
-   credentials), under CPU, memory and file-size limits, a wall-clock timeout, and an
-   audit hook that refuses to read anything but the staged inputs and the Python
-   installation, to write outside the working directory, to start processes or to open
-   sockets (``analysis_guard.py``);
+   credentials), under CPU, memory and file-size limits and a wall-clock timeout. With
+   bubblewrap it runs in an empty filesystem holding only the Python installation, system
+   files and its working directory, with no network: the staged files are the only data it
+   can see, so its result rests on exactly the files recorded. An audit hook
+   (``analysis_guard.py``) also refuses reads beyond the staged inputs and the Python
+   installation, writes outside the working directory, programs and sockets; without
+   bubblewrap that hook is the only guard, which stops mistakes but not code written to
+   evade it;
 4. stores what the script printed, the files it wrote and the results it reported in
-   ``results.json``, and records the run.
+   ``results.json``, and records the run, with how it was isolated.
 
-Scripts cannot start programs, so they never run DFT. The guards stop mistakes and naive
-misuse; they are not a security boundary against code written to evade them.
+Scripts cannot start programs, so they never run DFT.
 """
 
 import ast
@@ -40,7 +44,7 @@ from pathlib import Path
 
 from pydantic import ValidationError
 
-from cedar.contracts.analysis import AnalysisInput, AnalysisOutcome, AnalysisResult, AnalysisRun
+from cedar.contracts.analysis import AnalysisData, AnalysisInput, AnalysisOutcome, AnalysisResult, AnalysisRun
 from cedar.contracts.base import Actor, ActorKind, ArtifactRef, Quantity, new_id
 from cedar.contracts.evidence import QualityCheck
 from cedar.contracts.events import AnalysisRecorded, EventDraft
@@ -169,9 +173,10 @@ class AnalysisRunner:
     def __init__(self, ledger: ResearchLedger, artifacts: ArtifactStore, runs_root: str | Path | None,
                  work_root: str | Path, *, limits: AnalysisLimits = AnalysisLimits(),
                  read_roots: Sequence[Path] | None = None, actor: Actor = ANALYSIS_RUNNER,
-                 slots: threading.Semaphore | None = None) -> None:
+                 slots: threading.Semaphore | None = None, isolate: bool | None = None) -> None:
         """``slots``, shared between runners, limits how many scripts run at once on the login node. Without a
-        ``runs_root`` (no compute profile) scripts analyse registered runs only."""
+        ``runs_root`` (no compute profile) scripts analyse registered runs only. ``isolate`` runs scripts with
+        bubblewrap: None where it works, False never."""
         self._ledger = ledger
         self._artifacts = artifacts
         self._runs_root = Path(runs_root) if runs_root is not None else None
@@ -180,25 +185,30 @@ class AnalysisRunner:
         self._read_roots = tuple(read_roots) if read_roots is not None else default_read_roots()
         self._actor = actor
         self._slots = slots
+        self._isolate = isolate
 
     def run(self, investigation_id: str, hypothesis_id: str, *, purpose: str, script: str,
-            inputs: Mapping[str, Sequence[str] | None]) -> AnalysisReport:
-        """Run ``script`` on the named files of each calculation (default: its stored outputs and inputs)."""
+            inputs: Mapping[str, Sequence[str] | None],
+            data: Mapping[str, tuple[ArtifactRef, str]] | None = None) -> AnalysisReport:
+        """Run ``script`` on the named files of each calculation (default: its stored outputs and inputs), and on
+        ``data``: stored files by the name they are staged under, each with where it came from."""
+        data = dict(data or {})
         problems = examine_script(script)
         if problems:
             return AnalysisReport(None, None, tuple(problems))
         state = self._ledger.load(investigation_id)
         if hypothesis_id not in state.hypotheses:
             raise RuleViolation(f"unknown hypothesis {hypothesis_id}")
-        if not inputs:
-            return AnalysisReport(None, None, ("name at least one calculation whose files the script reads",))
+        if not inputs and not data:
+            return AnalysisReport(None, None, ("name at least one calculation or data file the script reads",))
+        bad = [n for n in data if Path(n).is_absolute() or ".." in Path(n).parts or len(Path(n).parts) != 1]
+        if bad:
+            return AnalysisReport(None, None, (f"data files are staged by plain file name, not {', '.join(bad)}",))
         plan: dict[str, tuple[CalculationRecord, list[str]]] = {}
         for calculation_id, names in inputs.items():
             calc = state.calculations.get(calculation_id)
             if calc is None:
                 problems.append(f"unknown calculation {calculation_id}")
-            elif not calc.visible_to(hypothesis_id):
-                problems.append(f"{calculation_id} is not one of {hypothesis_id}'s calculations")
             elif calc.run_check is None:
                 problems.append(f"the run of {calculation_id} has not been checked yet ({calc.state.value})")
             else:
@@ -214,10 +224,17 @@ class AnalysisRunner:
             staged, problems = self._stage(stage, plan)
             if problems:
                 return AnalysisReport(None, None, tuple(problems))
+            extra = []
+            for name, (ref, origin) in sorted(data.items()):
+                target = stage / "inputs" / "data" / name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copyfile(self._artifacts.resolve(ref), target)
+                target.chmod(0o444)
+                extra.append(AnalysisData(name=name, artifact=ref, origin=origin))
             script_ref = self._artifacts.put_bytes(script.encode(), label=SCRIPT_FILE, media_type="text/x-python")
             (stage / SCRIPT_FILE).write_text(script)
             with self._slots if self._slots is not None else contextlib.nullcontext():
-                outcome, exit_code, seconds = self._execute(stage)
+                outcome, exit_code, seconds, isolation = self._execute(stage)
             if exit_code is not None and exit_code < 0:
                 cause = _SIGNALS.get(-exit_code, f"signal {-exit_code}")
                 problems.append(f"the script was stopped by {cause}")
@@ -230,7 +247,8 @@ class AnalysisRunner:
                                                 else ((), (), []))
             problems += product_problems + result_problems
             run = AnalysisRun(
-                purpose=purpose, script=script_ref, inputs=tuple(staged), environment=environment_description(),
+                purpose=purpose, script=script_ref, inputs=tuple(staged), data=tuple(extra),
+                environment=f"{environment_description()}; {isolation}",
                 outcome=outcome, exit_code=exit_code, duration_seconds=round(seconds, 3), output=output_ref,
                 products=products, results=results, checks=checks, problems=tuple(problems))
             self._ledger.record(investigation_id, [EventDraft(actor=self._actor, payload=AnalysisRecorded(
@@ -283,7 +301,27 @@ class AnalysisRunner:
 
     # -- running --------------------------------------------------------------------------
 
-    def _execute(self, stage: Path) -> tuple[AnalysisOutcome, int | None, float]:
+    def _isolation(self, stage: Path) -> list[str]:
+        """The bubblewrap command around a script, or [] where scripts run with the audit hook alone: an empty
+        filesystem with only the Python installation, system files and the working directory, and no network."""
+        from cedar.engine.sandbox import bwrap_path  # the sandbox module imports this one
+
+        bwrap = bwrap_path() if self._isolate is not False else None
+        if bwrap is None:
+            return []
+        args = [bwrap, "--die-with-parent", "--new-session", "--unshare-all", "--dev", "/dev", "--proc", "/proc",
+                "--tmpfs", "/dev/shm", "--tmpfs", "/tmp"]
+        for top in ("/bin", "/sbin", "/lib", "/lib64", "/usr", "/etc"):
+            if os.path.islink(top):
+                args += ["--symlink", os.readlink(top), top]
+            elif os.path.isdir(top):
+                args += ["--ro-bind", top, top]
+        for root in self._read_roots:
+            if str(root) not in ("/proc", "/sys", "/dev", "/usr", "/etc", "/lib", "/lib64") and root.is_dir():
+                args += ["--ro-bind", str(root), str(root)]
+        return [*args, "--bind", str(stage), str(stage), "--chdir", str(stage)]
+
+    def _execute(self, stage: Path) -> tuple[AnalysisOutcome, int | None, float, str]:
         home, tmp = stage / ".home", stage / ".tmp"
         home.mkdir()
         tmp.mkdir()
@@ -296,9 +334,12 @@ class AnalysisRunner:
             "CEDAR_ANALYSIS_ROOT": str(stage), "CEDAR_READ_ROOTS": os.pathsep.join(str(p) for p in self._read_roots),
             "CEDAR_LIMITS": json.dumps(limits),
         }
+        isolation = self._isolation(stage)
+        how = ("isolated with bubblewrap: only its staged inputs and the Python installation visible, no network"
+               if isolation else "guarded by an audit hook in the script's own process")
         started = time.monotonic()
         with open(stage / OUTPUT_FILE, "wb") as output:
-            process = subprocess.Popen([sys.executable, "-I", "-B", str(GUARD)], cwd=stage, env=env,
+            process = subprocess.Popen([*isolation, sys.executable, "-I", "-B", str(GUARD)], cwd=stage, env=env,
                                        stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT,
                                        start_new_session=True)
             try:
@@ -306,9 +347,9 @@ class AnalysisRunner:
             except subprocess.TimeoutExpired:
                 os.killpg(process.pid, signal.SIGKILL)
                 process.wait()
-                return AnalysisOutcome.TIMED_OUT, None, time.monotonic() - started
+                return AnalysisOutcome.TIMED_OUT, None, time.monotonic() - started, how
         outcome = AnalysisOutcome.COMPLETED if code == 0 else AnalysisOutcome.FAILED
-        return outcome, code, time.monotonic() - started
+        return outcome, code, time.monotonic() - started, how
 
     # -- collecting -----------------------------------------------------------------------
 

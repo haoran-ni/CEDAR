@@ -9,7 +9,7 @@ from datetime import datetime
 from pathlib import Path
 
 from cedar.contracts.status import SchedulerState
-from cedar.hpc.slurm import SchedulerObservation
+from cedar.hpc.slurm import JobRefused, SchedulerObservation
 
 
 class FakeScheduler:
@@ -19,13 +19,21 @@ class FakeScheduler:
         self.submissions: list[tuple[Path, Path, str]] = []
         self.on_submit: Callable[[str, Path], None] | None = None
         """Called with (job_id, workdir) after each submission, e.g. to drop fixture outputs."""
+        self.refusal: str | None = None
+        """While set, ``submit`` refuses every job with this message, as sbatch does with an error."""
+        self.queued_when_refused = False
+        """Refusals queue the job all the same, as a controller that answered too late can."""
 
     def submit(self, script: Path, workdir: Path, job_name: str) -> str:
+        if self.refusal is not None and not self.queued_when_refused:
+            raise JobRefused(self.refusal)
         job_id = str(next(self._ids))
         self.jobs[job_id] = {"name": job_name, "state": SchedulerState.PENDING, "workdir": workdir}
         self.submissions.append((script, workdir, job_name))
         if self.on_submit is not None:
             self.on_submit(job_id, workdir)
+        if self.refusal is not None:
+            raise JobRefused(self.refusal)
         return job_id
 
     def set_state(self, job_id: str, state: SchedulerState) -> None:

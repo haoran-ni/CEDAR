@@ -56,6 +56,15 @@ def test_calculation_cannot_skip_submission():
         CALCULATION_MACHINE.check(C.SCHEDULER_TERMINAL, C.QUALITY_ASSESSED)
 
 
+def test_only_a_submission_being_tried_can_fail_and_a_failed_one_is_final():
+    assert walk(CALCULATION_MACHINE, C.VALIDATED_INPUT, C.SUBMISSION_PENDING, C.SUBMISSION_FAILED)[0] \
+        is C.SUBMISSION_FAILED
+    with pytest.raises(InvalidTransition):
+        CALCULATION_MACHINE.check(C.SUBMITTED, C.SUBMISSION_FAILED)
+    with pytest.raises(InvalidTransition, match="terminal"):
+        CALCULATION_MACHINE.check(C.SUBMISSION_FAILED, C.SUBMISSION_PENDING)
+
+
 def test_calculation_can_be_cancelled_until_assessed():
     for state in (C.SPECIFIED, C.SUBMITTED, C.RUNNING, C.PARSING):
         CALCULATION_MACHINE.check(state, C.CANCELLED)

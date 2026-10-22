@@ -2,6 +2,9 @@
 
 Job state comes from ``squeue`` for the user's live jobs and from ``sacct`` for the rest.
 A job neither command reports is UNKNOWN, never assumed finished.
+
+An ``sbatch`` that answers with an error has refused the job (``JobRefused``). A command that
+does not answer in time raises a plain ``SchedulerError``: the job may or may not exist.
 """
 
 import getpass
@@ -63,6 +66,15 @@ class SchedulerError(RuntimeError):
     pass
 
 
+class JobRefused(SchedulerError):
+    """The scheduler answered and refused to take the job. ``final`` when trying again cannot help; otherwise the
+    refusal may be temporary (a busy controller), and the job may even have been queued after all."""
+
+    def __init__(self, message: str, *, final: bool = False) -> None:
+        super().__init__(message)
+        self.final = final
+
+
 Runner = Callable[..., subprocess.CompletedProcess]
 
 
@@ -74,16 +86,20 @@ class SlurmBackend:
         self._timeout = timeout
         self._environ = environ
 
-    def _call(self, argv: list[str]) -> str:
+    def _call(self, argv: list[str], failure: type[SchedulerError] = SchedulerError) -> str:
         # sbatch exports the caller's environment into the job: never pass credentials along.
-        result = self._run(argv, capture_output=True, text=True, timeout=self._timeout, check=False,
-                           env=scrubbed_environment(self._environ))
+        try:
+            result = self._run(argv, capture_output=True, text=True, timeout=self._timeout, check=False,
+                               env=scrubbed_environment(self._environ))
+        except subprocess.TimeoutExpired:
+            raise SchedulerError(f"{argv[0]} did not answer within {self._timeout:g} s") from None
         if result.returncode != 0:
-            raise SchedulerError(f"{argv[0]} failed ({result.returncode}): {result.stderr.strip()}")
+            raise failure(f"{argv[0]} failed ({result.returncode}): {result.stderr.strip()}")
         return result.stdout
 
     def submit(self, script: Path, workdir: Path, job_name: str) -> str:
-        output = self._call(["sbatch", "--parsable", f"--job-name={job_name}", f"--chdir={workdir}", str(script)])
+        output = self._call(["sbatch", "--parsable", f"--job-name={job_name}", f"--chdir={workdir}", str(script)],
+                            failure=JobRefused)
         job_id = output.strip().split(";")[0]
         if not job_id.isdigit():
             raise SchedulerError(f"unexpected sbatch output: {output!r}")

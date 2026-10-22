@@ -27,7 +27,9 @@ since MPI ranks spin while they wait. Inside the step the script runs without th
   each with a note saying so. A run whose allocation ended before it recorded an exit code
   FAILED; a run on another node whose allocation still runs is UNKNOWN, never assumed finished.
 
-Nothing runs on a login node: ``submit`` refuses there.
+Nothing runs on a login node: ``submit`` refuses there, and the run waits for a dispatcher on
+an interactive node. A run that cannot fit here (more tasks than local DFT may use, or a time
+limit past the allocation's end) is refused for good (``JobRefused``).
 """
 
 import json
@@ -47,7 +49,7 @@ from typing import Protocol
 from cedar.contracts.status import SchedulerState
 from cedar.hpc.jobscript import format_walltime, local_resources
 from cedar.hpc.node import WORKBENCH_CORES, CorePool, ExecutionHost
-from cedar.hpc.slurm import SchedulerError, SchedulerObservation
+from cedar.hpc.slurm import JobRefused, SchedulerError, SchedulerObservation
 from cedar.secrets import scrubbed_environment
 
 RUNNER = Path(__file__).with_name("local_runner.py")
@@ -200,17 +202,18 @@ class LocalBackend:
         problem = self.unavailable(host)
         if problem:
             raise SchedulerError(problem)
+        # Refusals of the run itself are final: the cores here and the allocation's time left never grow.
         resources = local_resources(Path(script).read_text())
         if resources is None:
-            raise SchedulerError(f"{script} states no task count and time limit")
+            raise JobRefused(f"{script} states no task count and time limit", final=True)
         if resources.ntasks > host.dft_cores:
-            raise SchedulerError(f"{resources.ntasks} tasks exceed the {host.dft_cores} cores local DFT may use here: "
-                                 f"the allocation has {host.cores}, and {WORKBENCH_CORES} are kept for the agents' "
-                                 "commands")
+            raise JobRefused(f"{resources.ntasks} tasks exceed the {host.dft_cores} cores local DFT may use here: the "
+                             f"allocation has {host.cores}, and {WORKBENCH_CORES} are kept for the agents' commands",
+                             final=True)
         left = host.seconds_left()
         if left is not None and resources.walltime_minutes * 60 > left - MARGIN_SECONDS:
-            raise SchedulerError(f"{resources.walltime_minutes} minutes would run past the end of allocation "
-                                 f"{host.allocation}, {left / 60:.0f} minutes from now")
+            raise JobRefused(f"{resources.walltime_minutes} minutes would run past the end of allocation "
+                             f"{host.allocation}, {left / 60:.0f} minutes from now", final=True)
         self._records.mkdir(parents=True, exist_ok=True)
         job_id = f"local-{uuid.uuid4().hex[:16]}"
         _write(self._records / f"{job_id}.json", {

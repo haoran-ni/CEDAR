@@ -49,12 +49,15 @@ class Protocol(ABC):
     execution_files: tuple[str, ...]
     output_files: tuple[str, ...]
     reviewed_by_agent: bool = False
-    """The scientific content of the inputs is judged by the input reviewer; the examination checks only what runs
-    on the machine and records facts for the reviewer."""
+    """The input reviewer, an agent, checks the inputs before the researcher is asked about the run; the examination
+    checks only what runs on the machine and records facts for the reviewer."""
     superseded_by: str | None = None
     """The version new requests use instead; this one stays for the calculations recorded under it."""
     checks_declarations: bool = True
     """The examination rejects input files that do not set the task's declared settings as declared."""
+    other_files: bool = False
+    """The inputs may include files besides ``input_files``, under any plain name: files the run reads, which CEDAR
+    stores without reading and the input reviewer checks."""
 
     def input_settings(self, files: Mapping[str, bytes]) -> dict[str, str]:
         """Every setting the inputs make, as written, for the record and for comparisons; empty if this protocol
@@ -84,7 +87,8 @@ class Protocol(ABC):
 
     @abstractmethod
     def examine(self, task: ScientificTaskSpec, files: Mapping[str, bytes]) -> list[Finding]:
-        """Check the complete set of files against the declared task and this protocol's policy."""
+        """Check the complete set of files that would run against this protocol's policy, and record what the input
+        reviewer needs to know about them."""
 
     def requested_core_hours(self, files: Mapping[str, bytes]) -> float | None:
         """Core-hours the examined job script asks for, if this protocol can read them."""

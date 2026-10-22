@@ -22,6 +22,8 @@ from cedar.state.projection import authorization_for, calculation_with_inputs
 from cedar.store.artifacts import ArtifactStore
 
 PROTOCOL_ENGINE = Actor(kind=ActorKind.PROTOCOL_ENGINE, id="protocol-engine")
+DUPLICATE_INPUTS = "duplicate_inputs"
+"""The finding that the inputs are those of a calculation already in the record, which is used instead."""
 
 
 class ProtocolEngine:
@@ -36,9 +38,10 @@ class ProtocolEngine:
     def examine(self, investigation_id: str, calculation_id: str) -> RecordResult:
         """Generate any missing inputs, examine the full set, and record the verdict.
 
-        Approved inputs move to VALIDATED_INPUT; rejected ones to REJECTED. Inputs that
-        need review stay SPECIFIED until the user approves them (see ``approve``), and so do
-        inputs whose scientific content waits for the input reviewer.
+        Rejected inputs move to REJECTED. Under a protocol the input reviewer checks (from
+        ``fhiaims.run`` 0.3 on), the others stay SPECIFIED until it has decided; under an older
+        one, approved inputs move to VALIDATED_INPUT, and inputs needing review stay SPECIFIED
+        until the researcher approves them (see ``approve``).
         """
         state = self._ledger.load(investigation_id)
         calc = state.calculations.get(calculation_id)
@@ -57,14 +60,16 @@ class ProtocolEngine:
         if task.structure is not None:
             self._read_into(files, findings, protocol.structure_file, task.structure)
         for name, ref in task.authored_files.items():
-            if name not in protocol.input_files:
-                findings.append(Finding(severity=FindingSeverity.ERROR, code="unexpected_file", file=name,
-                                        message=f"{protocol.ref.name} does not take a file named {name}"))
-            elif name == protocol.structure_file and task.structure is not None:
+            if name == protocol.structure_file and task.structure is not None:
                 findings.append(Finding(severity=FindingSeverity.ERROR, code="structure_twice", file=name,
                                         message="the structure is given both as structure and as an authored file"))
-            else:
-                self._read_into(files, findings, name, ref)
+                continue
+            if name not in protocol.input_files and not protocol.other_files:
+                # Recorded with the rest, so the examination holds every file the agent gave.
+                findings.append(Finding(severity=FindingSeverity.ERROR, code="unexpected_file", file=name,
+                                        message=f"{protocol.ref.name} {protocol.ref.version} does not take a file "
+                                                f"named {name}"))
+            self._read_into(files, findings, name, ref)
         generated, generation_findings = protocol.generate(task, files)
         files.update(generated)
         findings += generation_findings
@@ -80,8 +85,9 @@ class ProtocolEngine:
         if duplicate is not None:
             message = (f"these inputs are identical to registered run {duplicate}, which already has outputs; read "
                        "or analyse it instead of running it again" if state.calculations[duplicate].registered else
-                       f"these inputs are identical to calculation {duplicate}; link it instead")
-            findings.append(Finding(severity=FindingSeverity.ERROR, code="duplicate_inputs", message=message))
+                       f"these inputs are identical to calculation {duplicate}, which is used instead of running them "
+                       "again")
+            findings.append(Finding(severity=FindingSeverity.ERROR, code=DUPLICATE_INPUTS, message=message))
         verdict = verdict_for(findings)
         examination = InputExamination(protocol=protocol.ref, code_version=protocol.code_version, files=refs,
                                        execution_files=execution, input_hash=input_hash, findings=tuple(findings),

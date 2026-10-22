@@ -325,15 +325,16 @@ def continuation_text(state: InvestigationState, task: AgentTaskRecord, why: str
 
 
 def ended_unseen(state: InvestigationState, hypothesis_id: str, since: int) -> list[str]:
-    """The hypothesis's calculations that ended after ``since``: their runs were checked, they were cancelled, or
-    the researcher or the input reviewer rejected their inputs. Registered runs never ran here, and an examiner's
-    rejection is answered at once."""
+    """The hypothesis's calculations that ended after ``since``: their runs were checked, they were cancelled, the
+    researcher or the input reviewer rejected their inputs, or the scheduler refused to run them. Registered runs
+    never ran here, and an examiner's rejection is answered at once."""
     found = []
     for cid in state.hypotheses[hypothesis_id].calculation_ids:
         calc = state.calculations[cid]
         if calc.registered:
             continue
-        ended = next((v for v, s in calc.history if s in (CalculationState.QUALITY_ASSESSED, CalculationState.CANCELLED)
+        ended = next((v for v, s in calc.history if s in (CalculationState.QUALITY_ASSESSED, CalculationState.CANCELLED,
+                                                           CalculationState.SUBMISSION_FAILED)
                       or (s is CalculationState.REJECTED and calc.refused)), None)
         if ended is not None and ended > since:
             found.append(cid)

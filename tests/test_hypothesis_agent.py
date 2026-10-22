@@ -5,10 +5,11 @@ waits, then reads the synthetic output, submits a cited reading, runs an analysi
 the output and records its result. The analysis script really runs, under its guards.
 """
 
+import os
 import re
 
 import pytest
-from factories import AGENT, authorize
+from factories import AGENT, add_hypothesis, agent_for, authorize
 from sites import aims_output, co_on_cu111, declared, geometry_text
 from sites import control_text as written_control
 from worlds import World
@@ -20,6 +21,7 @@ from cedar.contracts import (
     CalculationState,
     EvidenceKind,
     EvidenceQuality,
+    ExaminationVerdict,
     HypothesisStatus,
     PermissionAction,
     SchedulerState,
@@ -36,13 +38,17 @@ def world(ledger, store, artifacts, site):
     return World(ledger, store, artifacts, site)
 
 
-@pytest.fixture
-def agent(world, tmp_path):
+def tools_for(world, tmp_path, hypothesis_id, actor):
     access = FileAccess(roots=[world.runs], deny=[tmp_path / "config"])
-    ctx = ResearchContext(ledger=world.ledger, investigation_id=world.inv, hypothesis_id=world.hyp, actor=AGENT,
+    ctx = ResearchContext(ledger=world.ledger, investigation_id=world.inv, hypothesis_id=hypothesis_id, actor=actor,
                           registry=world.registry, artifacts=world.artifacts, engine=world.engine,
                           validator=world.validator, files=access, analysis=world.analysis)
     return research_tools(ctx) + file_tools(access)
+
+
+@pytest.fixture
+def agent(world, tmp_path):
+    return tools_for(world, tmp_path, world.hyp, AGENT)
 
 
 def latest_tool_text(call) -> str:
@@ -223,3 +229,66 @@ def test_new_requests_use_the_reviewed_protocol(world, agent):
         assert described.content == (f"fhiaims.run {version} is kept only for the calculations recorded under it; "
                                      "new requests use fhiaims.run 0.4.")
     assert world.state().calculations == {}
+
+
+def test_inputs_identical_to_another_agents_calculation_make_that_calculation_yours(world, agent, tmp_path):
+    add_hypothesis(world.ledger, world.inv, "hyp-b")
+    theirs_tools = {t.name: t for t in tools_for(world, tmp_path, "hyp-b", agent_for("hyp-b"))}
+    theirs = re.search(r"calc_[0-9a-f]{32}", theirs_tools["request_calculation"].invoke(request_args(world)).content)[0]
+    tools = {t.name: t for t in agent}
+    described_otherwise = {**request_args(world), "estimand": "the baseline total energy, as a reference"}
+    outcome = tools["request_calculation"].invoke(described_otherwise)
+    assert not outcome.is_error, outcome.content
+    assert (f"These inputs are identical to those of {theirs}, so they do not run again: {theirs} is one of your "
+            "calculations instead.") in outcome.content
+    assert "link it instead" not in outcome.content and "Fix the errors above" not in outcome.content
+    state = world.state()
+    assert state.calculations[theirs].hypothesis_ids == ["hyp-b", world.hyp]
+    (mine,) = [c for c in state.hypotheses[world.hyp].calculation_ids if c != theirs]
+    assert state.calculations[mine].state is CalculationState.REJECTED
+    (duplicate,) = [f for f in state.calculations[mine].examination.findings if f.code == "duplicate_inputs"]
+    assert duplicate.message == (f"these inputs are identical to calculation {theirs}, which is used instead of "
+                                 "running them again")
+    waiting = tools["submit_report"].invoke({"outcome": "waiting_for_calculations", "summary": "Waiting for it.",
+                                             "wait_for": [theirs]})
+    assert not waiting.is_error and world.state().hypotheses[world.hyp].awaiting_calculation_ids == (theirs,)
+
+
+def test_other_files_the_run_reads_go_with_the_inputs_and_to_the_input_reviewer(world, agent):
+    restart = world.runs / "earlier" / "restart.bin"
+    restart.parent.mkdir(parents=True)
+    restart.write_bytes(b"\x00\x01restart data\x00" * 50)
+    args = request_args(world)
+    request = {t.name: t for t in agent}["request_calculation"]
+    outcome = request.invoke({**args, "input_files": {**args["input_files"], "notes.txt": "k-points as converged\n"},
+                              "input_paths": {"wvfn.dat": str(restart)}})
+    assert not outcome.is_error, outcome.content
+    cid = re.search(r"calc_[0-9a-f]{32}", outcome.content)[0]
+    exam = world.calc(cid).examination
+    assert world.calc(cid).state is CalculationState.SPECIFIED and exam.verdict is ExaminationVerdict.APPROVED
+    assert set(exam.files) == {"control.in", "geometry.in", "job.sh", "notes.txt", "wvfn.dat"}
+    others = {f.file: f for f in exam.findings if f.code == "other_file"}
+    assert set(others) == {"notes.txt", "wvfn.dat"}
+    assert others["wvfn.dat"].message == "wvfn.dat (750 bytes) is not read by CEDAR; the input reviewer checks it"
+    directory = world.runs / world.calc(cid).workdir
+    assert (directory / "wvfn.dat").read_bytes() == restart.read_bytes()
+    assert not os.access(directory / "wvfn.dat", os.W_OK)
+    material = world.reviewer_material(cid)
+    assert ("Other files given with the inputs, which CEDAR does not read (check that the run needs them and that they "
+            "are harmless): notes.txt, wvfn.dat") in material
+    assert "--- wvfn.dat ---\n      750 bytes, not text, so not shown" in material
+    assert "--- notes.txt ---\n    1  k-points as converged" in material
+
+
+def test_an_input_cannot_take_the_outputs_name_or_be_the_structure_again(world, agent):
+    args = request_args(world)
+    request = {t.name: t for t in agent}["request_calculation"]
+    outcome = request.invoke({**args, "input_files": {**args["input_files"], "aims.out": "an old output"}})
+    cid = re.search(r"calc_[0-9a-f]{32}", outcome.content)[0]
+    assert world.calc(cid).state is CalculationState.REJECTED
+    assert "aims.out is the run's output, which the run writes; an input file cannot have its name" in outcome.content
+    refused = request.invoke({**args, "input_files": {**args["input_files"], "geometry.in": "atom 0 0 0 Cu"}})
+    assert refused.is_error and "give the structure as structure_path or structure_text" in refused.content
+    unnamed = request.invoke({**args, "input_files": {**args["input_files"], "../restart.bin": "x"}})
+    assert unnamed.is_error and "invalid_arguments" in unnamed.content
+    assert len(world.state().calculations) == 1

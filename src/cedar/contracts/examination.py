@@ -2,7 +2,9 @@
 
 Agents may write input files and job scripts themselves, or let a protocol generate
 them. Either way the protocol's examiner checks the exact files that will run against
-the declared task and the protocol's policy, and records what it found.
+the protocol's policy, and records what it found. From ``fhiaims.run`` 0.4 on, that policy
+covers only what runs on the machine (the files are there; the job script, its resources and
+the budget); the input reviewer checks the rest.
 """
 
 from collections.abc import Iterable, Mapping
@@ -25,7 +27,7 @@ from cedar.contracts.task import ProtocolRef
 
 class FindingSeverity(StrEnum):
     ERROR = "error"
-    """Contradicts the declared task or violates policy; the inputs are rejected."""
+    """Violates the protocol's policy; the inputs are rejected."""
     REVIEW = "review"
     """The examiner cannot verify it; the inputs need explicit user approval."""
     WARNING = "warning"

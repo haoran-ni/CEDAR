@@ -102,7 +102,10 @@ def job_status(state: InvestigationState, calc: CalculationRecord) -> str:
         else:
             text = "needs /approve submit" if needs else "authorized, not yet submitted"
     elif calc.state is _C.SUBMISSION_PENDING:
-        text = "submitting"
+        refused = len(calc.submission_refusals)
+        text = "submitting" + (f" (the scheduler refused it {refused}x; trying again)" if refused else "")
+    elif calc.state is _C.SUBMISSION_FAILED:
+        text = "refused by the scheduler"
     elif calc.state is _C.CANCELLED:
         text = "cancelled" + (f" (job {calc.scheduler_job_id})" if calc.scheduler_job_id else "")
     else:
@@ -342,12 +345,14 @@ def swarm_rows(state: InvestigationState) -> list[SwarmRow]:
         calcs = [state.calculations[c] for c in hyp.calculation_ids]
         qualities = Counter(r.evidence.quality.value for r in hypothesis_evidence(state, hyp.hypothesis_id))
         last = hyp.assessments[-1] if hyp.assessments else None
-        # A rejected request followed by another is a draft its agent has moved past.
+        # A rejected or refused request followed by another is a draft its agent has moved past.
         latest = max((c.requested_at for c in calcs if not c.registered), default=0)
-        replaced = [c for c in calcs if c.state is _C.REJECTED and c.requested_at < latest]
+        replaced = [c for c in calcs if c.state in (_C.REJECTED, _C.SUBMISSION_FAILED) and c.requested_at < latest]
         jobs = [job_status(state, c) for c in calcs if c not in replaced]
-        if replaced:
-            jobs.append(f"{len(replaced)} rejected request{'s' * (len(replaced) != 1)} replaced")
+        for kind, ended in (("rejected", _C.REJECTED), ("refused", _C.SUBMISSION_FAILED)):
+            count = sum(c.state is ended for c in replaced)
+            if count:
+                jobs.append(f"{count} {kind} request{'s' * (count != 1)} replaced")
         rows.append(SwarmRow(
             hypothesis_id=hyp.hypothesis_id,
             lifecycle=hyp.status.value,

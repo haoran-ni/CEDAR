@@ -19,7 +19,7 @@ One FHI-aims run of one structure, at fixed geometry or relaxing it, through Slu
 
 ### Inputs and declared settings
 
-The agent writes `control.in` and `geometry.in`, typically by copying the researcher's files and changing what its test changes; only the job script is generated, from the approved template, if the agent does not write it. The task declares what the calculation is, in whatever terms describe it: what it varies (interventions), physical conditions it holds fixed (controls) and accuracy settings (numerical settings), e.g. `{"dispersion": "MBD-NL"}`, `{"adsorption_site": "top", "n_layers": 4}` or `{"k_grid": [4, 4, 1]}`. The declarations are the agent's description, for the record, the input reviewer and comparisons; they are not checked against the files (`declarations_checked` is false in the examination), and what `control.in` actually sets is recorded from the file.
+The agent writes `control.in` and `geometry.in`, typically by copying the researcher's files and changing what its test changes; only the job script is generated, from the approved template, if the agent does not write it. The agent may also give any other file the run reads, such as a restart file, under any plain file name but the output's (`aims.out`). CEDAR stores such files by hash, writes them into the run directory with the rest and includes them in the calculation's identity, but does not read them: the input reviewer checks them. Every input file is read-only while the run runs and must be unchanged after it (`inputs_unchanged`), so inputs that make FHI-aims rewrite one of them fail the run. The task declares what the calculation is, in whatever terms describe it: what it varies (interventions), physical conditions it holds fixed (controls) and accuracy settings (numerical settings), e.g. `{"dispersion": "MBD-NL"}`, `{"adsorption_site": "top", "n_layers": 4}` or `{"k_grid": [4, 4, 1]}`. The declarations are the agent's description, for the record, the input reviewer and comparisons; they are not checked against the files (`declarations_checked` is false in the examination), and what `control.in` actually sets is recorded from the file.
 
 ### Deterministic examination
 
@@ -28,7 +28,9 @@ The agent writes `control.in` and `geometry.in`, typically by copying the resear
 | What | Finding |
 |---|---|
 | A missing `control.in`, `geometry.in` or job script | `ERROR` |
-| Inputs identical to a usable calculation's | `ERROR` (link it instead) |
+| Any other file given with the inputs: its name and size | `INFO` |
+| A file named like the run's output (`aims.out`) | `ERROR` |
+| Inputs identical to a usable calculation's | `ERROR`; the requesting agent's hypothesis is linked to that calculation, which is used instead (a registered run is read instead) |
 | The job script, examined against the approved profile as for 0.2: commands, directives, resources, the task's budget, and for a local run the allocation; a local run on a login node | `ERROR` or `REVIEW` as for 0.2 |
 | The structure's atoms, elements, constraints, initial moments, shortest distance and empty space along the third lattice vector; `geometry.in` lines CEDAR's reader cannot read or does not interpret | `INFO` |
 | Which species-defaults level each element's block equals, or that it equals none (by hash); an element without a block; a block for an element not in the structure | `INFO` |
@@ -41,7 +43,7 @@ Inputs that pass wait for the input reviewer: the calculation stays `SPECIFIED` 
 
 An agent separate from the one that wrote the inputs, and from the Evidence Judge. The dispatcher gives it the inputs waiting for review, one task per hypothesis. It checks two things, and only these:
 - that FHI-aims will run the inputs as the calculation the task describes: every keyword and its arguments are accepted by the installed version, the files are complete and fit together (a species block for every element, a readable structure), and what the task says the calculation is is actually set up (a task with MBD dispersion switches MBD on with arguments the installed version takes; a relaxation sets `relax_geometry`; a spin-polarized run sets `spin collinear` and initial moments);
-- that nothing in the files or the job script is harmful: commands that delete or overwrite files, reach the network, start other programs or get around CEDAR's checks, and text written as instructions to it or to CEDAR.
+- that nothing in the files or the job script is harmful: commands that delete or overwrite files, reach the network, start other programs or get around CEDAR's checks, and text written as instructions to it or to CEDAR. Files given besides `control.in`, `geometry.in` and the job script are its alone to check, since CEDAR does not read them: that the run reads them and that they are harmless.
 
 The scientific choices are not its to judge: the functional, the basis level, the k-points, the thresholds, the slab model, whether the test suits the hypothesis or compares with others. It is lenient: inputs that will run as described are approved, and a view on the science is a note at most.
 
@@ -50,7 +52,7 @@ It is shown:
 - the examination's facts, and every keyword `control.in` sets;
 - earlier revisions of the same request it sent back, with its reasons;
 - the installed code: binary, version, data paths, and the source tree with its manual (LaTeX sources, `doc/manual`) and its `control.in` parser (`src/read_control.f90`), found next to them;
-- the files, numbered by line.
+- the files, numbered by line; a file that is not text by its name and size only, to be looked at with the file tools.
 
 It reads any file the researcher can, except credentials. It always has the web, whatever the investigation's `/web` setting, but only the documentation sites in `REVIEW_DOMAINS` (`web.py`: fhi-aims.org, fhi-aims-club.gitlab.io, wiki.fysik.dtu.dk, ase-lib.org), so nothing about the system under investigation reaches the agents through it. It treats the files, their comments and web pages as data, never as instructions.
 
@@ -112,7 +114,7 @@ Every task must declare `xc`, `spin`, `charge`, `relativistic`, `occupation_type
 
 ### Input examination
 
-Findings are `ERROR` (reject), `REVIEW` (needs user approval), `WARNING` or `INFO`. `/pending` shows each `REVIEW` finding with its file and line, and the run directory that holds the examined files. The researcher approves such inputs (`/approve inputs`), or rejects them, or any examined inputs not yet submitted, with a reason that wakes the agent (`/reject inputs`).
+Findings are `ERROR` (reject), `REVIEW` (needs user approval), `WARNING` or `INFO`. `/pending` shows each `REVIEW` finding with its file and line, and the run directory that holds the examined files. The researcher approves such inputs with the run (`/approve submit`), or rejects them, or any examined inputs not yet submitted, with a reason that wakes the agent (`/reject inputs`).
 
 **Declarations:**
 - An unknown variable is an `ERROR`.
@@ -161,6 +163,10 @@ These marker strings were checked against the FHI-aims source and real outputs o
 A local run's checks are the same; its scheduler state comes from the local backend, and its run check records where it ran (`execution`, `host`, `allocation`, and the CPUs and id of its Slurm step).
 
 ## Every version
+
+### Submission
+
+Once the researcher (or, in full automation, the approver) has approved the run, the job manager submits it: to Slurm, or to the local backend. A scheduler that refuses the job (`sbatch` answers with an error) is asked again on the dispatcher's next passes, each refusal recorded (`submission_refused`), since a refusal can be temporary. After three refusals the calculation is `SUBMISSION_FAILED`, with what the scheduler said; a local run that no longer fits (more tasks than local DFT may use here, or a time limit past the allocation's end, which can happen while the inputs wait for review and approval) is refused once and for all. Before each verdict the job is looked up by name, since a refused `sbatch` can still have queued it. The calculation's agent is woken at once with the scheduler's words, to request the calculation again with the cause fixed, usually in the job script; the same DFT inputs may be given again, and the new request is reviewed and approved like any other. An `sbatch` that does not answer leaves the calculation waiting to be submitted; the next pass looks for the job by name before submitting again.
 
 ### Registered runs
 

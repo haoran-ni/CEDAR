@@ -64,6 +64,11 @@ def calculation_summary(state: InvestigationState, calc: CalculationRecord, *, f
             lines.append(f"  rejected by the input reviewer ({calc.ended_by}): {calc.end_reason}")
         elif calc.state is CalculationState.CANCELLED and calc.end_reason:
             lines.append("  cancelled" + (f" ({calc.ended_by})" if calc.ended_by else "") + f": {calc.end_reason}")
+        elif calc.submission_failed:
+            lines.append(f"  the scheduler refused to run it: {calc.end_reason}")
+        elif calc.submission_refusals:
+            lines.append(f"  the scheduler refused it {len(calc.submission_refusals)} time(s), trying again; last: "
+                         f"{calc.submission_refusals[-1]}")
         elif awaits_reviewer(state, calc):
             lines.append("  its inputs wait for the input reviewer")
         if calc.input_review is not None and not calc.rejected_by_reviewer:

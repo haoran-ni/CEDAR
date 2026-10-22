@@ -4,6 +4,12 @@ Submission is journaled: SUBMISSION_PENDING is recorded before the scheduler is 
 and a calculation found in that state is reconciled by job name before anything is
 submitted again, so a crash between the two never produces a duplicate job.
 
+A scheduler that refuses the job is asked again on later passes, since a refusal can be
+temporary; each refusal is recorded. After ``MAX_SUBMISSION_ATTEMPTS`` refusals, or one that
+trying again cannot change, the calculation is SUBMISSION_FAILED, with what the scheduler
+said, and its agent requests it again with the cause fixed. A refused job can still have been
+queued (a busy controller answers late), so the job name is looked up before each verdict.
+
 Each manager and monitor serves calculations of one execution: ``slurm`` through the Slurm
 adapter, ``local`` through the local backend on the interactive node CEDAR runs on. For local
 runs the monitor also records what the backend says a job waits for or where it runs (a
@@ -15,20 +21,28 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from cedar.contracts.base import Actor, ActorKind
-from cedar.contracts.events import CalculationStateChanged, EventDraft, RecordedEvent, SchedulerNoteRecorded
+from cedar.contracts.events import (
+    CalculationStateChanged,
+    EventDraft,
+    RecordedEvent,
+    SchedulerNoteRecorded,
+    SubmissionRefused,
+)
 from cedar.contracts.plan import PermissionAction
 from cedar.contracts.status import SCHEDULER_TERMINAL_STATES, CalculationState, SchedulerState
 from cedar.contracts.task import Execution
 from cedar.errors import RuleViolation
-from cedar.hpc.slurm import SchedulerBackend, SchedulerError, SchedulerObservation, default_lookback
+from cedar.hpc.slurm import JobRefused, SchedulerBackend, SchedulerError, SchedulerObservation, default_lookback
 from cedar.state.ledger import ResearchLedger
-from cedar.state.projection import CalculationRecord, authorization_for
+from cedar.state.projection import CalculationRecord, InvestigationState, authorization_for
 
 JOB_MANAGER = Actor(kind=ActorKind.JOB_MANAGER, id="job-manager")
 JOB_MONITOR = Actor(kind=ActorKind.JOB_MONITOR, id="job-monitor")
 
 _C = CalculationState
 _AT_SCHEDULER = frozenset({_C.SUBMITTED, _C.QUEUED, _C.RUNNING})
+MAX_SUBMISSION_ATTEMPTS = 3
+"""Times the scheduler may refuse a calculation's submission, one attempt per dispatcher pass, before it fails."""
 
 
 def job_name_for(calculation_id: str) -> str:
@@ -79,17 +93,46 @@ class JobManager:
 
         name = job_name_for(calculation_id)
         if calc.state is _C.SUBMISSION_PENDING:
-            existing = self._backend.find_by_name(name, default_lookback())
-            if len(existing) > 1:
-                raise SchedulerError(f"several scheduler jobs are named {name}; resolve this by hand")
-            if existing:
-                return self._record_submitted(investigation_id, calculation_id, existing[0].job_id, authorization)
+            existing = self._job_named(name)
+            if existing is not None:
+                return self._record_submitted(investigation_id, calculation_id, existing, authorization)
         else:
             self._ledger.record(investigation_id, [self._draft(calculation_id, _C.SUBMISSION_PENDING,
                                                                key=f"{calculation_id}:submission_pending")])
         script = directory / calc.examination.execution_files[0]
-        job_id = self._backend.submit(script, directory, name)
+        try:
+            job_id = self._backend.submit(script, directory, name)
+        except JobRefused as refusal:
+            existing = self._job_named(name)
+            if existing is not None:
+                return self._record_submitted(investigation_id, calculation_id, existing, authorization)
+            self._record_refusal(investigation_id, calculation_id, refusal)
+            raise
         return self._record_submitted(investigation_id, calculation_id, job_id, authorization)
+
+    def _job_named(self, name: str) -> str | None:
+        """The id of the one scheduler job with this name, if there is one."""
+        existing = self._backend.find_by_name(name, default_lookback())
+        if len(existing) > 1:
+            raise SchedulerError(f"several scheduler jobs are named {name}; resolve this by hand")
+        return existing[0].job_id if existing else None
+
+    def _record_refusal(self, investigation_id: str, calculation_id: str, refusal: JobRefused) -> None:
+        """Record a refused attempt; the last one allowed, or one that trying again cannot change, fails the
+        submission."""
+
+        def build(state: InvestigationState) -> list[EventDraft]:
+            calc = state.calculations[calculation_id]
+            if calc.state is not _C.SUBMISSION_PENDING:
+                return []
+            attempts = len(calc.submission_refusals) + 1
+            if refusal.final or attempts >= MAX_SUBMISSION_ATTEMPTS:
+                reason = str(refusal) + (f" (refused {attempts} times)" if attempts > 1 else "")
+                return [self._draft(calculation_id, _C.SUBMISSION_FAILED, reason=reason)]
+            return [EventDraft(actor=self._actor, payload=SubmissionRefused(calculation_id=calculation_id,
+                                                                            reason=str(refusal)))]
+
+        self._ledger.record_with(investigation_id, build)
 
     def reconcile(self, investigation_id: str) -> dict[str, str | None]:
         """Settle calculations left in SUBMISSION_PENDING: {calculation id: job id or None if none exists}."""

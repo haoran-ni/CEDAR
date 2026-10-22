@@ -16,7 +16,9 @@ from worlds import World
 from cedar.chat import ChatSession
 from cedar.contracts import CalculationState, ExaminationVerdict, HypothesisStatus, PermissionAction
 from cedar.contracts.events import HypothesisStatusChanged
+from cedar.engine.jobs import MAX_SUBMISSION_ATTEMPTS
 from cedar.summaries import gist, short_id
+from cedar.workspace import services_for
 
 
 @pytest.fixture
@@ -182,3 +184,39 @@ def test_a_calculation_waiting_for_submission_can_be_rejected_until_it_is_submit
     assert chat.handle(f"/reject inputs {short_id(submitted)}").startswith("Usage: /reject inputs <calc> <reason>")
     assert chat.handle("/reject inputs calc_nothing at all") == "No calculation calc_nothing in this investigation."
     assert [i for i in world.state().interventions if i.startswith("msg-")] == ["msg-1"]  # refusals record nothing
+
+
+def test_an_agent_hears_at_once_that_the_scheduler_refused_its_calculation(system, world, chat, baseline):
+    other = needs_review(world, baseline, "some_new_keyword")
+    record_run(world, "agent-hyp-xc", world.state().version)
+    world.ledger.record(world.inv, [draft(AGENT, HypothesisStatusChanged(
+        hypothesis_id=world.hyp, status=HypothesisStatus.WAITING_FOR_JOB, reason="waiting",
+        awaiting_calculation_ids=(baseline, other)))])
+    assert chat.handle(f"/approve submit {short_id(baseline)}").startswith("Approved 1 calculation")
+    refusal = "sbatch: error: Batch job submission failed: Invalid partition name specified"
+    system["scheduler"].refusal = refusal
+    services = services_for(system["workspace"], system["site"], system["scheduler"])
+    dispatcher = system["dispatcher"]
+    for _ in range(MAX_SUBMISSION_ATTEMPTS - 1):
+        assert dispatcher._submit(world.inv, services) == [
+            f"the scheduler refused {baseline}: {refusal}; trying again on the next pass"]
+        assert dispatcher._wake(world.inv) == []  # it may still be taken
+    assert dispatcher._submit(world.inv, services) == [
+        f"the scheduler refused {baseline}: {refusal}; its agent is told"]
+    assert world.calc(baseline).state is CalculationState.SUBMISSION_FAILED
+    assert dispatcher._submit(world.inv, services) == []  # nothing is tried again
+
+    assert dispatcher._wake(world.inv) == [f"woke the agent for {world.hyp}"]  # without waiting for the other one
+    hypothesis = world.state().hypotheses[world.hyp]
+    assert hypothesis.status is HypothesisStatus.ANALYZING
+    (woken,) = [e.payload for e in system["workspace"].store.read_stream(world.inv)
+                if isinstance(e.payload, HypothesisStatusChanged) and e.payload.status is HypothesisStatus.ANALYZING]
+    assert woken.reason == f"the scheduler refused {baseline}"
+    (task,) = world.state().pending_tasks
+    assert (f"the scheduler refused to run it: {refusal} (refused {MAX_SUBMISSION_ATTEMPTS} times)"
+            in task.instruction)
+    assert f"The scheduler refused to run {baseline}; what it said is shown above." in task.instruction
+    assert other not in task.instruction and "Look at the outputs" not in task.instruction
+    assert (f"The scheduler refused to run {baseline}: {refusal} (refused {MAX_SUBMISSION_ATTEMPTS} times). Its "
+            "agent is asked to request it again with the cause fixed.") == chat.handle(
+        f"/approve submit {short_id(baseline)}")

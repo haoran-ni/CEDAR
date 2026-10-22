@@ -90,7 +90,7 @@ dispatcher on the same node: the data directory is often on a shared filesystem.
 ## Local calculations
 
 A task with `execution: local` runs on the interactive node CEDAR runs on, inside the
-researcher's allocation, under `fhiaims.run` 0.2:
+researcher's allocation, under `fhiaims.run` 0.4:
 
 - its script, `local.sh`, is the approved job template without its `#SBATCH` lines, plus one
   `#CEDAR --ntasks=N --time=T` line; the examiner checks it like a job script, and its task
@@ -100,7 +100,10 @@ researcher's allocation, under `fhiaims.run` 0.2:
   runs no local DFT;
 - on a login node the request is rejected at once: "DFT cannot run locally on login nodes";
 - submission needs the researcher's `/approve submit <calc>`, `/approve submit <agent>` or
-  `/approve submit all` (or the approver, in full automation), as for Slurm.
+  `/approve submit all` (or the approver, in full automation), as for Slurm;
+- a run that no longer fits when it is to start (the allocation ran on while its inputs were
+  reviewed and approved) is refused at once: the calculation is `SUBMISSION_FAILED`, and its
+  agent is woken with the reason, to request it again.
 
 The local backend (`hpc/local.py`) has the scheduler adapter's interface, so the journaled
 submission, reconciliation by job name, the job monitor, run checks and agent wake-ups are

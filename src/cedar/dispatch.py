@@ -1,7 +1,8 @@
 """The dispatcher: moves investigations forward with or without anyone in the chat.
 
 Each pass, for every open investigation:
-1. submit calculations the researcher has authorized (never those of on-hold hypotheses);
+1. submit calculations the researcher has authorized (never those of on-hold hypotheses); one the scheduler keeps
+   refusing fails, and its agent is woken at once with what the scheduler said;
 2. poll the scheduler and record job state changes;
 3. check the health of every run that ended and store its outputs;
 4. start proposed agents whose review window has passed without a reply from the researcher;
@@ -85,7 +86,7 @@ from cedar.errors import RuleViolation
 from cedar.hpc.local import LocalBackend
 from cedar.hpc.node import local_dft
 from cedar.hpc.profile import ProfileNotApproved, ProfileStore
-from cedar.hpc.slurm import SchedulerBackend, SchedulerError
+from cedar.hpc.slurm import JobRefused, SchedulerBackend, SchedulerError
 from cedar.models.prices import dollars, prices_for
 from cedar.notebook import update_notebook
 from cedar.state.projection import (AgentTaskRecord, CalculationRecord, InvestigationState, authorization_for,
@@ -114,7 +115,7 @@ JUDGE = Actor(kind=ActorKind.EVIDENCE_JUDGE, id="evidence-judge")
 APPROVER_ACTOR = Actor(kind=ActorKind.APPROVER, id="approver")
 REVIEWER_ACTOR = Actor(kind=ActorKind.INPUT_REVIEWER, id="input-reviewer")
 _ENDED = frozenset({CalculationState.SCHEDULER_TERMINAL, CalculationState.PARSING, CalculationState.QUALITY_ASSESSED,
-                    CalculationState.REJECTED, CalculationState.CANCELLED})
+                    CalculationState.REJECTED, CalculationState.SUBMISSION_FAILED, CalculationState.CANCELLED})
 _ORDER = {Priority.HIGH: 0, Priority.NORMAL: 1, Priority.LOW: 2, Priority.ON_HOLD: 3}
 HEARTBEAT = "dispatcher.heartbeat"
 ACTIVITY = "activity"
@@ -139,16 +140,25 @@ _ANSWER_REJECTION = (
     "The inputs of {calcs} were rejected; who rejected them and why is shown above. Address the reasons: change what "
     "they concern and request the calculation again, or, if you cannot or disagree, say why in your report and ask "
     "the researcher. Never request the same inputs again unchanged.")
+_ANSWER_REFUSAL = (
+    "The scheduler refused to run {calcs}; what it said is shown above. Its inputs had been examined and approved, so "
+    "the cause is usually in how the job asks to run (the job script's partition, time limit, task count or account) "
+    "or a limit of the cluster; it can also be a passing problem of the scheduler. Request the calculation again with "
+    "the cause fixed: the same DFT inputs may be given again, and the request is reviewed and approved again. If the "
+    "fix needs the compute profile or the cluster changed, say so in your report and ask the researcher.")
 
 
 def wake_instruction(state: InvestigationState, ended: list[CalculationRecord]) -> str:
     """The task that wakes an agent for calculations of its that have ended: what each came to, and what to do."""
     rejected = [c.calculation_id for c in ended if c.refused]
+    refused = [c.calculation_id for c in ended if c.submission_failed]
     lines = [WAKE_TASK, *(calculation_summary(state, c, findings=False) for c in ended)]
-    if len(rejected) < len(ended):
+    if len(rejected) + len(refused) < len(ended):
         lines.append(_LOOK_AT_OUTPUTS)
     if rejected:
         lines.append(_ANSWER_REJECTION.format(calcs=", ".join(rejected)))
+    if refused:
+        lines.append(_ANSWER_REFUSAL.format(calcs=", ".join(refused)))
     lines.append("Say what this means for your hypothesis, then set its status (ASSESSED, or PLANNING_TEST if another "
                  "test is needed).")
     return "\n".join(lines)
@@ -405,6 +415,10 @@ class Dispatcher:
             try:
                 job = services.manager_for(calc).submit(investigation_id, calc.calculation_id)
                 notes.append(f"submitted {calc.calculation_id} as job {job}")
+            except JobRefused as exc:
+                now = self.workspace.ledger.load(investigation_id).calculations[calc.calculation_id]
+                notes.append(f"the scheduler refused {calc.calculation_id}: {exc}; "
+                             + ("its agent is told" if now.submission_failed else "trying again on the next pass"))
             except (RuleViolation, InputsChanged, SchedulerError, OSError) as exc:
                 notes.append(f"could not submit {calc.calculation_id}: {exc}")
         return notes
@@ -477,16 +491,19 @@ class Dispatcher:
                 else last.recorded_at
             if hyp.status is HypothesisStatus.WAITING_FOR_JOB:
                 awaited = [state.calculations[c] for c in hyp.awaiting_calculation_ids]
-                # A rejection by the researcher or the input reviewer is answered at once, without waiting for the
-                # other calculations.
+                # A rejection by the researcher or the input reviewer, or the scheduler's refusal, is answered at
+                # once, without waiting for the other calculations.
                 rejected = [state.calculations[c] for c in ended_unseen(state, hyp.hypothesis_id, since)
-                            if state.calculations[c].refused]
+                            if state.calculations[c].refused or state.calculations[c].submission_failed]
                 if all(c.state in _ENDED for c in awaited):
                     ended = awaited + [c for c in rejected if c not in awaited]
                     why = "the calculations it was waiting for have ended"
                 elif rejected and state.plan.priority(hyp.hypothesis_id) is not Priority.ON_HOLD:
                     ended = rejected
-                    why = f"the inputs of {', '.join(c.calculation_id for c in rejected)} were rejected"
+                    inputs = [c.calculation_id for c in rejected if c.refused]
+                    jobs = [c.calculation_id for c in rejected if c.submission_failed]
+                    why = "; ".join(([f"the inputs of {', '.join(inputs)} were rejected"] if inputs else [])
+                                    + ([f"the scheduler refused {', '.join(jobs)}"] if jobs else []))
                 else:
                     continue
                 drafts.append(EventDraft(actor=SYSTEM, payload=HypothesisStatusChanged(

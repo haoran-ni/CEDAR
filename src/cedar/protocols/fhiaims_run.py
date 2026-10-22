@@ -1,26 +1,25 @@
-"""One FHI-aims run of one structure, at fixed geometry or relaxing it (``fhiaims.run`` 0.4, and 0.3 to 0.1).
+"""One FHI-aims run of one structure, at fixed geometry or relaxing it: ``fhiaims.run`` 0.4 (``FhiAimsRunJobChecked``).
 
-The protocol examines the inputs before the run and checks the run's health after it. What
-to take from a healthy run is declared by the agent, who reads it from the outputs or
-computes it with an analysis script; the protocol itself reads the final total energies,
-which every run prints.
+The agent writes ``control.in`` and ``geometry.in``, and may give any other file the run
+reads; the protocol generates only the job script, from the approved template, when the
+agent does not write one. The run goes through Slurm (``job.sh``) or runs on the interactive
+node CEDAR runs on (``execution: local``; ``local.sh``, the template without its Slurm
+directives), never on a login node.
 
-Task variables are FHI-aims ``control.in`` keywords, named as in ``control.in``, plus the
-pseudo-variable ``species_defaults``: a level directory (such as ``light``) under the
-species-defaults directory of the approved compute profile. The protocol knows what each
-keyword means: whether it changes the physical model, sets numerical accuracy, or only
-affects how convergence is reached. It holds no site paths and no preferred values;
-agents declare every setting and the examiner checks that ``control.in`` implements
-exactly what was declared.
+Before the run, the examination checks deterministically only what runs on the machine: that
+``control.in``, ``geometry.in`` and the job script are there, and the job script against the
+approved template, its resources against the profile's limits and the task's budget and, for
+a local run, the allocation. It enforces nothing about the DFT settings or the other files:
+it records what ``control.in`` sets and facts about the structure and the species blocks, and
+the input reviewer, an agent, checks that FHI-aims will run the files as the task describes
+and that nothing in them is harmful. After the run, the protocol checks its health from
+FHI-aims's own markers and reads the final total energies; what else to take from a healthy
+run is the agent's decision.
 
-Version 0.2 adds runs on the interactive node CEDAR runs on (``execution: local``): instead
-of a Slurm job script, ``local.sh``, the approved job template without its Slurm directives,
-whose task count and time limit must fit the researcher's allocation here. On a login node a
-local run is refused. Version 0.1 runs through Slurm only; it stays for the calculations
-recorded under it.
-
-Versions 0.3 and 0.4 leave what the keywords mean to the input reviewer, an agent: see
-``FhiAimsRunReviewed`` and ``FhiAimsRunJobChecked``.
+Versions 0.1 to 0.3 stay for the calculations recorded under them and accept no new
+requests: 0.1 and 0.2 (``FhiAimsRunSlurmOnly``, ``FhiAimsRun``) held ``control.in`` to a
+fixed list of keywords and to the task's declared settings, and 0.3 (``FhiAimsRunReviewed``)
+to the declared settings.
 """
 
 import math
@@ -163,6 +162,15 @@ def _same_args(expected: tuple[str, ...], actual: tuple[str, ...]) -> bool:
 
 
 class FhiAimsRun(Protocol):
+    """``fhiaims.run`` 0.2, kept for the calculations recorded under it.
+
+    Task variables are ``control.in`` keywords, named as in ``control.in``, plus the pseudo-variable
+    ``species_defaults``: a level directory (such as ``light``) under the profile's species defaults. The protocol
+    knows what each keyword in its lists means (physical model, numerical accuracy, or how convergence is reached),
+    and the examiner checks that ``control.in`` sets exactly what was declared. A run goes through Slurm or on the
+    interactive node CEDAR runs on.
+    """
+
     ref = ProtocolRef(name="fhiaims.run", version="0.2")
     input_files = ("control.in", "geometry.in", "job.sh", "local.sh")
     structure_file = "geometry.in"
@@ -227,7 +235,7 @@ class FhiAimsRun(Protocol):
 
     def _where(self) -> list[str]:
         if not self.runs_locally:
-            return ["Runs through Slurm only (job.sh); use version 0.2 for a local run."]
+            return [f"Runs through Slurm only (job.sh); use version {self.superseded_by} for a local run."]
         host = self._host()
         local = (f"possible here: CEDAR runs on the {host.describe()}; a local run may use up to {host.cores} "
                  "tasks and must end before the allocation does" if host.interactive else
@@ -429,20 +437,21 @@ class FhiAimsRun(Protocol):
                                         output_file="aims.out")
             findings += script.findings
             if script.resources is not None:
-                findings += self._examine_budget(task, script.resources)
+                findings += self._examine_budget(task, script.resources, "job.sh")
         if "local.sh" in files:
             script = examine_local_script(files["local.sh"].decode(errors="replace"), self._profile, self._code,
                                           output_file="aims.out")
             findings += script.findings
             if script.resources is not None:
-                findings += self._examine_budget(task, script.resources) + self._examine_fit(script.resources)
+                findings += self._examine_budget(task, script.resources, "local.sh")
+                findings += self._examine_fit(script.resources)
         return findings
 
     def _examine_where(self) -> list[Finding]:
         if not self.runs_locally:
             return [Finding(severity=_E, code="no_local_runs",
                             message=f"{self.ref.name} {self.ref.version} runs through Slurm only; request "
-                                    f"{FhiAimsRun.ref.name} {FhiAimsRun.ref.version} for a local run")]
+                                    f"{self.ref.name} {self.superseded_by} for a local run")]
         host = self._host()
         if not host.interactive:
             return [Finding(severity=_E, code="local_on_login_node", message=LOGIN_NODE.format(host=host.hostname))]
@@ -590,15 +599,15 @@ class FhiAimsRun(Protocol):
         return findings
 
     @staticmethod
-    def _examine_budget(task: ScientificTaskSpec, resources: JobResources) -> list[Finding]:
+    def _examine_budget(task: ScientificTaskSpec, resources: JobResources, script: str) -> list[Finding]:
         findings = []
         budget = task.budget
         if budget.max_core_hours is not None and resources.core_hours > budget.max_core_hours:
-            findings.append(Finding(severity=_E, code="over_budget", file="job.sh",
+            findings.append(Finding(severity=_E, code="over_budget", file=script,
                                     message=f"{resources.core_hours:g} core-hours requested; the task allows "
                                             f"{budget.max_core_hours:g}"))
         if budget.max_walltime_hours is not None and resources.walltime_minutes > budget.max_walltime_hours * 60:
-            findings.append(Finding(severity=_E, code="over_budget", file="job.sh",
+            findings.append(Finding(severity=_E, code="over_budget", file=script,
                                     message=f"{resources.walltime_minutes} minutes requested; the task allows "
                                             f"{budget.max_walltime_hours:g} h"))
         return findings
@@ -833,19 +842,22 @@ JOB_CHECKED_LIMITATION = (
 class FhiAimsRunJobChecked(FhiAimsRunReviewed):
     """``fhiaims.run`` 0.4: nothing about the DFT settings is enforced by rules; the input reviewer checks the inputs.
 
-    The examination checks only what runs on the machine: that the files are there, the job script against the
-    approved template, its resources, the budget and, for a local run, the allocation. A fixed list of rules cannot
-    know a code's inputs and raises false alarms, so the task's declared settings are the agent's own description of
-    the calculation, in whatever terms suit it, and are not compared with control.in. What control.in sets, the
-    structure and which species defaults the blocks equal are recorded as facts for the input reviewer, which checks
-    that FHI-aims will run the files as the task describes and that nothing in them is harmful. The agent writes
-    control.in itself; only the job script is generated.
+    The examination checks only what runs on the machine: that control.in, geometry.in and the job script are there,
+    the job script against the approved template, its resources, the budget and, for a local run, the allocation. A
+    fixed list of rules cannot know a code's inputs and raises false alarms, so the task's declared settings are the
+    agent's own description of the calculation, in whatever terms suit it, and are not compared with control.in.
+    What control.in sets, the structure and which species defaults the blocks equal are recorded as facts for the
+    input reviewer, which checks that FHI-aims will run the files as the task describes and that nothing in them is
+    harmful. The agent writes control.in itself, and may give any other file the run reads under any plain name but
+    the output's; CEDAR stores such files without reading them, and the input reviewer checks them. Only the job
+    script is generated.
     """
 
     ref = ProtocolRef(name="fhiaims.run", version="0.4")
     superseded_by = None
     generates_control = False
     checks_declarations = False
+    other_files = True
     limitation = JOB_CHECKED_LIMITATION
 
     def describe(self) -> str:
@@ -863,6 +875,10 @@ class FhiAimsRunJobChecked(FhiAimsRunReviewed):
             "the calculation for the record, the input reviewer and the comparisons; CEDAR does not check them "
             "against the files, and records what control.in actually sets from the file.",
             f"{SPECIES_DEFAULTS} levels available on this system: {', '.join(levels) or 'none found'}",
+            "Other files the run reads, such as a restart file, may be given too, under any plain file name but the "
+            "output's (aims.out); give files that are not text by path. CEDAR stores them without reading them. "
+            "Every input file is read-only while the run runs and must be unchanged after it: a run that rewrites one "
+            "fails its check.",
             "The input reviewer, an agent, checks that FHI-aims will run your files as you describe and that nothing "
             "in them is harmful; your scientific choices are yours. If it finds a problem, you are woken with its "
             "reasons. Then the researcher approves the run, the last step before it starts.",
@@ -881,12 +897,28 @@ class FhiAimsRunJobChecked(FhiAimsRunReviewed):
                 findings.append(Finding(severity=_E, code="missing_file", file=name, message=f"{name} is missing"
                                         + ("; write it, this protocol generates only the job script"
                                            if name == "control.in" else "")))
+        findings += self._other_files(files)
         if "geometry.in" in files:
             geometry = parse_geometry(files["geometry.in"].decode(errors="replace"))
             findings += self._structure_facts(geometry)
             if "control.in" in files and not geometry.malformed_lines:
                 findings += self._species_facts(parse_control(files["control.in"].decode(errors="replace")), geometry)
         return findings + self._examine_scripts(task, files)
+
+    def _other_files(self, files: Mapping[str, bytes]) -> list[Finding]:
+        """Files besides control.in, geometry.in and the job script, as facts for the input reviewer, which checks
+        them; CEDAR does not read them. Only a file named like the run's output is refused: the run writes it."""
+        findings = []
+        for name in sorted(set(files) - set(self.input_files)):
+            if name in self.output_files:
+                findings.append(Finding(severity=_E, code="output_name", file=name,
+                                        message=f"{name} is the run's output, which the run writes; an input file "
+                                                "cannot have its name"))
+            else:
+                findings.append(Finding(severity=_I, code="other_file", file=name,
+                                        message=f"{name} ({len(files[name])} bytes) is not read by CEDAR; the input "
+                                                "reviewer checks it"))
+        return findings
 
     def _structure_facts(self, geometry: Geometry) -> list[Finding]:
         """What the structure is, and what CEDAR's reader could not read, as facts: FHI-aims is the judge of its

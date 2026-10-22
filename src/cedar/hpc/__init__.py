@@ -18,11 +18,11 @@ from cedar.hpc.profile import (
     check_profile,
     file_source,
 )
-from cedar.hpc.slurm import SchedulerBackend, SchedulerError, SchedulerObservation, SlurmBackend
+from cedar.hpc.slurm import JobRefused, SchedulerBackend, SchedulerError, SchedulerObservation, SlurmBackend
 
 __all__ = [
-    "CodeInstallation", "ComputeProfile", "JobResources", "ProfileNotApproved", "ProfileSource", "ProfileStore",
-    "SchedulerBackend", "SchedulerError", "SchedulerLimits", "SchedulerObservation", "SlurmBackend",
+    "CodeInstallation", "ComputeProfile", "JobRefused", "JobResources", "ProfileNotApproved", "ProfileSource",
+    "ProfileStore", "SchedulerBackend", "SchedulerError", "SchedulerLimits", "SchedulerObservation", "SlurmBackend",
     "check_profile", "examine_job_script", "examine_local_script", "file_source", "local_resources",
     "render_job_script", "render_local_script",
 ]

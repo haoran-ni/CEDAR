@@ -44,7 +44,7 @@ from cedar.errors import RuleViolation
 from cedar.hpc.local import RECORDS, LocalBackend, SlurmSteps
 from cedar.hpc.local_runner import main as run_locally
 from cedar.hpc.node import CorePool, ExecutionHost
-from cedar.hpc.slurm import SchedulerError
+from cedar.hpc.slurm import JobRefused, SchedulerError
 from cedar.protocols import FhiAimsRun, FhiAimsRunSlurmOnly, ProtocolRegistry
 from cedar.summaries import calculation_summary, short_id
 from cedar.workspace import Workspace
@@ -189,6 +189,7 @@ def test_version_01_runs_through_slurm_only(local):
     cid = w.ledger.request_calculation(w.inv, AGENT, w.hyp, task, "test").calculation_id
     w.engine.examine(w.inv, cid)
     assert "no_local_runs" in findings(w, cid) and w.calc(cid).state is CalculationState.REJECTED
+    assert findings(w, cid)["no_local_runs"].message.endswith("request fhiaims.run 0.4 for a local run")
 
 
 def test_on_an_interactive_node_the_template_runs_without_its_slurm_lines(local):
@@ -213,6 +214,33 @@ def test_a_local_run_must_fit_the_allocation(local, budget, code):
     cid = w.ledger.request_calculation(w.inv, AGENT, w.hyp, task, "test").calculation_id
     w.engine.examine(w.inv, cid)
     assert code in findings(w, cid) and w.calc(cid).state is CalculationState.REJECTED
+
+
+def test_a_local_runs_budget_findings_name_its_script(local):
+    w = local.world
+    script = (f"#!/bin/bash\n#CEDAR --ntasks=4 --time=01:00:00\n\nexport OMP_NUM_THREADS=1\n"
+              f"{local.binary} 4 > aims.out\n")
+    task = local.local_task(max_core_hours=1).model_copy(
+        update={"authored_files": {"local.sh": w.artifacts.put_bytes(script.encode())}})
+    cid = w.ledger.request_calculation(w.inv, AGENT, w.hyp, task, "test").calculation_id
+    w.engine.examine(w.inv, cid)
+    over = findings(w, cid)["over_budget"]
+    assert over.file == "local.sh" and over.message == "4 core-hours requested; the task allows 1"
+
+
+def test_a_local_run_that_no_longer_fits_once_approved_fails_at_once_with_the_reason(local):
+    w = local.world
+    cid = local.request_local(max_walltime_hours=1)
+    authorize(w.ledger, w.inv, PermissionAction.SUBMIT, cid, intervention_id=f"submit-{cid}")
+    local.host = interactive(minutes=30)  # the allocation ran on while the inputs were reviewed and approved
+    with pytest.raises(JobRefused) as refused:
+        local.manager.submit(w.inv, cid)
+    assert refused.value.final  # its time left only shrinks: no point trying again
+    calc = w.calc(cid)
+    assert calc.state is CalculationState.SUBMISSION_FAILED and calc.submission_refusals == []
+    assert calc.end_reason.startswith("60 minutes would run past the end of allocation 777001")
+    assert not list((w.runs / RECORDS).glob("local-*.json"))
+    assert job_status(w.state(), calc).endswith("refused by the scheduler")
 
 
 def test_a_local_run_takes_no_slurm_script(local):

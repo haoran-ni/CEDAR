@@ -45,6 +45,8 @@ class CalculationState(StrEnum):
     VALIDATED_INPUT = "VALIDATED_INPUT"
     REJECTED = "REJECTED"
     SUBMISSION_PENDING = "SUBMISSION_PENDING"
+    SUBMISSION_FAILED = "SUBMISSION_FAILED"
+    """The scheduler refused to take the job; its agent requests the calculation again with the cause fixed."""
     SUBMITTED = "SUBMITTED"
     QUEUED = "QUEUED"
     RUNNING = "RUNNING"
@@ -186,7 +188,7 @@ CALCULATION_MACHINE = StateMachine(
     flow=_graph({
         _C.SPECIFIED: {_C.VALIDATED_INPUT, _C.REJECTED},
         _C.VALIDATED_INPUT: {_C.SUBMISSION_PENDING, _C.REJECTED},
-        _C.SUBMISSION_PENDING: {_C.SUBMITTED},
+        _C.SUBMISSION_PENDING: {_C.SUBMITTED, _C.SUBMISSION_FAILED},
         _C.SUBMITTED: {_C.QUEUED, _C.RUNNING, _C.SCHEDULER_TERMINAL},
         _C.QUEUED: {_C.RUNNING, _C.SCHEDULER_TERMINAL},
         _C.RUNNING: {_C.QUEUED, _C.SCHEDULER_TERMINAL},
@@ -194,5 +196,5 @@ CALCULATION_MACHINE = StateMachine(
         _C.PARSING: {_C.QUALITY_ASSESSED},
     }),
     abort=frozenset({_C.CANCELLED}),
-    terminal=frozenset({_C.QUALITY_ASSESSED, _C.REJECTED, _C.CANCELLED}),
+    terminal=frozenset({_C.QUALITY_ASSESSED, _C.REJECTED, _C.SUBMISSION_FAILED, _C.CANCELLED}),
 )

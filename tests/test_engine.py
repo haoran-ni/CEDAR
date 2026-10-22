@@ -4,6 +4,7 @@ Uses the FakeScheduler TEST DOUBLE and SYNTHETIC outputs: no job runs, no number
 """
 
 import os
+import subprocess
 
 import pytest
 from factories import AGENT, authorize, draft
@@ -23,9 +24,12 @@ from cedar.contracts import (
     Quantity,
     SchedulerState,
 )
+from cedar.dashboard import job_status
 from cedar.engine import InputsChanged, job_name_for
-from cedar.engine.jobs import JOB_MANAGER
+from cedar.engine.jobs import JOB_MANAGER, MAX_SUBMISSION_ATTEMPTS
 from cedar.errors import RuleViolation
+from cedar.hpc.slurm import JobRefused, SchedulerError, SlurmBackend
+from cedar.notebook import render_notebook
 from cedar.state import replay
 
 ENERGY = -98765.432101234
@@ -111,6 +115,13 @@ class TestExamination:
         cid = world.ledger.request_calculation(world.inv, AGENT, world.hyp, spec, "test").calculation_id
         world.engine.examine(world.inv, cid)
         assert world.calc(cid).state is CalculationState.REJECTED
+
+    def test_only_the_current_protocol_takes_files_besides_its_own(self, world):
+        notes = world.artifacts.put_bytes(b"k-points from the converged test\n", label="notes.txt")
+        cid = world.request(authored={"notes.txt": notes})
+        world.engine.examine(world.inv, cid)
+        assert world.calc(cid).state is CalculationState.REJECTED
+        assert "unexpected_file" in {f.code for f in world.calc(cid).examination.findings}
 
     def test_examination_happens_once(self, world):
         cid = world.request()
@@ -297,3 +308,86 @@ class TestReadings:
         (record,) = state.evidence.values()
         assert record.evidence.quality is EvidenceQuality.INVALID
         assert not next(c for c in record.evidence.quality_checks if c.name.startswith("run_healthy")).passed
+
+
+PARTITION_REFUSED = "sbatch: error: Batch job submission failed: Invalid partition name specified"
+
+
+class TestRefusedSubmission:
+    def approved(self, world) -> str:
+        cid = world.request()
+        world.engine.examine(world.inv, cid)
+        world.approve_submission(cid)
+        return cid
+
+    def test_a_refused_submission_is_tried_again_then_fails_with_what_the_scheduler_said(self, world):
+        cid = self.approved(world)
+        world.scheduler.refusal = PARTITION_REFUSED
+        for attempt in range(1, MAX_SUBMISSION_ATTEMPTS):
+            with pytest.raises(JobRefused, match="Invalid partition name specified"):
+                world.manager.submit(world.inv, cid)
+            calc = world.calc(cid)
+            assert calc.state is CalculationState.SUBMISSION_PENDING
+            assert calc.submission_refusals == [PARTITION_REFUSED] * attempt
+            assert job_status(world.state(), calc).endswith(
+                f"submitting (the scheduler refused it {attempt}x; trying again)")
+        with pytest.raises(JobRefused):
+            world.manager.submit(world.inv, cid)
+        calc = world.calc(cid)
+        assert calc.state is CalculationState.SUBMISSION_FAILED and calc.submission_failed
+        assert calc.end_reason == f"{PARTITION_REFUSED} (refused {MAX_SUBMISSION_ATTEMPTS} times)"
+        assert job_status(world.state(), calc).endswith("refused by the scheduler")
+        assert world.scheduler.submissions == []
+        with pytest.raises(RuleViolation, match="cannot submit a calculation that is SUBMISSION_FAILED"):
+            world.manager.submit(world.inv, cid)
+
+        pages = "\n".join(render_notebook(world.store.read_stream(world.inv)).values())
+        assert f"- **{cid}** refused by the scheduler, to be tried again: " in pages
+        assert f"- **{cid}** refused by the scheduler; its agent is to request it again: " in pages
+
+    def test_a_job_queued_despite_its_refusal_is_followed_and_not_submitted_again(self, world):
+        cid = self.approved(world)
+        world.scheduler.refusal = "sbatch: error: Batch job submission failed: Socket timed out on send/recv operation"
+        world.scheduler.queued_when_refused = True
+        job = world.manager.submit(world.inv, cid)
+        calc = world.calc(cid)
+        assert calc.state is CalculationState.SUBMITTED and calc.scheduler_job_id == job
+        assert calc.submission_refusals == [] and len(world.scheduler.submissions) == 1
+
+    def test_the_same_inputs_can_be_requested_again_once_the_scheduler_refused_them(self, world):
+        cid = self.approved(world)
+        world.scheduler.refusal = PARTITION_REFUSED
+        for _ in range(MAX_SUBMISSION_ATTEMPTS):
+            with pytest.raises(JobRefused):
+                world.manager.submit(world.inv, cid)
+        again = world.request()
+        assert again != cid
+        world.engine.examine(world.inv, again)
+        assert world.calc(again).state is CalculationState.VALIDATED_INPUT  # not a duplicate of the refused one
+        world.scheduler.refusal = None
+        world.approve_submission(again)
+        assert world.manager.submit(world.inv, again) == world.calc(again).scheduler_job_id
+
+    def test_a_refusal_is_recorded_only_while_the_submission_is_tried(self, world):
+        from cedar.contracts import SubmissionRefused
+        cid = world.request()
+        world.engine.examine(world.inv, cid)
+        with pytest.raises(RuleViolation, match="a refused submission is one being tried"):
+            world.ledger.record(world.inv, [draft(JOB_MANAGER, SubmissionRefused(calculation_id=cid,
+                                                                                 reason=PARTITION_REFUSED))])
+
+
+class TestSlurmAdapter:
+    def test_an_error_from_sbatch_is_a_refusal_and_no_answer_is_not(self, tmp_path):
+        def refusing(argv, **_):
+            return subprocess.CompletedProcess(argv, 1, "", PARTITION_REFUSED)
+
+        def silent(argv, **_):
+            raise subprocess.TimeoutExpired(argv, 60)
+
+        with pytest.raises(JobRefused, match="Invalid partition name specified") as refused:
+            SlurmBackend(user="someone", runner=refusing, environ={}).submit(tmp_path / "job.sh", tmp_path, "cedar-x")
+        assert not refused.value.final  # the controller may have been busy: tried again
+        with pytest.raises(SchedulerError, match="sbatch did not answer within 60 s") as unanswered:
+            SlurmBackend(user="someone", runner=silent, environ={}).submit(tmp_path / "job.sh", tmp_path, "cedar-x")
+        assert not isinstance(unanswered.value, JobRefused)  # the job may exist: found by name on the next pass

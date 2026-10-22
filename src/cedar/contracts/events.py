@@ -350,6 +350,16 @@ class CalculationStateChanged(Contract):
     """User intervention that authorizes this change, where one is required."""
 
 
+class SubmissionRefused(Contract):
+    """The scheduler refused one attempt to submit a calculation; it stays SUBMISSION_PENDING and is tried again.
+    The attempt that may not be repeated moves it to SUBMISSION_FAILED instead."""
+
+    type: Literal["submission_refused"] = "submission_refused"
+    calculation_id: Identifier
+    reason: NonEmptyStr
+    """What the scheduler said."""
+
+
 class SchedulerNoteRecorded(Contract):
     """What a queued or running calculation's scheduler says it is doing, when that changes without its state: a
     local run that waited for free cores and now waits for Slurm to start its step."""
@@ -639,6 +649,7 @@ EventPayload = Annotated[
     | CalculationLinked
     | CalculationInputsExamined
     | CalculationStateChanged
+    | SubmissionRefused
     | SchedulerNoteRecorded
     | RunChecked
     | RunRegistered

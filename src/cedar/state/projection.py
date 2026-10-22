@@ -48,6 +48,7 @@ from cedar.contracts.events import (
     RunChecked,
     RunRegistered,
     SchedulerNoteRecorded,
+    SubmissionRefused,
     SynthesisRecorded,
     BudgetChanged,
     UserInterventionRecorded,
@@ -110,6 +111,7 @@ EVENT_ACTORS: dict[type, frozenset[ActorKind]] = {
     CalculationLinked: frozenset({_A.CHIEF_SCIENTIST, _A.HYPOTHESIS_AGENT}),
     CalculationInputsExamined: frozenset({_A.PROTOCOL_ENGINE}),
     CalculationStateChanged: frozenset({_A.PROTOCOL_ENGINE, _A.JOB_MANAGER, _A.JOB_MONITOR, _A.VALIDATOR}),
+    SubmissionRefused: frozenset({_A.JOB_MANAGER}),
     SchedulerNoteRecorded: frozenset({_A.JOB_MONITOR}),
     RunChecked: frozenset({_A.VALIDATOR}),
     RunRegistered: frozenset({_A.VALIDATOR}),
@@ -133,6 +135,7 @@ CALCULATION_STATE_ACTORS: dict[CalculationState, frozenset[ActorKind]] = {
     _C.REJECTED: frozenset({_A.PROTOCOL_ENGINE}),
     _C.SUBMISSION_PENDING: frozenset({_A.JOB_MANAGER}),
     _C.SUBMITTED: frozenset({_A.JOB_MANAGER}),
+    _C.SUBMISSION_FAILED: frozenset({_A.JOB_MANAGER}),
     _C.QUEUED: frozenset({_A.JOB_MONITOR}),
     _C.RUNNING: frozenset({_A.JOB_MONITOR}),
     _C.SCHEDULER_TERMINAL: frozenset({_A.JOB_MONITOR}),
@@ -155,6 +158,8 @@ _LIVE_AT_SCHEDULER = frozenset({_C.SUBMISSION_PENDING, _C.SUBMITTED, _C.QUEUED, 
 """SUBMISSION_PENDING counts as live: sbatch may already have accepted the job."""
 _FOLLOWED = _LIVE_AT_SCHEDULER | {_C.SCHEDULER_TERMINAL, _C.PARSING}
 """Calculations the dispatcher still follows: at the scheduler, or waiting for their run check."""
+_ENDED_WITH_REASON = frozenset({_C.REJECTED, _C.SUBMISSION_FAILED, _C.CANCELLED})
+"""Ends of a calculation that never ran to completion; each records why."""
 _PREDICTABLE = frozenset({_C.SPECIFIED, _C.VALIDATED_INPUT})
 """A calculation can be predicted until it is submitted: once it runs, its output can be read."""
 _CLOSED_HYPOTHESIS = frozenset({HypothesisStatus.DISCARDED, HypothesisStatus.SUPERSEDED})
@@ -236,7 +241,7 @@ class CalculationRecord:
     registration: RunRegistered | None = None
     """For a run computed outside CEDAR and registered: where it came from, who registered it, what it is."""
     end_reason: str | None = None
-    """Why it was rejected or cancelled."""
+    """Why it was rejected or cancelled, or what the scheduler said when it refused the job."""
     ended_by: str | None = None
     """What authorized the rejection or cancellation, where the record requires it: the researcher's message, or
     the input reviewer's review."""
@@ -244,6 +249,8 @@ class CalculationRecord:
     """Who rejected inputs the examiner did not reject: "researcher" or "input_reviewer"."""
     input_review: InputReviewRecorded | None = None
     """The input reviewer's review of the inputs, if one was recorded."""
+    submission_refusals: list[str] = field(default_factory=list)
+    """What the scheduler said each time it refused the submission while it was still being tried."""
 
     @property
     def registered(self) -> bool:
@@ -262,6 +269,11 @@ class CalculationRecord:
         """Rejected after its examination, by the researcher or the input reviewer: its agent hears of it later, with
         the reason, rather than in reply to its request."""
         return self.rejected_by is not None and self.state is CalculationState.REJECTED
+
+    @property
+    def submission_failed(self) -> bool:
+        """The scheduler refused the job: its agent hears of it at once, with what the scheduler said."""
+        return self.state is CalculationState.SUBMISSION_FAILED
 
     @property
     def shared(self) -> bool:
@@ -701,7 +713,7 @@ def reusable_calculation(state: InvestigationState, task_hash: str) -> str | Non
 def _is_reusable(calc: CalculationRecord) -> bool:
     if calc.registered:
         return calc.registration.healthy
-    if calc.state in (_C.REJECTED, _C.CANCELLED):
+    if calc.state in (_C.REJECTED, _C.SUBMISSION_FAILED, _C.CANCELLED):
         return False
     return not (
         calc.scheduler_state in SCHEDULER_TERMINAL_STATES and calc.scheduler_state is not SchedulerState.COMPLETED
@@ -900,7 +912,7 @@ def review_attempts(state: InvestigationState, calculation_id: str) -> int:
 
 
 def awaits_reviewer(state: InvestigationState, calc: CalculationRecord) -> bool:
-    """Examined inputs whose scientific content waits for the input reviewer, who has not decided yet and may still."""
+    """Examined inputs that wait for the input reviewer, who has not decided yet and may still."""
     exam = calc.examination
     return (calc.state is _C.SPECIFIED and exam is not None and exam.agent_review
             and exam.verdict is not ExaminationVerdict.REJECTED and calc.input_review is None
@@ -1260,7 +1272,7 @@ def _on_calculation_state(state: InvestigationState, event: RecordedEvent, p: Ca
             raise RuleViolation(f"scheduler job {p.scheduler_job_id} is already attached to a calculation")
         if state.spec.constraints.submit_requires_approval:
             _require_authorization(state, p.authorization_id, PermissionAction.SUBMIT, calc.calculation_id)
-    if p.state in (_C.REJECTED, _C.CANCELLED) and not (p.reason and p.reason.strip()):
+    if p.state in _ENDED_WITH_REASON and not (p.reason and p.reason.strip()):
         raise RuleViolation(f"{p.state} needs a reason")
     rejected_by = None
     if (p.state is _C.REJECTED and calc.examination is not None
@@ -1280,7 +1292,7 @@ def _on_calculation_state(state: InvestigationState, event: RecordedEvent, p: Ca
         raise RuleViolation("QUALITY_ASSESSED requires the run check to be recorded first")
 
     calc.state = new_state
-    if p.state in (_C.REJECTED, _C.CANCELLED):
+    if p.state in _ENDED_WITH_REASON:
         calc.end_reason, calc.ended_by, calc.rejected_by = p.reason, p.authorization_id, rejected_by
     if scheduler_state is not None:
         calc.scheduler_state = scheduler_state
@@ -1289,6 +1301,13 @@ def _on_calculation_state(state: InvestigationState, event: RecordedEvent, p: Ca
     if p.state in (_C.QUEUED, _C.RUNNING, _C.SCHEDULER_TERMINAL):
         calc.scheduler_note = p.reason
     calc.history.append((event.stream_version, new_state))
+
+
+def _on_submission_refused(state: InvestigationState, event: RecordedEvent, p: SubmissionRefused) -> None:
+    calc = _calculation(state, p.calculation_id)
+    if calc.state is not _C.SUBMISSION_PENDING:
+        raise RuleViolation(f"a refused submission is one being tried; {calc.calculation_id} is {calc.state}")
+    calc.submission_refusals.append(p.reason)
 
 
 def _on_scheduler_note(state: InvestigationState, event: RecordedEvent, p: SchedulerNoteRecorded) -> None:
@@ -1608,6 +1627,7 @@ _HANDLERS = {
     CalculationLinked: _on_calculation_linked,
     CalculationInputsExamined: _on_inputs_examined,
     CalculationStateChanged: _on_calculation_state,
+    SubmissionRefused: _on_submission_refused,
     SchedulerNoteRecorded: _on_scheduler_note,
     RunChecked: _on_run_checked,
     RunRegistered: _on_run_registered,

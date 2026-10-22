@@ -59,6 +59,7 @@ from cedar.contracts.events import (
     BudgetChanged,
     RunChecked,
     SchedulerNoteRecorded,
+    SubmissionRefused,
     RunRegistered,
     UserInterventionRecorded,
     WorkbenchPolicyChanged,
@@ -111,7 +112,8 @@ ROUND_SECTIONS = (
 _NOTE = ("*Generated from the event log; do not edit. Quoted text is its author's own words. Values come from "
          "recorded evidence.*")
 _CLOSED = frozenset({HypothesisStatus.DISCARDED, HypothesisStatus.SUPERSEDED})
-_FINISHED = frozenset({CalculationState.QUALITY_ASSESSED, CalculationState.REJECTED, CalculationState.CANCELLED})
+_FINISHED = frozenset({CalculationState.QUALITY_ASSESSED, CalculationState.REJECTED, CalculationState.SUBMISSION_FAILED,
+                       CalculationState.CANCELLED})
 _UNSETTLED = frozenset({Assessment.NOT_TESTED, Assessment.INCONCLUSIVE, Assessment.NOT_COMPARABLE})
 
 
@@ -621,6 +623,11 @@ def _tested(rnd: _Round, state: InvestigationState) -> list[str]:
         elif isinstance(p, CalculationStateChanged) and p.state is CalculationState.CANCELLED:
             by = f", authorized by {p.authorization_id}" if p.authorization_id else ""
             lines.append(f"- **{p.calculation_id}** cancelled{by}: {_said(p.reason or '')}")
+        elif isinstance(p, SubmissionRefused):
+            lines.append(f"- **{p.calculation_id}** refused by the scheduler, to be tried again: {_said(p.reason)}")
+        elif isinstance(p, CalculationStateChanged) and p.state is CalculationState.SUBMISSION_FAILED:
+            lines.append(f"- **{p.calculation_id}** refused by the scheduler; its agent is to request it again: "
+                         f"{_said(p.reason or '')}")
         elif isinstance(p, InputReviewRecorded):
             lines.append(f"- **{p.calculation_id}** reviewed by the input reviewer ({p.review_id}), an agent's "
                          f"judgement: {p.decision.value}: {_said(p.summary)}")
@@ -1053,6 +1060,8 @@ def _describe(event: RecordedEvent) -> str:
             return f"{p.calculation_id} moved to {p.state.value}{extra}"
         case SchedulerNoteRecorded():
             return f"{p.calculation_id}: {_said(p.note)}"
+        case SubmissionRefused():
+            return f"{p.calculation_id}: the scheduler refused the submission, to be tried again: {_said(p.reason)}"
         case EvidenceRecorded():
             ev = p.evidence
             return f"{p.evidence_id} recorded: {ev.quality.value}, {ev.observable.name} = {_quantity(ev.value)}"

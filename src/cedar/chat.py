@@ -205,6 +205,9 @@ def _not_ready(state: InvestigationState, calc: CalculationRecord) -> str:
                 "finished, and your approval is the last step before it runs.")
     if calc.state is CalculationState.REJECTED:
         return f"The inputs of {cid} were rejected: {calc.end_reason}"
+    if calc.submission_failed:
+        return (f"The scheduler refused to run {cid}: {calc.end_reason}. Its agent is asked to request it again with "
+                "the cause fixed.")
     if calc.state is CalculationState.VALIDATED_INPUT:
         return f"{cid} is approved already; the dispatcher submits it on its next tick."
     if calc.state is CalculationState.SPECIFIED:

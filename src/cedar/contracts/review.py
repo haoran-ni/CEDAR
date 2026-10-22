@@ -1,11 +1,13 @@
 """The input reviewer's verdict on a calculation's inputs, before anything runs.
 
 Deterministic checks cover what runs on the machine: the job script against the approved
-template, its resources and the task's budget. Whether the scientific inputs make sense
-(what each keyword does in the installed code version, whether the settings fit the
-estimand and the comparison they serve, whether the structure is what the task describes)
-is judged by the input reviewer, an agent that reads the files and the code's documentation.
-Its verdict is a model's judgement, recorded as its own and never as evidence.
+template, its resources and the task's budget. The input reviewer, an agent that reads the
+files with the installed code's manual and source, checks two things: that the code will run
+the inputs as the calculation the task describes (every keyword and its arguments accepted by
+the installed version, complete files that fit together, what the task says set up), and that
+nothing in them, the other files given with them included, is harmful. The scientific choices
+are not its to judge. Its verdict is a model's judgement, recorded as its own and never as
+evidence.
 """
 
 from enum import StrEnum

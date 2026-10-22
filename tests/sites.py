@@ -172,3 +172,144 @@ def aims_output(*, version: str = VERSION, energy: float = -1234.567890123, rela
 
 def make_writable(path: Path) -> None:
     os.chmod(path, 0o644)
+
+
+# -- VASP ------------------------------------------------------------------------------------
+
+VASP_VERSION = "test-vasp-6.4.2"
+VALENCE = {"H": 1, "C": 4, "O": 6, "Cu": 11, "Cu_pv": 17}
+VASP_TEMPLATE = """#!/bin/bash
+#SBATCH --partition={{partition}}
+#SBATCH --nodes={{nodes}}
+#SBATCH --ntasks={{ntasks}}
+#SBATCH --time={{walltime}}
+
+ulimit -s unlimited
+source VASP_ENV
+mpirun -np {{ntasks}} {{binary}} > {{output}}
+"""
+VASP_SOURCE = """! SYNTHETIC stand-in for a VASP source file: only the quoted tag names matter to the examiner
+      CALL RDATAB(LOPEN,INCAR,IU5,'ENCUT','=','#',';','F',IDUM,ENCUT,CDUM,LDUM,CHARAC,N,1,IERR)
+      CALL PROCESS_INCAR(LOPEN, IU0, IU5, 'EDIFF', EDIFF, IERR, WRITEXMLINCAR)
+"""
+VASP_TAGS = ("ENCUT", "EDIFF", "EDIFFG", "ISMEAR", "SIGMA", "PREC", "GGA", "ISPIN", "MAGMOM", "IBRION", "NSW",
+             "ISIF", "LWAVE", "LCHARG", "LSORBIT", "LNONCOLLINEAR", "KSPACING", "NCORE", "ALGO", "SYSTEM", "NELM")
+
+
+def dataset_text(name: str) -> str:
+    """A SYNTHETIC PAW dataset reproducing the lines the examiner reads; not a real potential."""
+    element = name.split("_")[0]
+    return (f"  PAW_PBE {name} 01Jan2000\n"
+            f" {VALENCE[name]:.16f}\n"
+            " parameters from PSCTR are:\n"
+            f"   VRHFIN ={element}: synthetic\n"
+            "   LEXCH  = PE\n"
+            f"   TITEL  = PAW_PBE {name} 01Jan2000\n"
+            f"   POMASS =    1.000; ZVAL   =   {VALENCE[name]:.3f}    mass and valenz\n"
+            f"  SYNTHETIC test dataset for {element}; not a real PAW potential\n"
+            " End of Dataset\n")
+
+
+def add_vasp(site: ComputeProfile, root: Path, *, own_template: bool = True, variants: bool = True,
+             source: bool = True) -> ComputeProfile:
+    """``site`` with a synthetic VASP installation under ``root``: three builds that are never executed, a PAW
+    library, a source directory naming the tags in VASP_TAGS and, by default, a job template of its own."""
+    software = root / "vasp"
+    builds = {}
+    for build in ("vasp_std", "vasp_gam", "vasp_ncl"):
+        path = software / "bin" / build
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("#!/bin/sh\necho 'synthetic test binary; never executed' >&2\nexit 1\n")
+        path.chmod(0o755)
+        builds[build] = str(path)
+    library = software / "potpaw_PBE"
+    for name in VALENCE:
+        (library / name).mkdir(parents=True)
+        (library / name / "POTCAR").write_text(dataset_text(name))
+    if source:
+        (software / "src").mkdir()
+        tags = "".join(f"      DATA '{tag}'\n" for tag in VASP_TAGS)
+        (software / "src" / "reader.F").write_text(VASP_SOURCE + tags)
+    env = software / "vasp_env.sh"
+    env.write_text("# synthetic VASP environment script\n")
+    vasp = CodeInstallation(binary=builds["vasp_std"], version=VASP_VERSION, data_paths={"potcars": str(library)},
+                            variants={"gam": builds["vasp_gam"], "ncl": builds["vasp_ncl"]} if variants else {},
+                            job_template=VASP_TEMPLATE.replace("VASP_ENV", str(env)) if own_template else None)
+    return site.model_copy(update={"codes": {**site.codes, "vasp": vasp}})
+
+
+def incar_text(**tags) -> str:
+    lines = ["# SYNTHETIC test INCAR", "SYSTEM = CO on Cu(111)"]
+    values = {"ENCUT": 400, "EDIFF": "1E-6", "ISMEAR": 1, "SIGMA": 0.1, "GGA": "PE", "LWAVE": ".FALSE.",
+              "LCHARG": ".FALSE."}
+    for name, value in tags.items():
+        if value is None:
+            values.pop(name, None)
+        else:
+            values[name] = value
+    return "\n".join([*lines, *(f"{name} = {value}" for name, value in values.items())]) + "\n"
+
+
+def poscar_text(atoms, fixed: set[int] = frozenset(), names: bool = True) -> str:
+    """POSCAR for ``atoms``, grouped by species in order of first appearance, with the indices in ``fixed`` held
+    fixed by selective dynamics."""
+    species = list(dict.fromkeys(atoms.get_chemical_symbols()))
+    order = [i for s in species for i, atom in enumerate(atoms) if atom.symbol == s]
+    lines = ["SYNTHETIC test structure", "1.0"]
+    lines += [f"  {v[0]:.10f} {v[1]:.10f} {v[2]:.10f}" for v in atoms.cell]
+    if names:
+        lines.append("  " + " ".join(species))
+    lines.append("  " + " ".join(str(atoms.get_chemical_symbols().count(s)) for s in species))
+    if fixed:
+        lines.append("Selective dynamics")
+    lines.append("Cartesian")
+    for i in order:
+        x, y, z = atoms[i].position
+        flags = (" F F F" if i in fixed else " T T T") if fixed else ""
+        lines.append(f"  {x:.10f} {y:.10f} {z:.10f}{flags}")
+    return "\n".join(lines) + "\n"
+
+
+def kpoints_text(mesh=(4, 4, 1), style: str = "Gamma") -> str:
+    return f"SYNTHETIC k-points\n0\n{style}\n{mesh[0]} {mesh[1]} {mesh[2]}\n0 0 0\n"
+
+
+def vasp_outcar(*, version: str = VASP_VERSION, energies: tuple[float, ...] = (-123.456789,), relax: bool = False,
+                geometry_converged: bool = True, normal_end: bool = True, unconverged: tuple[int, ...] = (),
+                vasp6_marker: bool = False, potcars: tuple[str, ...] = ("Cu", "C", "O"), nelm: int = 3) -> str:
+    """SYNTHETIC OUTCAR reproducing the marker formats of real VASP output, one ionic step per energy; the ionic
+    steps in ``unconverged`` run NELM electronic steps without reaching EDIFF."""
+    lines = [f" vasp.{version} 20Jul23 (build Sep 26 2023 11:38:54) complex", "  ",
+             " running on    4 total cores",
+             " SYNTHETIC TEST OUTPUT: the marker lines follow VASP formats; every number is made up.", "",
+             " INCAR:", *(f" POTCAR:    PAW_PBE {name} 01Jan2000" for name in potcars), "",
+             f"   NELM   =    {nelm:3d};   NELMIN=  2; NELMDL= -5     # of ELM steps",
+             "   EDIFF  = 0.1E-05   stopping-criterion for ELM",
+             f"   NSW    =    {len(energies) + 3 if relax else 0:3d}    number of steps for IOM",
+             f"   IBRION =    {2 if relax else -1:3d}    ionic relax: 0-MD 1-quasi-New 2-CG", ""]
+    for step, energy in enumerate(energies, start=1):
+        electronic = nelm if step in unconverged else 2
+        for k in range(1, electronic + 1):
+            lines += [f"--------------------------------------- Iteration {step:6d}({k:4d})  "
+                      "---------------------------------------", "",
+                      f"  free energy    TOTEN  =      {energy + 1 / k:14.8f} eV", "",
+                      f"  energy without entropy =     {energy + 1 / k + 0.001:14.8f}  energy(sigma->0) =      "
+                      f"{energy + 1 / k + 0.0005:14.8f}", ""]
+        if step not in unconverged:
+            lines.append("------------------------ aborting loop because EDIFF is reached "
+                         "----------------------------------------")
+        elif vasp6_marker:
+            lines.append("------------------------ aborting loop EDIFF was not reached (unconverged)  "
+                         "----------------------------")
+        lines += ["", "  FREE ENERGIE OF THE ION-ELECTRON SYSTEM (eV)",
+                  "  ---------------------------------------------------",
+                  f"  free  energy   TOTEN  =      {energy:14.8f} eV", "",
+                  f"  energy  without entropy=      {energy + 0.001:14.8f}  energy(sigma->0) =      "
+                  f"{energy + 0.0005:14.8f}", ""]
+        if relax and step == len(energies) and geometry_converged:
+            lines.append(" reached required accuracy - stopping structural energy minimisation")
+    if normal_end:
+        lines += ["", " General timing and accounting informations for this job:",
+                  " ========================================================", "",
+                  "                  Total CPU time used (sec):        1.000"]
+    return "\n".join(lines) + "\n"

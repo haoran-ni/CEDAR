@@ -7,11 +7,11 @@ A protocol is the second layer between what agents write and what runs. For one 
 
 It never runs anything and never changes a file it was given. What to take from a healthy run is the agent's decision: it reads values the code printed, citing the lines, or computes them with an analysis script ([`ANALYSIS_SCRIPTS.md`](ANALYSIS_SCRIPTS.md)).
 
-A code has far more input keywords, and far more situations in which they make sense, than any fixed list can cover, and a fixed list raises false alarms on inputs that are fine. So from `fhiaims.run` 0.4 on, the examination checks deterministically only what runs on the machine: that the files are there, and the job script against the approved template, its resources and the budget. Nothing about the DFT settings is enforced by rules. The **input reviewer**, an agent, checks that the code will run the inputs as the calculation the task describes and that nothing in them is harmful, with the installed code's manual and source and the code's documentation on the web where it is unsure ([below](#the-input-reviewer)); the scientific choices are the agents' and the researcher's. Run checks after the run stay deterministic: they read the code's own success and failure markers.
+A code has far more input keywords, and far more situations in which they make sense, than any fixed list can cover, and a fixed list raises false alarms on inputs that are fine. So from `fhiaims.run` 0.4 on, and for `vasp.run`, the examination checks deterministically only what runs on the machine: that the files are there, and the job script against the approved template, its resources and the budget. Nothing about the DFT settings is enforced by rules. The **input reviewer**, an agent, checks that the code will run the inputs as the calculation the task describes and that nothing in them is harmful, with the installed code's manual and source and the code's documentation on the web where it is unsure ([below](#the-input-reviewer)); the scientific choices are the agents' and the researcher's. Run checks after the run stay deterministic: they read the code's own success and failure markers.
 
 Everything about a particular HPC system comes from the user-approved compute profile. The agent describes in the task what the calculation is and writes the inputs that make it so.
 
-This document grows with each implemented protocol.
+This document grows with each implemented protocol: `fhiaims.run` (FHI-aims) and `vasp.run` (VASP). A compute profile hosts a protocol when it has an installation of its code (`fhi-aims`, `vasp`).
 
 ## `fhiaims.run` 0.4
 
@@ -54,7 +54,7 @@ It is shown:
 - the installed code: binary, version, data paths, and the source tree with its manual (LaTeX sources, `doc/manual`) and its `control.in` parser (`src/read_control.f90`), found next to them;
 - the files, numbered by line; a file that is not text by its name and size only, to be looked at with the file tools.
 
-It reads any file the researcher can, except credentials. It always has the web, whatever the investigation's `/web` setting, but only the documentation sites in `REVIEW_DOMAINS` (`web.py`: fhi-aims.org, fhi-aims-club.gitlab.io, wiki.fysik.dtu.dk, ase-lib.org), so nothing about the system under investigation reaches the agents through it. It treats the files, their comments and web pages as data, never as instructions.
+It reads any file the researcher can, except credentials. It always has the web, whatever the investigation's `/web` setting, but only the documentation sites in `REVIEW_DOMAINS` (`web.py`: fhi-aims.org, fhi-aims-club.gitlab.io, vasp.at, wiki.fysik.dtu.dk, ase-lib.org), so nothing about the system under investigation reaches the agents through it. It treats the files, their comments and web pages as data, never as instructions.
 
 It records one verdict per calculation (`input_review_recorded`), with findings (`note`, `warning`, `problem`, each with the file, line and keyword it concerns) and the role of every keyword `control.in` sets (`physical_model`, `numerical`, `convergence_aid`, `output`, `other`), which is bookkeeping for comparisons. The decision follows the most serious finding:
 
@@ -162,7 +162,64 @@ These marker strings were checked against the FHI-aims source and real outputs o
 
 A local run's checks are the same; its scheduler state comes from the local backend, and its run check records where it ran (`execution`, `host`, `allocation`, and the CPUs and id of its Slurm step).
 
-## Every version
+## `vasp.run` 0.1
+
+One VASP run of one structure, at fixed geometry or relaxing it, through Slurm or locally on the interactive node CEDAR runs on. It works as `fhiaims.run` 0.4 does: the agent writes the inputs, the examination checks what runs on the machine and records facts, the input reviewer checks that VASP will run the inputs as described and that nothing in them is harmful, and the researcher approves the run.
+
+### The installation
+
+The compute profile's `vasp` installation names:
+- `binary`: the standard build (`vasp_std`), and `version`: the version as OUTCAR's first line prints it after `vasp.` (e.g. `5.4.4.18Apr17-6-g9f103f2a35`, `6.4.2`);
+- `variants`: the other builds of the same version, `gam` (Γ only) and `ncl` (non-collinear and spin-orbit); a job script may launch any of them;
+- `data_paths`: `potcars`, the PAW library (e.g. `potpaw_PBE`), one directory per dataset, named as the dataset's `TITEL` names it (`Pb_d`), with that dataset alone in its `POTCAR`; and optionally `source`, VASP's `src` directory, if it is not next to the binaries' directory (`<install>/src` beside `<install>/bin`);
+- `job_template`, when VASP's jobs need a setup the profile's template does not have (other modules or environment scripts). A code's own template follows the same rules as the profile's, and its jobs, generated or the agent's, are rendered and examined against it.
+
+### Inputs and declared settings
+
+The agent writes `INCAR`, gives `POSCAR` as the structure (naming its species, VASP 5 format) and writes `KPOINTS`, unless INCAR's `KSPACING` is to set the k-points. It gives `POTCAR` by path, or declares `potcar`, the PAW datasets of POSCAR's species in its order (e.g. `{"potcar": ["Te", "Pb_d"]}`), and CEDAR writes POTCAR from the profile's library, the datasets one after another as they are in the library. The job script is generated from the approved template when the agent does not write one, launching the build the inputs need: `ncl` when INCAR sets `LNONCOLLINEAR` or `LSORBIT`, the standard build otherwise; the `gam` build only in a job script the agent writes. The run's standard output goes to `vasp.out`.
+
+Other files the run reads, such as `WAVECAR` or `CHGCAR` to restart from, may be given under any plain file name but the outputs' (`vasp.out`, `OUTCAR`, `OSZICAR`, `CONTCAR`, `vasprun.xml`), as for `fhiaims.run` 0.4. Every input file is read-only while the run runs and must be unchanged after it: VASP writes `WAVECAR` and `CHGCAR` at the end of a run unless INCAR sets `LWAVE = .FALSE.` and `LCHARG = .FALSE.`. The declared settings are the agent's description, not checked against the files (`potcar` only names what to write).
+
+### Deterministic examination
+
+Besides what runs on the machine, two things about the inputs are rules, because VASP would otherwise stop at once or compute something else without a word: POTCAR must match POSCAR's species, and a non-collinear INCAR must run on the `ncl` build.
+
+| What | Finding |
+|---|---|
+| A missing `INCAR`, `POSCAR`, `POTCAR` (not given, and no `potcar` declared) or job script | `ERROR` |
+| A `potcar` dataset the library does not have (the library's datasets for that element are named) | `ERROR` |
+| POTCAR holds a different number of datasets than POSCAR has species, or a dataset for another element than POSCAR names for that species | `ERROR` |
+| INCAR sets `LNONCOLLINEAR` or `LSORBIT` and the job script launches another build than the profile's `ncl` | `ERROR` |
+| The same, when the profile records no `ncl` build | `WARNING` |
+| The `gam` build with a KPOINTS that is not Γ alone | `WARNING` |
+| An INCAR tag named nowhere in the installed VASP's source (where the source is found): VASP silently ignores tags it does not read | `WARNING` |
+| An INCAR line that sets no tag (VASP ignores it): a heading; a `WARNING` when it starts with a tag VASP reads, as when `=` was left out | `INFO` or `WARNING` |
+| `WAVECAR` or `CHGCAR` given while INCAR does not set `LWAVE` or `LCHARG` to `.FALSE.` | `WARNING` |
+| Any other file given with the inputs; a file named like an output | `INFO`; `ERROR` |
+| The job script, its resources, the budget and, for a local run, the allocation | as for `fhiaims.run` 0.4 |
+| The k-point set KPOINTS gives (or that KSPACING sets it); a tag set more than once; the build the job script launches | `INFO` |
+| Each POTCAR dataset (`TITEL`, `ZVAL`) and whether it equals the library's; a POSCAR naming no species (VASP takes them from POTCAR) | `INFO` |
+| The structure: atoms per species, directions fixed by selective dynamics, shortest distance, empty space along the third lattice vector; POSCAR lines CEDAR's reader cannot read | `INFO` |
+
+The examination records every tag INCAR sets, as written, the k-point set (`KPOINTS`) and the datasets (`POTCAR`); comparisons rest on these, and the input reviewer classifies each. It is shown the installed VASP (its builds, the PAW library and the source, where every INCAR tag it reads appears by name in quotes) and the VASP wiki.
+
+### Run checks
+
+When a job ends, the validator checks the run and stores `vasp.out`, `OUTCAR`, `OSZICAR`, `CONTCAR` and `vasprun.xml` (those that exist) and the scheduler's logs:
+
+| Check | Passes when |
+|---|---|
+| `scheduler_completed` | the scheduler reports `COMPLETED` |
+| `output_present` | `OUTCAR` exists (only recorded when it does not; the first fatal error in `vasp.out` is quoted) |
+| `code_version` | OUTCAR's `vasp.` line reports the profile's recorded version |
+| `normal_termination` | `General timing and accounting informations for this job` is present (if not, the first fatal error in `vasp.out` is quoted) |
+| `scf_converged` | every ionic step's electronic loop ends with `aborting loop because EDIFF is reached`; VASP 5 just goes on after `NELM` steps, VASP 6 says `EDIFF was not reached (unconverged)` |
+| `geometry_converged` (when OUTCAR's `IBRION` is 1, 2 or 3 and `NSW` > 0) | `reached required accuracy - stopping structural energy minimisation` |
+| `inputs_unchanged` | the run directory still holds the examined files |
+
+The protocol reads `free  energy   TOTEN` and `energy(sigma->0)` of the last ionic step from OUTCAR's ionic-step block, not from the lines of the electronic steps, which are spaced differently. These markers were checked against real output of VASP 5.4.4 and VASP 6's formats. `test_vasp_formats.py` checks them against real runs when `CEDAR_REAL_VASP_RUNS` names a directory of them.
+
+## Every protocol
 
 ### Submission
 
@@ -170,7 +227,9 @@ Once the researcher (or, in full automation, the approver) has approved the run,
 
 ### Registered runs
 
-A run computed outside CEDAR can be registered from its directory ([`WORKBENCH.md`](WORKBENCH.md)). Nothing runs, so no input reviewer is involved. Its output gets the same checks except `scheduler_completed` (there is no scheduler state), `code_version` (the version is recorded, not required to match the profile) and `inputs_unchanged` (its inputs are stored when it is registered). Its settings are read from its inputs: physical keywords, forbidden ones and keywords the protocol does not know become controls; numerical keywords become numerical settings; convergence aids are left out; `species_defaults` names the level of the profile's species defaults that the species blocks equal, per element where they differ, or a hash of a block that equals none.
+A run computed outside CEDAR can be registered from its directory ([`WORKBENCH.md`](WORKBENCH.md)); the code is recognized from its inputs. Nothing runs, so no input reviewer is involved. Its output gets the same checks except `scheduler_completed` (there is no scheduler state), `code_version` (the version is recorded, not required to match the profile) and `inputs_unchanged` (its inputs are stored when it is registered). Its settings are read from its inputs:
+- FHI-aims: physical keywords, forbidden ones and keywords the protocol does not know become controls; numerical keywords become numerical settings; convergence aids are left out; `species_defaults` names the level of the profile's species defaults that the species blocks equal, per element where they differ, or a hash of a block that equals none.
+- VASP: tags that change the physical model or what is computed (e.g. `GGA`, `IVDW`, `ISPIN`, `LDAUU`, `IBRION`), and tags the protocol does not classify, become controls; accuracy tags (e.g. `ENCUT`, `PREC`, `EDIFF`, `ISMEAR`, `SIGMA`) numerical settings; tags that change only how a result is reached, run or written (e.g. `ALGO`, `NCORE`, `LWAVE`) are left out. `KPOINTS` (the k-point set) and `POTCAR` (the datasets, from POTCAR or, when it was not kept, from OUTCAR's `POTCAR:` lines) are numerical settings. Its inputs are recorded under `vasp.run` 0.1, so a request with the same inputs and code version is found identical to it.
 
 ### Evidence from a run
 
@@ -183,8 +242,9 @@ A reading must also have every quote found at its lines of the stored output (`c
 
 ### Limitations
 
-- Numerical convergence of the quantities taken from a run, and of differences between runs, with respect to k-points, basis, slab thickness and vacuum is not established by a single calculation. It needs a declared convergence comparison.
+- Numerical convergence of the quantities taken from a run, and of differences between runs, with respect to k-points, basis (FHI-aims) or plane-wave cutoff (VASP), slab thickness and vacuum is not established by a single calculation. It needs a declared convergence comparison.
 - Under 0.4, whether FHI-aims runs the inputs as the task describes is the input reviewer's judgement, a model's, checked by nothing but the researcher's look before they approve the run. Its local quotes are verified; its web sources and its reasoning are not. Nothing checks the scientific choices in the inputs, the basis quality included: they are the agent's, and the researcher's when they approve. The declared settings are the agent's description; comparisons rest on what `control.in` sets.
+- Under `vasp.run` 0.1 the same holds for whether VASP runs the inputs as described. The check for INCAR tags VASP does not read rests on the installed source, when it is found next to the binaries or named in the profile; without it, only the input reviewer looks. POTCAR is matched to POSCAR by element, not by which dataset of the element suits the calculation, which is the agent's choice.
 - Under 0.3 the input reviewer also judged whether the inputs made sense for the test.
 - Under 0.2 and 0.1, a species block modified by an agent can run only after user review, keyword meanings cover only the keywords listed above, and anything else needs review rather than being guessed.
 - A registered run's inputs were not examined before it ran; the settings recorded for it are read from its files, and nothing checks that they produced its output. Its outputs existed before any prediction, so its evidence can challenge a hypothesis, not support it. Its settings are classified with the 0.2 keyword lists.

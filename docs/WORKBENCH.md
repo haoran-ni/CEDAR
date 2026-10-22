@@ -9,7 +9,7 @@ runs they bring into the record.
 | Read access | Any file the researcher can read, except credentials; every agent | — | no |
 | Workspace | A writable directory per hypothesis | — | no |
 | Workbench | Shell commands and scripts in the workspace, in a sandbox | no; `/workbench off` turns it off | no |
-| Registered run | A finished FHI-aims run computed outside CEDAR, brought into the record | no; nothing runs | yes, marked as computed outside CEDAR |
+| Registered run | A finished FHI-aims or VASP run computed outside CEDAR, brought into the record | no; nothing runs | yes, marked as computed outside CEDAR |
 | Local calculation | An examined calculation run on the interactive node CEDAR runs on | yes: `/approve submit` | yes, as for a Slurm run |
 
 ## What agents read and write
@@ -90,10 +90,11 @@ dispatcher on the same node: the data directory is often on a shared filesystem.
 ## Local calculations
 
 A task with `execution: local` runs on the interactive node CEDAR runs on, inside the
-researcher's allocation, under `fhiaims.run` 0.4:
+researcher's allocation, under `fhiaims.run` 0.4 or `vasp.run` 0.1:
 
-- its script, `local.sh`, is the approved job template without its `#SBATCH` lines, plus one
-  `#CEDAR --ntasks=N --time=T` line; the examiner checks it like a job script, and its task
+- its script, `local.sh`, is the approved job template (the code's own, if the profile gives it
+  one) without its `#SBATCH` lines, plus one `#CEDAR --ntasks=N --time=T` line; the examiner
+  checks it like a job script, and its task
   count and time limit against the cores local DFT may use and the allocation's time left
   (with five minutes to spare). Local DFT uses at most the allocation's cores on this node
   less 4, which always stay free for the agents' commands; an allocation of 4 cores or fewer
@@ -163,14 +164,21 @@ identical to a healthy local one links the existing run instead of computing it 
 
 `register_existing_run` (hypothesis agents, for their own hypothesis; the Chief Scientist,
 shared or for one hypothesis) and `/register <dir> <note>` (the researcher, shared with every
-agent) bring a finished FHI-aims run into the record (`engine/registration.py`). Nothing runs:
+agent) bring a finished FHI-aims or VASP run into the record (`engine/registration.py`); the code
+is recognized from the inputs (`control.in` and `geometry.in`, or `INCAR` and `POSCAR`). Nothing
+runs:
 
-- `control.in`, `geometry.in` and the output are stored by hash;
+- the inputs and the output are stored by hash: for FHI-aims `control.in`, `geometry.in` and
+  `aims.out`; for VASP `INCAR`, `POSCAR`, `OUTCAR`, and `KPOINTS`, `POTCAR`, `OSZICAR`,
+  `CONTCAR`, `vasprun.xml` and `vasp.out` where kept (an extra output over 100 MB stays in its
+  directory, noted); `--output` (`output_file`) names an output other than `aims.out` or
+  `OUTCAR`;
 - the output's health is checked with the protocol's markers (normal end, SCF and geometry
   convergence); there is no scheduler state, and the code version is recorded, not required;
 - the settings the inputs used become the run's task, classified as a task declares them:
-  physical and unknown keywords as controls, numerical ones as numerical settings, and the
-  species blocks by the species-defaults level they equal (or a hash);
+  physical and unknown keywords (INCAR tags) as controls, numerical ones as numerical
+  settings, and the species blocks by the species-defaults level they equal (or a hash), or
+  VASP's k-point set and PAW datasets as numerical settings;
 - a `run_registered` event creates a calculation already `QUALITY_ASSESSED`.
 
 Readings of a registered run are `archived_computation` evidence; analyses of it are analysis

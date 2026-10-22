@@ -71,6 +71,7 @@ from cedar.contracts.plan import Authorization, PermissionAction
 from cedar.contracts.examination import ExaminationVerdict
 from cedar.contracts.status import INVESTIGATION_MACHINE, CalculationState, InvestigationMode
 from cedar.errors import RuleViolation
+from cedar.engine.registration import registration_problem
 from cedar.hpc.profile import ProfileStore
 from cedar.hpc.profile import ProfileNotApproved
 from cedar.hpc.node import ExecutionHost, HostWatch, local_dft
@@ -160,8 +161,9 @@ COMMANDS = (
     Command("/workbench off", "no commands for any agent of this investigation"),
     Command("/attach <path> <note>", "give the agents an image, PDF or text file to view; the note is optional"),
     Command("/materials", "the files you attached"),
-    Command("/register <dir> <note>", "register a finished FHI-aims run computed outside CEDAR, shared with every "
-                                      "agent, so evidence can come from it; --output <file> if it is not aims.out"),
+    Command("/register <dir> <note>", "register a finished FHI-aims or VASP run computed outside CEDAR, shared with "
+                                      "every agent, so evidence can come from it; --output <file> if it is not "
+                                      "aims.out or OUTCAR"),
     Command("/cancel <calc> <reason>", "cancel a calculation, stopping its job if it has one"),
     Command("/report", "update the research notebook and show where it is"),
     Command("/halt <reason>", "stop this investigation now: cancel its jobs, retire its agents, pause it (reason "
@@ -969,7 +971,7 @@ class ChatSession:
     def _register(self, args: list[str], line: str) -> str:
         usage = ("Usage: /register <dir> <note> [--output <file>], e.g. /register ~/runs/co-fcc \"my PBE fcc run, "
                  "the one that disagrees\"")
-        output = "aims.out"
+        output = None
         if "--output" in args:
             at = args.index("--output")
             if at + 1 >= len(args):
@@ -980,9 +982,9 @@ class ChatSession:
         directory = Path(args[0]).expanduser().resolve()
         if directory == config_dir().resolve() or directory.is_relative_to(config_dir().resolve()):
             return "Nothing in CEDAR's configuration directory, which holds your API keys, can be registered."
-        missing = [name for name in ("control.in", "geometry.in", output) if not (directory / name).is_file()]
-        if missing:
-            return f"{directory} has no {', '.join(missing)}.\n{usage}"
+        problem = registration_problem(directory, output)
+        if problem is not None:
+            return f"{problem}.\n{usage}"
         note = " ".join(args[1:]).strip() or f"a run the researcher registered from {directory}"
         message_id = self._record_message(line)
         registrar = investigation_registrar(self.workspace, self.profiles, self.investigation_id,

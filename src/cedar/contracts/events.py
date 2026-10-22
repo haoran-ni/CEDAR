@@ -441,6 +441,12 @@ class RunRegistered(Contract):
     intervention_id: Identifier | None = None
     """The researcher's command, when it was the researcher who registered it."""
 
+    @property
+    def code(self) -> str:
+        """The code that computed it, as its method records it; runs registered before VASP could be were FHI-aims
+        runs."""
+        return str(self.method.get("code") or "FHI-aims")
+
     @model_validator(mode="after")
     def _consistent(self) -> "RunRegistered":
         if self.task_hash != self.task.identity_hash():

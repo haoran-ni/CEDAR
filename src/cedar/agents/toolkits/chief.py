@@ -286,11 +286,13 @@ class ProtocolArgs(Contract):
 
 
 class RegisterArgs(Contract):
-    directory: str = Field(description="Absolute path of a finished FHI-aims run's directory, holding its "
-                                       "control.in, geometry.in and output.")
+    directory: str = Field(description="Absolute path of a finished run's directory, holding its inputs and output: "
+                                       "for FHI-aims control.in, geometry.in and aims.out; for VASP INCAR, POSCAR "
+                                       "and OUTCAR (and KPOINTS, POTCAR, OSZICAR, CONTCAR, vasprun.xml where kept).")
     description: NonEmptyStr = Field(description="What the run is, e.g. the researcher's calculation that disagrees "
                                                  "with the measurement.")
-    output_file: FileName = Field(default="aims.out", description="The output's file name in that directory.")
+    output_file: FileName | None = Field(default=None, description="The output's file name in that directory, if it "
+                                                                   "is not aims.out (FHI-aims) or OUTCAR (VASP).")
     hypothesis_id: Identifier | None = Field(default=None, description="Register it for this hypothesis only; by "
                                                                        "default it is shared with every agent.")
     system_label: str | None = Field(default=None, description="A short label; the directory's name by default.")
@@ -632,8 +634,8 @@ def chief_tools(ctx: ChiefContext) -> list[AgentTool]:
                   "review, closing) and the exact command they type to grant each.", NoArgs, approvals),
         AgentTool("describe_protocol", "Explain what a protocol under this investigation's compute profile "
                   "accepts.", ProtocolArgs, describe_protocol),
-        AgentTool("register_existing_run", "Register a finished FHI-aims run computed outside CEDAR, such as the "
-                  "researcher's calculation that disagrees with the measurement, so that agents can read and "
+        AgentTool("register_existing_run", "Register a finished FHI-aims or VASP run computed outside CEDAR, such "
+                  "as the researcher's calculation that disagrees with the measurement, so that agents can read and "
                   "analyse it and evidence can come from it. Nothing runs: its files are stored by hash, its health "
                   "is checked from its output, and the settings its inputs used are recorded. By default every "
                   "agent may use it.", RegisterArgs, register_existing_run),

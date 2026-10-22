@@ -9,7 +9,11 @@ from cedar.protocols.fhiaims_run import (
     FhiAimsRunReviewed,
     FhiAimsRunSlurmOnly,
 )
+from cedar.protocols.vasp_run import FREE_ENERGY, SIGMA0_ENERGY, VaspRun
 
-__all__ = ["FhiAimsRun", "FhiAimsRunJobChecked", "FhiAimsRunReviewed", "FhiAimsRunSlurmOnly", "Protocol",
-           "ProtocolRegistry", "Reading", "RunReport",
-           "TOTAL_ENERGY", "ZERO_BROADENING_ENERGY"]
+CODES = {"fhiaims.run": "fhi-aims", "vasp.run": "vasp"}
+"""The code each protocol runs, by protocol name: its key in a compute profile's ``codes``."""
+
+__all__ = ["CODES", "FhiAimsRun", "FhiAimsRunJobChecked", "FhiAimsRunReviewed", "FhiAimsRunSlurmOnly", "Protocol",
+           "ProtocolRegistry", "Reading", "RunReport", "VaspRun",
+           "FREE_ENERGY", "SIGMA0_ENERGY", "TOTAL_ENERGY", "ZERO_BROADENING_ENERGY"]

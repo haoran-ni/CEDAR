@@ -9,7 +9,7 @@ import subprocess
 from datetime import date
 
 import pytest
-from sites import JOB_TEMPLATE, aims_output, build_site
+from sites import JOB_TEMPLATE, add_vasp, aims_output, build_site
 
 from cedar import cli
 from cedar.agents import AgentRunner, TranscriptStore
@@ -137,6 +137,24 @@ def test_setup_agent_proposes_a_profile_with_sources(home):
     assert (answer.reference, answer.note) == ("Which partitions may CEDAR use?", "only compute")
     script_source = next(s for s in profile.sources if s.reference.endswith("submit.sh"))
     assert script_source.note == "template, binary, environment script" and len(script_source.sha256) == 64
+
+
+def test_a_code_may_bring_its_builds_and_its_own_job_template(home, tmp_path):
+    vasp = add_vasp(home["site"], tmp_path / "vasp-site").codes["vasp"]
+    store = ProfileStore(home["config"] / "profiles")
+    tools = {t.name: t for t in environment_tools(store, SchedulerQueries(runner=fake_runner([])), SetupSession(),
+                                                  lambda q: "", deny=[home["config"]])}
+    codes = {"fhi-aims": proposal(home)["codes"]["fhi-aims"],
+             "vasp": {"binary": vasp.binary, "version": vasp.version, "data_paths": vasp.data_paths,
+                      "variants": vasp.variants, "job_template": vasp.job_template}}
+    outcome = tools["propose_profile"].invoke(proposal(home, codes=codes))
+    assert not outcome.is_error, outcome.content
+    saved = store.load("synthetic").codes
+    assert saved["vasp"].variants == vasp.variants and saved["vasp"].job_template == vasp.job_template
+    assert saved["fhi-aims"].job_template is None
+    broken = {**codes, "vasp": {**codes["vasp"], "job_template": "#!/bin/bash\nmpirun {{binary}}\n"}}
+    outcome = tools["propose_profile"].invoke(proposal(home, codes=broken))
+    assert outcome.is_error and "exactly one template line" in outcome.content
 
 
 def test_inspect_path_cannot_see_the_credentials_directory(home):

@@ -256,7 +256,7 @@ def test_the_decision_must_follow_from_the_findings(world, decision, findings, p
 def test_every_keyword_must_be_classified(world):
     cid = examined(world)
     outcome = world.review(cid, settings={"xc": "physical_model"})
-    assert outcome.is_error and "classify every keyword control.in sets; missing: charge" in outcome.content
+    assert outcome.is_error and "classify every setting the inputs make; missing: charge" in outcome.content
 
 
 def test_quotes_from_local_documentation_are_checked(world, tmp_path):
@@ -382,7 +382,7 @@ def test_the_reviewer_is_shown_the_installation_and_the_files_not_the_science_ar
     assert "--- control.in ---" in material and f"{line + 1:>5}  d3\n" in material
     assert "  declared (in the agent's own terms, not checked against the files): " in material
     assert "'dispersion': 'D3'" in material
-    assert "Keywords control.in sets (classify every one of them): " in material
+    assert "Settings the inputs make (classify every one of them): " in material
     # What it checks needs no hypothesis, predictions or other calculations to compare with.
     assert first not in material and "atop is preferred" not in world.reviewer_material(first)
     assert "for hypothesis" not in material
@@ -409,7 +409,7 @@ def test_an_undeclared_difference_makes_a_comparison_uncontrolled(world):
     assert judge["compare_calculations"].invoke({"calculation_ids": [plain, with_d3], "varied": ["d3"]}).content \
         .startswith("Controlled comparison: yes")
     dossier = judge["hypothesis_dossier"].invoke({"hypothesis_id": world.hyp}).content
-    assert "  control.in actually sets: " in dossier and "input reviewer (review_" in dossier
+    assert "  its inputs actually set: " in dossier and "input reviewer (review_" in dossier
 
 
 
@@ -430,7 +430,7 @@ def test_comparisons_rest_on_what_the_files_set_when_declarations_are_not_checke
                                     "k_grid": "numerical"})
     text = compare()
     assert text.startswith("Controlled comparison: yes")
-    assert "Accuracy settings set differently in control.in, as the input reviewer classified them:" in text
+    assert "Accuracy settings set differently in the inputs, as the input reviewer classified them:" in text
     assert "    k_grid: ['4 4 1', '8 8 1'] (numerical)" in text and "converged with respect to them" in text
 
 

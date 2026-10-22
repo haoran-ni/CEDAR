@@ -2,8 +2,8 @@
 calculation the task describes, and that nothing in them is harmful.
 
 Deterministic checks have already covered what runs on the machine (the job script, its resources, the budget). The
-reviewer reads the files, those CEDAR does not read included (any file given besides control.in, geometry.in and the
-job script), with the installed code's manual and source and the code's documentation on the web where it is unsure,
+reviewer reads the files, those CEDAR does not read included (any file given besides the code's own inputs and the job
+script), with the installed code's manual and source and the code's documentation on the web where it is unsure,
 and decides: the inputs are fine (the researcher then approves the run), the researcher should look at
 something first, or they go back to the agent with the reviewer's reasons. The scientific choices in them are the
 agent's and the researcher's, not the reviewer's. Claims about what a keyword does cite their source; quotes from
@@ -32,6 +32,8 @@ from cedar.contracts.review import (
 from cedar.contracts.status import CalculationState
 from cedar.engine.inputs import PROTOCOL_ENGINE
 from cedar.hpc.profile import ComputeProfile
+from cedar.protocols import CODES
+from cedar.protocols.vasp_run import POTCARS, VaspRun
 from cedar.state.ledger import ResearchLedger
 from cedar.state.projection import (
     MAX_REVIEW_REJECTIONS,
@@ -53,6 +55,7 @@ MAX_SOURCE_BYTES = 50_000_000
 """Largest local file a quote is checked against."""
 DOC_MARKERS = ("doc/manual", "src/read_control.f90")
 """What an FHI-aims source tree holds: the manual's LaTeX sources and the parser of control.in."""
+VASP_WIKI = "https://www.vasp.at/wiki/"
 
 
 @dataclass
@@ -83,11 +86,12 @@ class SourceArgs(Contract):
 class FindingArgs(Contract):
     severity: ReviewSeverity = Field(description="note: worth knowing, including any view on the scientific "
                                                  "choices; warning: something the run depends on that you could not "
-                                                 "verify, for the researcher to look at; problem: FHI-aims would "
+                                                 "verify, for the researcher to look at; problem: the code would "
                                                  "stop, the run would not be the calculation described, or something "
                                                  "is harmful.")
     text: NonEmptyStr = Field(description="What you found and why it matters for this calculation.")
-    file: FileName | None = Field(default=None, description="The input file it concerns, e.g. control.in.")
+    file: FileName | None = Field(default=None, description="The input file it concerns, e.g. control.in or "
+                                                              "INCAR.")
     line: int | None = Field(default=None, ge=1, description="The line of that file.")
     keyword: str | None = Field(default=None, description="The keyword it concerns, if any.")
     sources: list[SourceArgs] = Field(default_factory=list, description="The documentation it rests on. Cite a "
@@ -103,12 +107,15 @@ class ReviewArgs(Contract):
     summary: NonEmptyStr = Field(description="Your verdict in two or three sentences, for the researcher and the "
                                              "agent.")
     findings: list[FindingArgs] = Field(default_factory=list)
-    settings: dict[str, SettingRole] = Field(default_factory=dict, description="What every keyword set in control.in "
+    settings: dict[str, SettingRole] = Field(default_factory=dict, description="What every setting the inputs make "
+                                             "(control.in keywords; INCAR tags, KPOINTS and POTCAR) "
                                              "does: physical_model, numerical, convergence_aid, output or other.")
 
 
-def installation_lines(profile: ComputeProfile | None) -> list[str]:
+def installation_lines(profile: ComputeProfile | None, code_name: str = "fhi-aims") -> list[str]:
     """Where the installed code is, and its manual and source if they can be found next to it."""
+    if code_name == VaspRun.code:
+        return vasp_installation_lines(profile)
     if profile is None or "fhi-aims" not in profile.codes:
         return ["No compute profile with an FHI-aims installation; rely on the web documentation."]
     code = profile.codes["fhi-aims"]
@@ -125,6 +132,26 @@ def installation_lines(profile: ComputeProfile | None) -> list[str]:
                   f"  control.in parser (what each keyword reads; keywords missing from the manual are here): "
                   f"{root / 'src' / 'read_control.f90'}" if (root / "src" / "read_control.f90").is_file() else
                   "  No src/read_control.f90 in the source tree."]
+    return lines
+
+
+def vasp_installation_lines(profile: ComputeProfile | None) -> list[str]:
+    """Where the installed VASP, its builds, its PAW library and its source are; VASP's manual is its wiki."""
+    if profile is None or VaspRun.code not in profile.codes:
+        return [f"No compute profile with a VASP installation; rely on the VASP wiki, {VASP_WIKI}."]
+    code = profile.codes[VaspRun.code]
+    lines = [f"Installed VASP {code.version}: standard build {code.binary}"]
+    lines += [f"  {name} build: {path}" for name, path in code.variants.items()]
+    lines += [f"  {role}: {path}" for role, path in code.data_paths.items() if role != POTCARS]
+    if POTCARS in code.data_paths:
+        lines.append(f"  PAW library (one directory per dataset, its POTCAR inside): {code.data_paths[POTCARS]}")
+    source = VaspRun(profile).source
+    lines.append(f"  Source of this installation: {source}. VASP reads an INCAR tag by its name in quotes, e.g. "
+                 "'ENCUT' in reader.F: search the source for a tag to see whether and how this version reads it; VASP "
+                 "silently ignores a tag it does not read." if source is not None else
+                 "  No source directory was found next to the binaries; rely on the VASP wiki for this version.")
+    lines.append(f"  Documentation: the VASP wiki, {VASP_WIKI}, which describes the latest version; check what "
+                 f"changed since {code.version} where it matters.")
     return lines
 
 
@@ -187,7 +214,7 @@ def review_material(ctx: ReviewerContext, state: InvestigationState, calc: Calcu
     generated = [f.file for f in exam.findings if f.code == "generated" and f.file]
     if generated:
         lines.append(f"  generated by the protocol: {', '.join(generated)}")
-    lines.append(f"Keywords control.in sets (classify every one of them): {', '.join(exam.settings) or 'none'}")
+    lines.append(f"Settings the inputs make (classify every one of them): {', '.join(exam.settings) or 'none'}")
     others = [f.file for f in exam.findings if f.code == "other_file" and f.file]
     if others:
         lines.append(f"Other files given with the inputs, which CEDAR does not read (check that the run needs them "
@@ -198,7 +225,7 @@ def review_material(ctx: ReviewerContext, state: InvestigationState, calc: Calcu
                      + ("you cannot send this one back: if you find a problem, the researcher decides" if
                         escalated(state, calc) else "check that your reasons were addressed") + "):")
         lines += [f"  {c}: {state.calculations[c].end_reason}" for c in earlier]
-    lines += ["", *installation_lines(ctx.profile), ""]
+    lines += ["", *installation_lines(ctx.profile, CODES.get(task.protocol.name, "fhi-aims")), ""]
     lines += [_file_text(ctx, calc, name) for name in sorted(exam.files)]
     return "\n".join(lines)
 
@@ -252,7 +279,7 @@ def reviewer_tools(ctx: ReviewerContext) -> list[AgentTool]:
             raise ToolFailure(f"the inputs of {args.calculation_id} no longer wait for your review")
         unclassified = sorted(set(calc.examination.settings) - set(args.settings))
         if unclassified:
-            raise ToolFailure(f"classify every keyword control.in sets; missing: {', '.join(unclassified)}")
+            raise ToolFailure(f"classify every setting the inputs make; missing: {', '.join(unclassified)}")
         findings = tuple(ReviewFinding(severity=f.severity, text=f.text, file=f.file, line=f.line, keyword=f.keyword,
                                        sources=tuple(check_source(ctx, s) for s in f.sources))
                          for f in args.findings)
@@ -296,7 +323,7 @@ def reviewer_tools(ctx: ReviewerContext) -> list[AgentTool]:
                   "examination's facts, earlier rejected revisions, where the installed code's manual and source "
                   "are, and the files, numbered by line.", NoArgs, inputs_to_review),
         AgentTool("record_input_review", "Record your verdict on one calculation's inputs, with every finding and its "
-                  "sources, and what every keyword control.in sets does. The researcher is then asked to approve the "
+                  "sources, and what every setting the inputs make does. The researcher is then asked to approve the "
                   "run, with your warnings shown; rejected inputs go back to the agent with your reasons.",
                   ReviewArgs, record),
     ]

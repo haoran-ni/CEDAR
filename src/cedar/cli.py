@@ -236,7 +236,10 @@ def _profile_approve(args) -> int:
     print(profile.job_template)
     print(f"Partitions: {', '.join(profile.limits.partitions)}; runs under {profile.runs_root}")
     for name, code in profile.codes.items():
-        print(f"{name}: {code.binary} (version {code.version})")
+        builds = "".join(f", {variant} {path}" for variant, path in code.variants.items())
+        print(f"{name}: {code.binary}{builds} (version {code.version})")
+        if code.job_template is not None:
+            print(f"{name} runs with its own job template:\n{code.job_template}")
     answer = input(f"Approve profile {args.name}? Jobs will be submitted as shown. [y/N] ")
     if answer.strip().lower() not in ("y", "yes"):
         print("Not approved.")
@@ -382,7 +385,7 @@ def _clean(args, command: str) -> int:
     from cedar.cleanup import Cleanup
     from cedar.hpc.local import LocalBackend
     from cedar.hpc.slurm import SlurmBackend
-    from cedar.protocols.fhiaims_run import current_host
+    from cedar.protocols.runs import current_host
 
     cleanup = Cleanup(data_dir(), config_dir(), setup=command == "purge", runs=args.runs, slurm=SlurmBackend(),
                       local=lambda root: LocalBackend(root, host=current_host))

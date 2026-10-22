@@ -269,7 +269,7 @@ def _inputs(calc: CalculationRecord, indent: str) -> list[str]:
     if calc.registered:
         registration = calc.registration
         lines = [f"{indent}- Inputs registered from `{registration.source}` with its output: computed outside CEDAR "
-                 f"(FHI-aims {registration.code_version}), not examined before it ran"]
+                 f"({registration.code} {registration.code_version}), not examined before it ran"]
         lines += [f"{indent}  - {n.severity.value} {n.code}: {_flat(n.message)}" for n in registration.notes
                   if n.severity in (FindingSeverity.ERROR, FindingSeverity.REVIEW, FindingSeverity.WARNING)]
         return lines

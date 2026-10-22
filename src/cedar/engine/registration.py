@@ -1,10 +1,14 @@
 """Registering runs computed outside CEDAR, so that readings and analyses of them can become evidence.
 
 The researcher's starting calculations, and earlier runs an agent finds, usually sit in
-directories CEDAR did not create. Registering one runs nothing. The validator:
+directories CEDAR did not create. Registering one runs nothing. The code is recognized from the
+inputs: ``control.in`` and ``geometry.in`` for FHI-aims, ``INCAR`` and ``POSCAR`` for VASP.
+The validator:
 
-1. stores the run's ``control.in``, ``geometry.in`` and output by content hash, so evidence
-   always points to exactly the files that were checked;
+1. stores the run's inputs and output by content hash (for FHI-aims ``control.in``,
+   ``geometry.in`` and ``aims.out``; for VASP ``INCAR``, ``POSCAR``, ``KPOINTS`` and ``POTCAR``
+   where kept, ``OUTCAR``, and ``OSZICAR``, ``CONTCAR``, ``vasprun.xml`` and ``vasp.out`` where
+   kept and not too large), so evidence always points to exactly the files that were checked;
 2. checks the run's health from its output with the protocol's own markers (normal end, SCF
    and geometry convergence); there is no scheduler state, and the code version the output
    reports is recorded, not required;
@@ -19,29 +23,78 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
+from cedar.codes.vasp.potcar import parse_potcar
 from cedar.contracts.base import Actor, ArtifactRef, Observable, new_id
 from cedar.contracts.events import EventDraft, RunRegistered
 from cedar.contracts.evidence import RunReading
-from cedar.contracts.examination import scientific_input_hash
-from cedar.contracts.task import ScientificTaskSpec
+from cedar.contracts.examination import Finding, FindingSeverity, scientific_input_hash
+from cedar.contracts.task import ProtocolRef, ScientificTaskSpec
 from cedar.engine.results import VALIDATOR, verify_quote
 from cedar.hpc.profile import ComputeProfile
-from cedar.protocols.fhiaims_run import (
-    CODE,
-    REGISTERED_ESTIMAND,
-    REGISTERED_OBSERVABLE,
-    SPECIES_ROLE,
-    FhiAimsRun,
-    registered_report,
-    registered_settings,
-)
+from cedar.protocols import CODES, fhiaims_run, vasp_run
+from cedar.protocols.fhiaims_run import REGISTERED_ESTIMAND, SPECIES_ROLE, FhiAimsRun
+from cedar.protocols.vasp_run import VaspRun, outcar_potcars, outcar_report
 from cedar.state.ledger import ResearchLedger
 from cedar.state.projection import InvestigationState
 from cedar.store.artifacts import ArtifactStore
 
-INPUT_FILES = ("control.in", "geometry.in")
 MAX_INPUT_BYTES = 50 * 1024 ** 2
-"""Largest control.in or geometry.in registered; real ones are far smaller."""
+"""Largest input file registered; real ones are far smaller."""
+MAX_EXTRA_OUTPUT_BYTES = 100 * 1024 ** 2
+"""Largest output kept besides the one the run's health is checked from; a larger one stays in its directory."""
+
+
+@dataclass(frozen=True)
+class RunFiles:
+    """What a registered run of one code is made of."""
+
+    code: str
+    """The code's name, as people write it."""
+    protocol: ProtocolRef
+    """The protocol its settings and health are recorded under."""
+    inputs: tuple[str, ...]
+    structure: str
+    output: str
+    """The output its health is checked from, unless another is named."""
+    optional_inputs: tuple[str, ...] = ()
+    optional_outputs: tuple[str, ...] = ()
+    limitation: str = ""
+
+
+FHI_AIMS = RunFiles("FHI-aims", FhiAimsRun.ref, ("control.in", "geometry.in"), "geometry.in", "aims.out",
+                    limitation="One run at the settings its inputs used; convergence of the quantities taken from it "
+                               "(and of differences between runs) with respect to k-points, basis, slab thickness and "
+                               "vacuum must be established by a comparison of runs.")
+VASP = RunFiles("VASP", VaspRun.ref, ("INCAR", "POSCAR"), "POSCAR", "OUTCAR", ("KPOINTS", "POTCAR"),
+                ("OSZICAR", "CONTCAR", "vasprun.xml", "vasp.out"),
+                limitation="One run at the settings its inputs used; convergence of the quantities taken from it (and "
+                           "of differences between runs) with respect to k-points, plane-wave cutoff, slab thickness "
+                           "and vacuum must be established by a comparison of runs.")
+
+
+def run_files(directory: Path) -> RunFiles | None:
+    """Which code's run ``directory`` holds, from its inputs."""
+    if any((directory / name).is_file() for name in FHI_AIMS.inputs):
+        return FHI_AIMS
+    if any((directory / name).is_file() for name in VASP.inputs):
+        return VASP
+    return None
+
+
+def registration_problem(directory: Path, output_file: str | None = None) -> str | None:
+    """Why ``directory`` cannot be registered as a run, if its files already say: None if they do not."""
+    kind = run_files(directory)
+    if kind is None:
+        return (f"{directory} holds neither an FHI-aims run (control.in, geometry.in) nor a VASP run (INCAR, POSCAR, "
+                "OUTCAR)")
+    output = output_file or kind.output
+    missing = [name for name in (*kind.inputs, output) if not (directory / name).is_file()]
+    if missing:
+        return (f"{directory} has no {', '.join(missing)}; a registered {kind.code} run needs its "
+                f"{', '.join(kind.inputs)} and output file (name it with output_file if it is not {kind.output})")
+    if output in (*kind.inputs, *kind.optional_inputs):
+        return f"{output} is an input file, not the run's output"
+    return None
 
 
 def registered_limitation(source: str) -> str:
@@ -70,9 +123,11 @@ class RunRegistrar:
         self._readable = readable
 
     def register(self, investigation_id: str, directory: str | Path, *, requested_by: Actor, description: str,
-                 hypothesis_id: str | None = None, output_file: str = "aims.out", system_label: str | None = None,
+                 hypothesis_id: str | None = None, output_file: str | None = None, system_label: str | None = None,
                  observable: Observable | None = None, estimand: str | None = None,
                  intervention_id: str | None = None) -> RegistrationOutcome:
+        """``output_file`` is the output the run's health is checked from: the code's usual one (aims.out, OUTCAR)
+        when None."""
         path = Path(directory).expanduser()
         if not path.is_absolute():
             return RegistrationOutcome(None, (f"give the run directory as an absolute path, not {directory}",))
@@ -83,42 +138,65 @@ class RunRegistrar:
             return RegistrationOutcome(None, (f"{source} is a run directory of CEDAR's own calculations; use that "
                                               "calculation directly instead of registering it as a run computed "
                                               "outside CEDAR",))
-        names = (*INPUT_FILES, output_file)
-        missing = [name for name in names if not (source / name).is_file()]
-        if missing:
-            return RegistrationOutcome(None, (f"{source} has no {', '.join(missing)}; a registered FHI-aims run needs "
-                                              "its control.in, geometry.in and output file (name it with "
-                                              "output_file if it is not aims.out)",))
-        large = [name for name in INPUT_FILES if (source / name).stat().st_size > MAX_INPUT_BYTES]
+        problem = registration_problem(source, output_file)
+        if problem is not None:
+            return RegistrationOutcome(None, (problem,))
+        kind = run_files(source)
+        output_file = output_file or kind.output
+        inputs = (*kind.inputs, *(name for name in kind.optional_inputs if (source / name).is_file()))
+        large = [name for name in inputs if (source / name).stat().st_size > MAX_INPUT_BYTES]
         if large:
             return RegistrationOutcome(None, (f"{', '.join(large)} in {source} exceed {MAX_INPUT_BYTES} bytes",))
-        if output_file in INPUT_FILES:
-            return RegistrationOutcome(None, (f"{output_file} is an input file, not the run's output",))
+        notes: list[Finding] = []
+        extra = []
+        for name in kind.optional_outputs:
+            path = source / name
+            if name == output_file or not path.is_file():
+                continue
+            if path.stat().st_size > MAX_EXTRA_OUTPUT_BYTES:
+                notes.append(Finding(severity=FindingSeverity.INFO, code="output_not_stored", file=name,
+                                     message=f"{name} ({path.stat().st_size} bytes) is not stored; read it in "
+                                             f"{source}"))
+            else:
+                extra.append(name)
+        outputs = (output_file, *extra)
 
-        stored = {name: self._artifacts.put_file(source / name) for name in names}
-        texts = {name: self._artifacts.read(stored[name]).decode(errors="replace") for name in INPUT_FILES}
-        code = self._profile.codes.get(CODE) if self._profile is not None else None
-        species_root = Path(code.data_paths[SPECIES_ROLE]) if code and SPECIES_ROLE in code.data_paths else None
-        controls, numerical, notes = registered_settings(texts["control.in"], texts["geometry.in"], species_root)
-        method = {"code": "FHI-aims", "protocol": f"{FhiAimsRun.ref.name} {FhiAimsRun.ref.version}",
-                  "origin": "registered", "source": str(source), **controls, **numerical}
-        limitations = (registered_limitation(str(source)),
-                       "One run at the settings its inputs used; convergence of the quantities taken from it (and of "
-                       "differences between runs) with respect to k-points, basis, slab thickness and vacuum must "
-                       "be established by a comparison of runs.")
+        stored = {name: self._artifacts.put_file(source / name) for name in (*inputs, *outputs)}
+        texts = {name: self._artifacts.read(stored[name]).decode(errors="replace") for name in inputs}
         output = self._artifacts.read(stored[output_file])
-        report = registered_report(output, controls, output_file=output_file, method=method, limitations=limitations)
+        code = self._profile.codes.get(CODES[kind.protocol.name]) if self._profile is not None else None
+        limitations = (registered_limitation(str(source)), kind.limitation)
+        method = {"code": kind.code, "protocol": f"{kind.protocol.name} {kind.protocol.version}",
+                  "origin": "registered", "source": str(source)}
+        if kind is VASP:
+            titles = ([d.title for d in parse_potcar(texts["POTCAR"]).datasets] if "POTCAR" in texts else
+                      outcar_potcars(output.decode(errors="replace")))
+            controls, numerical, settings_notes = vasp_run.registered_settings(texts["INCAR"], texts.get("KPOINTS"),
+                                                                                titles)
+            method |= {**controls, **numerical}
+            stdout = self._artifacts.read(stored["vasp.out"]) if "vasp.out" in stored else None
+            report = outcar_report(output, stdout, method=method, output_file=output_file, limitations=limitations)
+            registered_observable = vasp_run.REGISTERED_OBSERVABLE
+        else:
+            species_root = Path(code.data_paths[SPECIES_ROLE]) if code and SPECIES_ROLE in code.data_paths else None
+            controls, numerical, settings_notes = fhiaims_run.registered_settings(texts["control.in"],
+                                                                                   texts["geometry.in"], species_root)
+            method |= {**controls, **numerical}
+            report = fhiaims_run.registered_report(output, controls, output_file=output_file, method=method,
+                                                   limitations=limitations)
+            registered_observable = fhiaims_run.REGISTERED_OBSERVABLE
+        notes = settings_notes + notes
         version = report.method.get("code_version") or "unknown"
         if code is not None and version != code.version:
-            limitations += (f"{output_file} reports FHI-aims {version}; the compute profile's FHI-aims is "
+            limitations += (f"{output_file} reports {kind.code} {version}; the compute profile's {kind.code} is "
                             f"{code.version}.",)
-        inputs = {name: stored[name] for name in INPUT_FILES}
+        input_refs = {name: stored[name] for name in inputs}
         task = ScientificTaskSpec(
-            protocol=FhiAimsRun.ref, observable=observable or REGISTERED_OBSERVABLE,
+            protocol=kind.protocol, observable=observable or registered_observable,
             estimand=estimand or REGISTERED_ESTIMAND, system_label=system_label or source.name,
-            structure=stored["geometry.in"], controls=controls, numerical_settings=numerical,
-            authored_files={"control.in": stored["control.in"]})
-        input_hash = scientific_input_hash(task.protocol, version, inputs)
+            structure=stored[kind.structure], controls=controls, numerical_settings=numerical,
+            authored_files={name: ref for name, ref in input_refs.items() if name != kind.structure})
+        input_hash = scientific_input_hash(task.protocol, version, input_refs)
 
         state = self._ledger.load(investigation_id)
         existing = self._existing(state, str(source), input_hash, stored[output_file], hypothesis_id)
@@ -132,8 +210,8 @@ class RunRegistrar:
         self._ledger.record(investigation_id, [EventDraft(actor=self._actor, payload=RunRegistered(
             calculation_id=calculation_id, hypothesis_id=hypothesis_id, requested_by=requested_by,
             description=description, source=str(source), task=task, task_hash=task.identity_hash(),
-            code_version=version, inputs=inputs, input_hash=input_hash, notes=tuple(notes),
-            outputs={output_file: stored[output_file]}, checks=report.checks,
+            code_version=version, inputs=input_refs, input_hash=input_hash, notes=tuple(notes),
+            outputs={name: stored[name] for name in outputs}, checks=report.checks,
             failure_quality=report.failure_quality, readings=readings, limitations=limitations,
             method=report.method, intervention_id=intervention_id))])
         return RegistrationOutcome(calculation_id)

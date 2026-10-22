@@ -5,7 +5,7 @@ Hypothesis agents take results from finished calculations in two ways:
 - **Readings.** A value the code printed is recorded with `submit_reading`, citing the file and lines. The validator finds the quote in the stored output before recording it.
 - **Analysis scripts.** Anything that must be computed is handled by a Python script the agent writes, run with `run_analysis`. Examples: a gap from an eigenvalue table, a distance from a geometry, a planar average, or a difference between runs. The agent then records a result with `record_result`.
 
-No quantity is built into CEDAR. The FHI-aims protocol (`fhiaims.run`) checks that a run is healthy; what to take from it is the agent's decision. The runs can be CEDAR's own or runs computed outside CEDAR and registered ([`WORKBENCH.md`](WORKBENCH.md)).
+No quantity is built into CEDAR. The protocols (`fhiaims.run` for FHI-aims, `vasp.run` for VASP) check that a run is healthy; what to take from it is the agent's decision. The runs can be CEDAR's own or runs computed outside CEDAR and registered ([`WORKBENCH.md`](WORKBENCH.md)).
 
 Analysis scripts are not the agent's general-purpose commands: those run in its workspace, in the workbench's sandbox, and give context, not evidence ([`WORKBENCH.md`](WORKBENCH.md)).
 
@@ -41,7 +41,7 @@ A script reports its results, and the checks it made, in `results.json` in its w
 
 ### Two kinds of checks
 
-- **Run checks** are the same for every FHI-aims run, whatever its purpose. When a job ends, the protocol checks that the scheduler reported completion, the code version matches the compute profile, FHI-aims ended normally, the SCF converged (and the geometry, for a relaxation), and the input files are unchanged. They come from FHI-aims's own output markers, not from any quantity or site.
+- **Run checks** are the same for every run of a code, whatever its purpose. When a job ends, the protocol checks that the scheduler reported completion, the code version matches the compute profile, the code ended normally, the SCF converged (for VASP, in every ionic step) and the geometry too, for a relaxation, and the input files are unchanged. They come from the code's own output markers (`aims.out`; VASP's `OUTCAR`), not from any quantity or site.
 - **Script checks** are what this particular run's purpose needs, decided by the agent and computed by its script: the electron count, the right SCF block, agreement with a printed value, forces below a threshold, an expected output file present, the intended spin state, a quantity converged with respect to a numerical setting.
 
 Both kinds are recorded on the evidence. The script's checks appear with the prefix `script:`.

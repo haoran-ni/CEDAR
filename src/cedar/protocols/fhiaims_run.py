@@ -24,7 +24,7 @@ to the declared settings.
 
 import math
 import re
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 from pydantic import JsonValue
@@ -36,23 +36,16 @@ from cedar.codes.fhiaims.control import (
     render_control,
     species_default_path,
 )
-from cedar.codes.fhiaims.geometry import Geometry, minimum_distance, parse_geometry, vacuum_along_c
+from cedar.codes.fhiaims.geometry import Geometry, parse_geometry
 from cedar.codes.fhiaims.output import parse_output
+from cedar.codes.structure import minimum_distance, vacuum_along_c
 from cedar.contracts.base import Observable, Quantity, sha256_hex
 from cedar.contracts.evidence import QualityCheck
 from cedar.contracts.examination import Finding, FindingSeverity
 from cedar.contracts.status import EvidenceQuality, SchedulerState
 from cedar.contracts.task import ProtocolRef, ScientificTaskSpec
-from cedar.hpc.jobscript import (
-    JobResources,
-    examine_job_script,
-    examine_local_script,
-    render_job_script,
-    render_local_script,
-)
-from cedar.hpc.node import WORKBENCH_CORES, ExecutionHost, HostWatch
-from cedar.hpc.profile import ComputeProfile
 from cedar.protocols.base import Protocol, Reading, RunReport
+from cedar.protocols.runs import CodeRun
 
 _E, _R, _W, _I = FindingSeverity.ERROR, FindingSeverity.REVIEW, FindingSeverity.WARNING, FindingSeverity.INFO
 
@@ -109,12 +102,6 @@ REGISTERED_OBSERVABLE = Observable(
 )
 REGISTERED_ESTIMAND = "what the registered run's outputs show, at the settings its inputs used"
 _KEYWORD_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")
-LOCAL_MARGIN_MINUTES = 5
-"""A local run must end this long before the allocation does."""
-LOGIN_NODE = ("CEDAR is running on a login node ({host}), and DFT cannot run locally on login nodes. Start CEDAR "
-              "on an interactive node (inside a Slurm allocation) to run it locally, or request it through Slurm.")
-current_host = HostWatch()
-"""Where this process runs, asked again at most every minute."""
 SLAB_VACUUM = 5.0
 """Å of empty space along c above which a periodic structure is treated as a slab."""
 MIN_DISTANCE = 0.5
@@ -161,7 +148,7 @@ def _same_args(expected: tuple[str, ...], actual: tuple[str, ...]) -> bool:
     return True
 
 
-class FhiAimsRun(Protocol):
+class FhiAimsRun(CodeRun):
     """``fhiaims.run`` 0.2, kept for the calculations recorded under it.
 
     Task variables are ``control.in`` keywords, named as in ``control.in``, plus the pseudo-variable
@@ -176,26 +163,11 @@ class FhiAimsRun(Protocol):
     structure_file = "geometry.in"
     execution_files = ("job.sh", "local.sh")
     output_files = ("aims.out",)
-    runs_locally = True
+    code = CODE
+    run_output = "aims.out"
     superseded_by = "0.4"
     generates_control = True
     """Whether a missing control.in is written from the declared keywords; from 0.4 on the agent writes it."""
-
-    def __init__(self, profile: ComputeProfile, host: Callable[[], ExecutionHost] | None = None) -> None:
-        """``host`` says where CEDAR runs, which bounds a local run."""
-        if CODE not in profile.codes:
-            raise ValueError(f"compute profile {profile.name} has no {CODE!r} installation")
-        self._profile = profile
-        self._code = profile.codes[CODE]
-        self._host = host or current_host
-
-    @staticmethod
-    def _script(task: ScientificTaskSpec) -> str:
-        return "local.sh" if task.execution == "local" else "job.sh"
-
-    @property
-    def code_version(self) -> str:
-        return self._code.version
 
     def input_settings(self, files: Mapping[str, bytes]) -> dict[str, str]:
         """Every keyword control.in sets, with its arguments as written; repeats are joined by '; '."""
@@ -232,17 +204,6 @@ class FhiAimsRun(Protocol):
             "Keywords the examiner does not know also need user review.",
             *self._where(),
         ])
-
-    def _where(self) -> list[str]:
-        if not self.runs_locally:
-            return [f"Runs through Slurm only (job.sh); use version {self.superseded_by} for a local run."]
-        host = self._host()
-        local = (f"possible here: CEDAR runs on the {host.describe()}; a local run may use up to {host.cores} "
-                 "tasks and must end before the allocation does" if host.interactive else
-                 "not possible here: " + LOGIN_NODE.format(host=host.hostname))
-        return ["Where it runs: execution 'slurm' (default) submits job.sh to the scheduler; execution 'local' runs "
-                f"local.sh on the interactive node CEDAR runs on, inside the researcher's allocation. Local runs are "
-                f"{local}. Both need the researcher's approval to start."]
 
     # -- declared variables -----------------------------------------------------------
 
@@ -331,40 +292,9 @@ class FhiAimsRun(Protocol):
             elif not any(f.severity is _E for f in problems):
                 geometry = parse_geometry(present["geometry.in"].decode(errors="replace"))
                 generated["control.in"] = self._render_control(values, geometry).encode()
-        script = self._script(task)
-        other = "job.sh" if script == "local.sh" else "local.sh"
-        if other in present:
-            findings.append(Finding(severity=_E, code="wrong_script", file=other,
-                                    message=f"a {task.execution} run takes {script}, not {other}"))
-        elif script not in present and script == "local.sh":
-            if self.runs_locally and self._host().interactive:
-                resources = self._default_local_resources(task)
-                host = self._host()
-                if resources is None and host.dft_cores == 0:
-                    findings.append(Finding(severity=_E, code="no_cores_for_dft",
-                                            message=f"the allocation has {host.cores} cores here, and "
-                                                    f"{WORKBENCH_CORES} are kept for the agents' commands, which "
-                                                    "leaves none for a local run; run it through Slurm"))
-                elif resources is None:
-                    findings.append(Finding(severity=_E, code="budget_too_small",
-                                            message="the task budget or the allocation's time left does not allow "
-                                                    "a local run of one minute"))
-                else:
-                    generated["local.sh"] = render_local_script(
-                        self._profile, self._code, ntasks=resources.ntasks,
-                        walltime_minutes=resources.walltime_minutes, output_file="aims.out").encode()
-        elif script not in present:
-            resources = self._default_resources(task)
-            if resources is None:
-                findings.append(Finding(severity=_E, code="budget_too_small",
-                                        message="the task budget does not allow one minute at the profile's default "
-                                                "task count"))
-            else:
-                generated["job.sh"] = render_job_script(self._profile, self._code, resources, job_name="cedar",
-                                                        output_file="aims.out").encode()
-        for name in sorted(generated):
-            findings.append(Finding(severity=_I, code="generated", file=name,
-                                    message=f"{name} was generated by {self.ref.name} {self.ref.version}"))
+        script, problems = self._generate_script(task, present)
+        generated |= script
+        findings += problems + self._generated(generated)
         return generated, findings
 
     def _render_control(self, values: Mapping[str, object], geometry: Geometry) -> str:
@@ -378,36 +308,6 @@ class FhiAimsRun(Protocol):
         header = [f"Generated by CEDAR protocol {self.ref.name} {self.ref.version}",
                   f"species_defaults: {level}"]
         return render_control(header, keywords, species)
-
-    def _default_resources(self, task: ScientificTaskSpec) -> JobResources | None:
-        limits = self._profile.limits
-        ntasks = task.budget.cores or limits.default_ntasks
-        minutes = limits.default_walltime_minutes
-        if task.budget.max_walltime_hours is not None:
-            minutes = min(minutes, math.floor(task.budget.max_walltime_hours * 60))
-        if task.budget.max_core_hours is not None:
-            minutes = min(minutes, math.floor(task.budget.max_core_hours * 60 / ntasks))
-        if minutes < 1:
-            return None
-        nodes = math.ceil(ntasks / limits.cores_per_node)
-        return JobResources(limits.default_partition, nodes, ntasks, minutes)
-
-    def _default_local_resources(self, task: ScientificTaskSpec) -> JobResources | None:
-        """The allocation's cores here (or the task's, if fewer), for the profile's default walltime, ending well
-        before the allocation does."""
-        host = self._host()
-        if host.dft_cores == 0:
-            return None
-        ntasks = min(task.budget.cores or host.dft_cores, host.dft_cores)
-        minutes = self._profile.limits.default_walltime_minutes
-        if task.budget.max_walltime_hours is not None:
-            minutes = min(minutes, math.floor(task.budget.max_walltime_hours * 60))
-        if task.budget.max_core_hours is not None:
-            minutes = min(minutes, math.floor(task.budget.max_core_hours * 60 / ntasks))
-        left = host.seconds_left()
-        if left is not None:
-            minutes = min(minutes, math.floor(left / 60) - LOCAL_MARGIN_MINUTES)
-        return JobResources("local", 1, ntasks, minutes) if minutes >= 1 else None
 
     # -- examination ------------------------------------------------------------------
 
@@ -427,64 +327,6 @@ class FhiAimsRun(Protocol):
         if "control.in" in files and geometry is not None and not any(f.severity is _E for f in problems):
             findings += self._examine_control(files["control.in"].decode(errors="replace"), values, geometry)
         return findings + self._examine_scripts(task, files)
-
-    def _examine_scripts(self, task: ScientificTaskSpec, files: Mapping[str, bytes]) -> list[Finding]:
-        """The job script against the approved template, its resources against the budget and, for a local run,
-        the allocation."""
-        findings: list[Finding] = []
-        if "job.sh" in files:
-            script = examine_job_script(files["job.sh"].decode(errors="replace"), self._profile, self._code,
-                                        output_file="aims.out")
-            findings += script.findings
-            if script.resources is not None:
-                findings += self._examine_budget(task, script.resources, "job.sh")
-        if "local.sh" in files:
-            script = examine_local_script(files["local.sh"].decode(errors="replace"), self._profile, self._code,
-                                          output_file="aims.out")
-            findings += script.findings
-            if script.resources is not None:
-                findings += self._examine_budget(task, script.resources, "local.sh")
-                findings += self._examine_fit(script.resources)
-        return findings
-
-    def _examine_where(self) -> list[Finding]:
-        if not self.runs_locally:
-            return [Finding(severity=_E, code="no_local_runs",
-                            message=f"{self.ref.name} {self.ref.version} runs through Slurm only; request "
-                                    f"{self.ref.name} {self.superseded_by} for a local run")]
-        host = self._host()
-        if not host.interactive:
-            return [Finding(severity=_E, code="local_on_login_node", message=LOGIN_NODE.format(host=host.hostname))]
-        return [Finding(severity=_I, code="local_host", message=f"runs on the {host.describe()}")]
-
-    def _examine_fit(self, resources: JobResources) -> list[Finding]:
-        """A local run must fit the allocation CEDAR runs in: its cores here, and its time left."""
-        host = self._host()
-        if not host.interactive:
-            return []
-        findings = []
-        if resources.ntasks > host.dft_cores:
-            findings.append(Finding(severity=_E, code="too_many_tasks", file="local.sh",
-                                    message=f"{resources.ntasks} tasks exceed the {host.dft_cores} cores local DFT may "
-                                            f"use on {host.hostname}: the allocation has {host.cores}, and "
-                                            f"{WORKBENCH_CORES} are kept for the agents' commands"))
-        left = host.seconds_left()
-        if left is not None and resources.walltime_minutes > left / 60 - LOCAL_MARGIN_MINUTES:
-            findings.append(Finding(severity=_E, code="past_the_allocation", file="local.sh",
-                                    message=f"{resources.walltime_minutes} minutes would run past the end of "
-                                            f"allocation {host.allocation}, {left / 60:.0f} minutes from now"))
-        return findings
-
-    def requested_resources(self, files: Mapping[str, bytes]):
-        if "local.sh" in files:
-            script = examine_local_script(files["local.sh"].decode(errors="replace"), self._profile, self._code,
-                                          output_file="aims.out")
-        elif "job.sh" in files:
-            script = examine_job_script(files["job.sh"].decode(errors="replace"), self._profile, self._code,
-                                        output_file="aims.out")
-        else:
-            return None
-        return script.resources
 
     def _examine_geometry(self, geometry: Geometry, values: Mapping[str, object]) -> list[Finding]:
         f = "geometry.in"
@@ -596,20 +438,6 @@ class FhiAimsRun(Protocol):
             if block.species not in geometry.elements:
                 findings.append(Finding(severity=_W, code="unused_species", file=f, line=block.line,
                                         message=f"species {block.species} does not occur in the structure"))
-        return findings
-
-    @staticmethod
-    def _examine_budget(task: ScientificTaskSpec, resources: JobResources, script: str) -> list[Finding]:
-        findings = []
-        budget = task.budget
-        if budget.max_core_hours is not None and resources.core_hours > budget.max_core_hours:
-            findings.append(Finding(severity=_E, code="over_budget", file=script,
-                                    message=f"{resources.core_hours:g} core-hours requested; the task allows "
-                                            f"{budget.max_core_hours:g}"))
-        if budget.max_walltime_hours is not None and resources.walltime_minutes > budget.max_walltime_hours * 60:
-            findings.append(Finding(severity=_E, code="over_budget", file=script,
-                                    message=f"{resources.walltime_minutes} minutes requested; the task allows "
-                                            f"{budget.max_walltime_hours:g} h"))
         return findings
 
     # -- run checks -------------------------------------------------------------------
@@ -904,21 +732,6 @@ class FhiAimsRunJobChecked(FhiAimsRunReviewed):
             if "control.in" in files and not geometry.malformed_lines:
                 findings += self._species_facts(parse_control(files["control.in"].decode(errors="replace")), geometry)
         return findings + self._examine_scripts(task, files)
-
-    def _other_files(self, files: Mapping[str, bytes]) -> list[Finding]:
-        """Files besides control.in, geometry.in and the job script, as facts for the input reviewer, which checks
-        them; CEDAR does not read them. Only a file named like the run's output is refused: the run writes it."""
-        findings = []
-        for name in sorted(set(files) - set(self.input_files)):
-            if name in self.output_files:
-                findings.append(Finding(severity=_E, code="output_name", file=name,
-                                        message=f"{name} is the run's output, which the run writes; an input file "
-                                                "cannot have its name"))
-            else:
-                findings.append(Finding(severity=_I, code="other_file", file=name,
-                                        message=f"{name} ({len(files[name])} bytes) is not read by CEDAR; the input "
-                                                "reviewer checks it"))
-        return findings
 
     def _structure_facts(self, geometry: Geometry) -> list[Finding]:
         """What the structure is, and what CEDAR's reader could not read, as facts: FHI-aims is the judge of its

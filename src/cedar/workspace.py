@@ -19,8 +19,15 @@ from cedar.hpc.local import LocalBackend
 from cedar.hpc.profile import ComputeProfile, LocalExecution, ProfileNotApproved, ProfileStore
 from cedar.hpc.slurm import SchedulerBackend, SlurmBackend
 from cedar.models import CredentialStore, ModelClient, ModelConfig, ModelSettings, create_client
-from cedar.protocols import FhiAimsRun, FhiAimsRunJobChecked, FhiAimsRunReviewed, FhiAimsRunSlurmOnly, ProtocolRegistry
-from cedar.protocols.fhiaims_run import current_host
+from cedar.protocols import (
+    FhiAimsRun,
+    FhiAimsRunJobChecked,
+    FhiAimsRunReviewed,
+    FhiAimsRunSlurmOnly,
+    ProtocolRegistry,
+    VaspRun,
+)
+from cedar.protocols.runs import current_host
 from cedar.state.ledger import ResearchLedger
 from cedar.state.projection import AgentRecord, CalculationRecord, InvestigationState
 from cedar.store import ArtifactStore, SQLiteEventStore
@@ -84,7 +91,9 @@ class Services:
 def registry_for(profile: ComputeProfile) -> ProtocolRegistry:
     protocols = ([FhiAimsRunJobChecked(profile), FhiAimsRunReviewed(profile), FhiAimsRun(profile),
                   FhiAimsRunSlurmOnly(profile)]
-                 if "fhi-aims" in profile.codes else [])
+                 if FhiAimsRun.code in profile.codes else [])
+    if VaspRun.code in profile.codes:
+        protocols.append(VaspRun(profile))
     return ProtocolRegistry(protocols)
 
 
@@ -149,7 +158,7 @@ def research_context(workspace: Workspace, investigation_id: str, agent: AgentRe
     bench = None
     if workbench is not None:
         local = profile.local_execution if profile is not None else LocalExecution()
-        binaries = [Path(code.binary) for code in profile.codes.values()] if profile is not None else []
+        binaries = [Path(b) for code in profile.codes.values() for b in code.binaries] if profile is not None else []
 
         def view() -> SandboxView:
             # The sandbox makes its own /proc and /dev; the credentials, DFT codes and launchers are hidden.

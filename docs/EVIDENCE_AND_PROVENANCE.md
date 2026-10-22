@@ -73,7 +73,7 @@ An `evidence_recorded` event carries an `EvidenceObject`:
 - **calculation_id**, or **calculation_ids**, **analysis_id** and **analysis_result**: the run a reading came from, or the analysis, the result of it, and the runs it used
 - **interpreted_by**: the agent whose reading it is, if an agent read it
 - **limitations**, **assumptions**, and **non-comparability** conditions
-- the **method**: the code, protocol and declared settings (from `fhiaims.run` 0.4, the agent's description; what the inputs set is in the calculation's examination)
+- the **method**: the code, protocol and declared settings (from `fhiaims.run` 0.4, and under `vasp.run`, the agent's description; what the inputs set is in the calculation's examination)
 
 A run gives evidence only after its run check; a registered run, after the health check made when it was registered. Experimental evidence is recorded by the validator for the agent that cites it: a quote from a message, a text file or a PDF is checked against the stored text, and a value must appear in its quote; values read off a figure or a web page are `PROVISIONAL`. A value read from an output cites the lines
 it came from, checked verbatim against the stored, hashed file. A value computed by an

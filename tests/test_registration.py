@@ -330,7 +330,8 @@ def test_the_researcher_registers_shared_runs_from_the_chat(tmp_path, site):
     assert calc.shared and calc.registration.description == "my PBE fcc run, the one that disagrees"
     assert calc.registration.intervention_id == "msg-1" and state.interventions["msg-1"].text.startswith("/register")
     assert chat.handle(f"/register {directory} again").startswith("That run is already registered")
-    assert "has no control.in" in chat.handle(f"/register {tmp_path}")
+    assert "holds neither an FHI-aims run (control.in, geometry.in) nor a VASP run" in chat.handle(
+        f"/register {tmp_path}")
     refused = chat.handle(f"/register {run_directory(config_dir() / 'run', site)} keys")
     assert "configuration directory" in refused
 

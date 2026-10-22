@@ -16,9 +16,9 @@ from cedar.models.types import WebAccess
 from cedar.state.projection import RetrievalRecord
 
 WEB_ROLES = frozenset({"chief_scientist", "hypothesis_agent"})
-REVIEW_DOMAINS = ("fhi-aims.org", "fhi-aims-club.gitlab.io", "wiki.fysik.dtu.dk", "ase-lib.org")
-"""Where the input reviewer may read the codes' documentation: FHI-aims, its tutorials and ASE. Add a code's
-documentation site here when a protocol for it is added."""
+REVIEW_DOMAINS = ("fhi-aims.org", "fhi-aims-club.gitlab.io", "vasp.at", "wiki.fysik.dtu.dk", "ase-lib.org")
+"""Where the input reviewer may read the codes' documentation: FHI-aims and its tutorials, the VASP wiki, and ASE.
+Add a code's documentation site here when a protocol for it is added."""
 
 
 def web_access(setting: RetrievalRecord | None, role: str) -> WebAccess | None:

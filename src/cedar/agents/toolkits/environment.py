@@ -86,7 +86,17 @@ class AskArgs(Contract):
 class CodeArgs(Contract):
     binary: str
     version: NonEmptyStr = Field(description="The version string exactly as the code prints it in its output.")
-    data_paths: dict[Identifier, str] = Field(default={}, description="e.g. {\"species_defaults\": \"/path\"}")
+    data_paths: dict[Identifier, str] = Field(default={}, description="e.g. {\"species_defaults\": \"/path\"} for "
+                                                                      "FHI-aims, {\"potcars\": \"/path/potpaw_PBE\"} "
+                                                                      "for VASP")
+    variants: dict[Identifier, str] = Field(default={}, description="Other builds of the same version, by name, e.g. "
+                                                                    "{\"gam\": \"/path/vasp_gam\", \"ncl\": "
+                                                                    "\"/path/vasp_ncl\"} for VASP, whose binary is "
+                                                                    "then vasp_std.")
+    job_template: NonEmptyStr | None = Field(default=None, description="This code's own job template, with the same "
+                                                                       "placeholders, when its jobs need a setup the "
+                                                                       "profile's template does not have (other "
+                                                                       "modules or environment scripts).")
 
 
 class ProposeArgs(Contract):
@@ -99,7 +109,8 @@ class ProposeArgs(Contract):
     max_nodes: int = Field(gt=0)
     default_walltime_minutes: int = Field(gt=0)
     max_walltime_minutes: int = Field(gt=0)
-    codes: dict[Identifier, CodeArgs] = Field(min_length=1, description="Installations by code name, e.g. fhi-aims.")
+    codes: dict[Identifier, CodeArgs] = Field(min_length=1, description="Installations by code name: fhi-aims, "
+                                                                         "vasp.")
     job_template: NonEmptyStr = Field(description="Job script with {{job_name}}, {{partition}}, {{nodes}}, "
                                                   "{{ntasks}}, {{walltime}}, {{binary}}, {{output}} placeholders.")
     runs_root: str = Field(description="Directory for run directories, reachable from compute nodes.")
@@ -158,7 +169,8 @@ def environment_tools(store: ProfileStore, queries: SchedulerQueries, session: S
                     cores_per_node=args.cores_per_node, default_ntasks=args.default_ntasks, max_nodes=args.max_nodes,
                     default_walltime_minutes=args.default_walltime_minutes,
                     max_walltime_minutes=args.max_walltime_minutes),
-                codes={name: CodeInstallation(binary=code.binary, version=code.version, data_paths=code.data_paths)
+                codes={name: CodeInstallation(binary=code.binary, version=code.version, data_paths=code.data_paths,
+                                              variants=code.variants, job_template=code.job_template)
                        for name, code in args.codes.items()},
                 job_template=args.job_template, runs_root=args.runs_root,
                 sources=session.with_notes(args.source_notes),

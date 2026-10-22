@@ -4,7 +4,8 @@ A profile is data. The environment-setup agent proposes it from local files or t
 user's answers, ``check_profile`` verifies it, and it takes effect only once the user
 approves that exact content. Nothing in this module knows about any specific site.
 
-Job templates use ``{{name}}`` placeholders, which do not clash with shell ``${VAR}``.
+Job templates use ``{{name}}`` placeholders, which do not clash with shell ``${VAR}``. A code
+whose jobs need a setup the profile's template does not have carries its own template.
 """
 
 import hashlib
@@ -51,6 +52,23 @@ class CodeInstallation(Contract):
     """The version string the code reports in its own output."""
     data_paths: dict[Identifier, AbsolutePath] = {}
     """Code data such as basis or species-default directories, by role."""
+    variants: dict[Identifier, AbsolutePath] = {}
+    """Other builds of the same version, by name, which a job script may launch instead of ``binary``, e.g. VASP's
+    ``gam`` and ``ncl``."""
+    job_template: NonEmptyStr | None = None
+    """This code's own job-script template, when it needs a setup the profile's does not have; the profile's when
+    None."""
+
+    @model_validator(mode="after")
+    def _template_well_formed(self) -> "CodeInstallation":
+        if self.job_template is not None:
+            check_template(self.job_template)
+        return self
+
+    @property
+    def binaries(self) -> tuple[str, ...]:
+        """Every build a job script may launch: ``binary`` first."""
+        return (self.binary, *self.variants.values())
 
 
 class SchedulerLimits(Contract):
@@ -107,6 +125,18 @@ def fill_template(text: str, values: dict[str, object]) -> str:
     return _PLACEHOLDER.sub(lambda m: str(values[m.group(1)]), text)
 
 
+def check_template(text: str) -> None:
+    """Raise ValueError unless ``text`` is a job template CEDAR can render and examine scripts against."""
+    unknown = template_fields(text) - TEMPLATE_FIELDS
+    if unknown:
+        raise ValueError(f"unknown template placeholders: {sorted(unknown)}")
+    if not text.startswith("#!"):
+        raise ValueError("the job template must start with a shebang line")
+    launch = [line for line in text.splitlines() if "binary" in template_fields(line)]
+    if len(launch) != 1 or "output" not in template_fields(launch[0]):
+        raise ValueError("exactly one template line must launch {{binary}} writing to {{output}}")
+
+
 class ComputeProfile(Contract):
     name: Identifier
     scheduler: Literal["slurm"]
@@ -122,23 +152,26 @@ class ComputeProfile(Contract):
 
     @model_validator(mode="after")
     def _template_well_formed(self) -> "ComputeProfile":
-        unknown = template_fields(self.job_template) - TEMPLATE_FIELDS
-        if unknown:
-            raise ValueError(f"unknown template placeholders: {sorted(unknown)}")
-        if not self.job_template.startswith("#!"):
-            raise ValueError("the job template must start with a shebang line")
-        launch = [line for line in self.job_template.splitlines() if "binary" in template_fields(line)]
-        if len(launch) != 1 or "output" not in template_fields(launch[0]):
-            raise ValueError("exactly one template line must launch {{binary}} writing to {{output}}")
+        check_template(self.job_template)
         return self
 
     @property
     def local_execution(self) -> LocalExecution:
         return self.local or LocalExecution()
 
+    def template_for(self, code: CodeInstallation) -> str:
+        """The job template ``code`` runs with: its own, or the profile's."""
+        return code.job_template or self.job_template
+
     def content_hash(self) -> str:
-        # A profile approved before ``local`` existed keeps its hash, and so its approval.
+        # A profile approved before ``local``, or a code's ``variants`` and ``job_template``, existed keeps its hash,
+        # and so its approval.
         data = self.model_dump(mode="json", exclude={"local"} if self.local is None else None)
+        for code in data["codes"].values():
+            if not code["variants"]:
+                del code["variants"]
+            if code["job_template"] is None:
+                del code["job_template"]
         return sha256_hex(canonical_json(data))
 
 
@@ -158,11 +191,11 @@ def check_profile(profile: ComputeProfile) -> list[Finding]:
         findings.append(Finding(severity=severity, code=code, message=message))
 
     for name, code in profile.codes.items():
-        binary = Path(code.binary)
-        if not binary.is_file():
-            add(FindingSeverity.ERROR, "missing_binary", f"{name}: {binary} does not exist")
-        elif not os.access(binary, os.X_OK):
-            add(FindingSeverity.ERROR, "binary_not_executable", f"{name}: {binary} is not executable")
+        for binary in map(Path, code.binaries):
+            if not binary.is_file():
+                add(FindingSeverity.ERROR, "missing_binary", f"{name}: {binary} does not exist")
+            elif not os.access(binary, os.X_OK):
+                add(FindingSeverity.ERROR, "binary_not_executable", f"{name}: {binary} is not executable")
         for role, path in code.data_paths.items():
             if not Path(path).is_dir():
                 add(FindingSeverity.ERROR, "missing_data_path", f"{name}: {role} directory {path} does not exist")

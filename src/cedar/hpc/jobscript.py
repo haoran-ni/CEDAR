@@ -4,7 +4,9 @@ The examiner knows Slurm's directive syntax and nothing about any site. A script
 commands are accepted only if each matches a command line of the approved profile's job
 template (after shell variables are expanded on both sides), with the template's
 placeholders standing for numbers or the configured values. Exactly one command must be
-the template's launch of the configured binary. Anything else needs user review.
+the template's launch of the configured binary, or of one of the code's other builds. Anything
+else needs user review. A code with its own template in the profile is examined against that
+one.
 
 A local script, for a run on the interactive node CEDAR runs on, is the same template
 without its ``#SBATCH`` lines, and one ``#CEDAR --ntasks=N --time=T`` line that states what
@@ -71,11 +73,12 @@ LOCAL_PARTITION = "local"
 
 
 def render_local_script(profile: ComputeProfile, code: CodeInstallation, *, ntasks: int, walltime_minutes: int,
-                        output_file: str) -> str:
-    """The approved job template without its Slurm directives, for a run on this interactive node."""
-    text = fill_template(profile.job_template, {
+                        output_file: str, binary: str | None = None) -> str:
+    """The approved job template without its Slurm directives, for a run on this interactive node; ``binary`` is
+    one of the code's builds, ``code.binary`` by default."""
+    text = fill_template(profile.template_for(code), {
         "job_name": "cedar", "partition": LOCAL_PARTITION, "nodes": 1, "ntasks": ntasks,
-        "walltime": format_walltime(walltime_minutes), "binary": code.binary, "output": output_file,
+        "walltime": format_walltime(walltime_minutes), "binary": binary or code.binary, "output": output_file,
     })
     lines = [line for line in text.splitlines() if not line.strip().startswith("#SBATCH")]
     lines.insert(1, f"{LOCAL_DIRECTIVE} --ntasks={ntasks} --time={format_walltime(walltime_minutes)}")
@@ -83,11 +86,11 @@ def render_local_script(profile: ComputeProfile, code: CodeInstallation, *, ntas
 
 
 def render_job_script(profile: ComputeProfile, code: CodeInstallation, resources: JobResources,
-                      *, job_name: str, output_file: str) -> str:
-    text = fill_template(profile.job_template, {
+                      *, job_name: str, output_file: str, binary: str | None = None) -> str:
+    text = fill_template(profile.template_for(code), {
         "job_name": job_name, "partition": resources.partition, "nodes": resources.nodes,
         "ntasks": resources.ntasks, "walltime": format_walltime(resources.walltime_minutes),
-        "binary": code.binary, "output": output_file,
+        "binary": binary or code.binary, "output": output_file,
     })
     return text if text.endswith("\n") else text + "\n"
 
@@ -96,6 +99,8 @@ def render_job_script(profile: ComputeProfile, code: CodeInstallation, resources
 class ScriptExamination:
     findings: tuple[Finding, ...]
     resources: JobResources | None
+    binary: str | None = None
+    """The build the script launches, if it launches one as the template does."""
 
 
 def _expand(value: str, variables: dict[str, str]) -> str | None:
@@ -151,8 +156,9 @@ def _split(text: str) -> _Commands:
 
 
 def _template_patterns(profile: ComputeProfile, code: CodeInstallation, output_file: str) -> list[tuple[re.Pattern, bool]]:
-    """Each template command as a regex; the flag marks the launch line."""
-    marked = fill_template(profile.job_template, {name: f"\x00{name}\x00" for name in template_fields(profile.job_template)})
+    """Each template command as a regex; the flag marks the launch line, whose ``binary`` group is the build."""
+    template = profile.template_for(code)
+    marked = fill_template(template, {name: f"\x00{name}\x00" for name in template_fields(template)})
     patterns = []
     for _, command in _split(marked).commands:
         pieces = re.split(r"\x00(\w+)\x00", command)
@@ -161,7 +167,7 @@ def _template_patterns(profile: ComputeProfile, code: CodeInstallation, output_f
             if i % 2 == 0:
                 regex += re.escape(piece)
             elif piece == "binary":
-                regex += re.escape(code.binary)
+                regex += "(?P<binary>" + "|".join(map(re.escape, code.binaries)) + ")"
             elif piece == "output":
                 regex += re.escape(output_file)
             else:
@@ -197,9 +203,9 @@ def _directive_options(text: str) -> list[tuple[str, str | None]] | None:
     return options
 
 
-def _template_directive_names(profile: ComputeProfile) -> set[str]:
+def _template_directive_names(template: str) -> set[str]:
     names = set()
-    for _, line in _split(profile.job_template).directives:
+    for _, line in _split(template).directives:
         for name, _ in _directive_options(line[len("#SBATCH"):]) or []:
             names.add(name)
     return names
@@ -216,16 +222,13 @@ def examine_job_script(text: str, profile: ComputeProfile, code: CodeInstallatio
         add(_R, "no_examiner", f"no job-script examiner for scheduler {profile.scheduler}")
         return ScriptExamination(tuple(findings), None)
     lines = text.splitlines()
-    if not lines or not lines[0].startswith("#!"):
-        add(_E, "missing_shebang", "the first line must be a shebang such as #!/bin/bash", 1)
-    if lines and profile.job_template.splitlines()[0].strip() != lines[0].strip():
-        add(_R, "different_shell", f"uses {lines[0].strip()}, not the profile's {profile.job_template.splitlines()[0]}", 1)
+    _examine_shell(lines, profile.template_for(code), add)
 
     script = _split(text)
     for number, line in script.unresolved:
         add(_R, "unresolved_line", f"cannot resolve shell variables in: {line}", number)
 
-    allowed_names = _SLURM_RESOURCE_OPTIONS | _template_directive_names(profile)
+    allowed_names = _SLURM_RESOURCE_OPTIONS | _template_directive_names(profile.template_for(code))
     directives: dict[str, str | None] = {}
     for number, line in script.directives:
         if not line:
@@ -243,27 +246,35 @@ def examine_job_script(text: str, profile: ComputeProfile, code: CodeInstallatio
     launches = _examine_commands(script, profile, code, output_file, add)
     resources = _resources(directives, profile, add)
     if resources is not None:
-        for number, ntasks in launches:
+        for number, ntasks, _ in launches:
             if ntasks is not None and ntasks > resources.ntasks:
                 add(_E, "oversubscribed", f"launches {ntasks} tasks but requests {resources.ntasks}", number)
     for name in ("output", "error"):
         value = directives.get(name)
         if value is not None and not _PLAIN_FILE.match(value):
             add(_R, "output_path", f"--{name}={value} writes outside the run directory")
-    return ScriptExamination(tuple(findings), resources)
+    return ScriptExamination(tuple(findings), resources, launches[0][2] if launches else None)
+
+
+def _examine_shell(lines: list[str], template: str, add) -> None:
+    if not lines or not lines[0].startswith("#!"):
+        add(_E, "missing_shebang", "the first line must be a shebang such as #!/bin/bash", 1)
+    if lines and template.splitlines()[0].strip() != lines[0].strip():
+        add(_R, "different_shell", f"uses {lines[0].strip()}, not the profile's {template.splitlines()[0]}", 1)
 
 
 def _examine_commands(script: _Commands, profile: ComputeProfile, code: CodeInstallation, output_file: str,
-                      add) -> list[tuple[int, int | None]]:
-    """Every command must be one of the template's; returns the launches, with the task count each starts."""
+                      add) -> list[tuple[int, int | None, str]]:
+    """Every command must be one of the template's; returns the launches, with the task count each starts and the
+    build it launches."""
     patterns = _template_patterns(profile, code, output_file)
-    launches: list[tuple[int, int | None]] = []
+    launches: list[tuple[int, int | None, str]] = []
     for number, command in script.commands:
         for pattern, is_launch in patterns:
             if m := pattern.fullmatch(command):
                 if is_launch:
                     ntasks = m.groupdict().get("ntasks")
-                    launches.append((number, int(ntasks) if ntasks else None))
+                    launches.append((number, int(ntasks) if ntasks else None, m.group("binary")))
                 break
         else:
             add(_R, "unapproved_command", f"not a command of the approved job template: {command}", number)
@@ -298,10 +309,7 @@ def examine_local_script(text: str, profile: ComputeProfile, code: CodeInstallat
         findings.append(Finding(severity=severity, code=code_, message=message, file=file, line=line))
 
     lines = text.splitlines()
-    if not lines or not lines[0].startswith("#!"):
-        add(_E, "missing_shebang", "the first line must be a shebang such as #!/bin/bash", 1)
-    if lines and profile.job_template.splitlines()[0].strip() != lines[0].strip():
-        add(_R, "different_shell", f"uses {lines[0].strip()}, not the profile's {profile.job_template.splitlines()[0]}", 1)
+    _examine_shell(lines, profile.template_for(code), add)
     script = _split(text)
     for number, line in script.unresolved:
         add(_R, "unresolved_line", f"cannot resolve shell variables in: {line}", number)
@@ -315,10 +323,10 @@ def examine_local_script(text: str, profile: ComputeProfile, code: CodeInstallat
                                       f"'{LOCAL_DIRECTIVE} --ntasks=8 --time=01:00:00'")
     launches = _examine_commands(script, profile, code, output_file, add)
     if resources is not None:
-        for number, ntasks in launches:
+        for number, ntasks, _ in launches:
             if ntasks is not None and ntasks > resources.ntasks:
                 add(_E, "oversubscribed", f"launches {ntasks} tasks but states {resources.ntasks}", number)
-    return ScriptExamination(tuple(findings), resources)
+    return ScriptExamination(tuple(findings), resources, launches[0][2] if launches else None)
 
 
 def _resources(directives: dict[str, str | None], profile: ComputeProfile, add) -> JobResources | None:

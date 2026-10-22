@@ -104,7 +104,7 @@ def test_full_cycle(world, agent, tmp_path):
     assert result.outcome == "waiting"
     assert "CEDAR does not check them against the files" in latest_tool_text(model.calls[1])
     reply_text = latest_tool_text(model.calls[2])
-    assert "The input reviewer, an agent, now checks that FHI-aims will run these inputs" in reply_text
+    assert "The input reviewer, an agent, now checks that the code will run these inputs" in reply_text
     assert "CEDAR asks the researcher to approve the run. Do not ask them yourself." in reply_text
     state = world.state()
     (cid,) = state.hypotheses[world.hyp].calculation_ids

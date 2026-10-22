@@ -48,7 +48,7 @@ def calculation_summary(state: InvestigationState, calc: CalculationRecord, *, f
         settings = ", ".join(f"{name} {canonical_json(value)}" for name, value in
                              {**calc.task.controls, **calc.task.numerical_settings}.items())
         lines = [f"{calc.calculation_id}: registered run from {registration.source} ({owner}; computed outside "
-                 f"CEDAR, FHI-aims {registration.code_version})",
+                 f"CEDAR, {registration.code} {registration.code_version})",
                  f"  {registration.description}", f"  settings its inputs used: {settings or 'none recorded'}"]
     else:
         head = f"{calc.calculation_id}: {calc.state.value}"

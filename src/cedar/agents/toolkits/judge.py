@@ -69,10 +69,11 @@ def _analysis_lines(run, artifacts: ArtifactStore | None) -> list[str]:
 
 
 def input_differences(calcs, varied) -> tuple[list[str], list[str], list[str]]:
-    """Keywords the examined control.in files set differently that the comparison does not vary, by what the input
-    reviewer classified them as: uncontrolled (the physical model, or unclassified), numerical (accuracy settings,
-    which need a convergence justification) and convergence aids or output only. A keyword a task declares is left
-    to the comparison of declarations when every examination made sure the files set what their tasks declare."""
+    """Settings the examined inputs (control.in keywords; INCAR tags, KPOINTS, POTCAR) make differently that the
+    comparison does not vary, by what the input reviewer classified them as: uncontrolled (the physical model, or
+    unclassified), numerical (accuracy settings, which need a convergence justification) and convergence aids or
+    output only. A keyword a task declares is left to the comparison of declarations when every examination made sure
+    the files set what their tasks declare."""
     examined = [c for c in calcs if c.examination is not None and c.examination.settings and not c.registered]
     if len(examined) < 2:
         return [], [], []
@@ -127,15 +128,15 @@ def judge_tools(ctx: JudgeContext) -> list[AgentTool]:
                 registration = calc.registration
                 lines.append(f"  registered run from {registration.source}, "
                              + ("shared with every agent" if calc.shared else f"for {registration.hypothesis_id}")
-                             + f": computed outside CEDAR (FHI-aims {registration.code_version}), its inputs not "
-                             f"examined before it ran, its outputs there before any prediction; "
+                             + f": computed outside CEDAR ({registration.code} {registration.code_version}), its "
+                             f"inputs not examined before it ran, its outputs there before any prediction; "
                              f"{registration.description}")
             lines.append(f"  interventions {task.interventions}; controls {task.controls}; numerical "
                          f"{task.numerical_settings}")
             exam = calc.examination
             if exam is not None and not calc.registered:
                 if exam.settings:
-                    lines.append("  control.in actually sets: " + "; ".join(f"{k} {v}".strip()
+                    lines.append("  its inputs actually set: " + "; ".join(f"{k} {v}".strip()
                                                                           for k, v in exam.settings.items()))
                 directory = run_directory(calc, ctx.runs_root)
                 if directory:
@@ -191,10 +192,10 @@ def judge_tools(ctx: JudgeContext) -> list[AgentTool]:
         lines = [f"Controlled comparison: {'yes' if report.is_controlled and not uncontrolled else 'NO'}"]
         lines += [f"  {d.variable} ({d.category}, {d.kind.value}): {list(d.values)}" for d in report.differences]
         if uncontrolled:
-            lines.append("  Set differently in control.in, and not varied by the comparison (uncontrolled):")
+            lines.append("  Set differently in the inputs, and not varied by the comparison (uncontrolled):")
             lines += uncontrolled
         if numerical:
-            lines.append("  Accuracy settings set differently in control.in, as the input reviewer classified them:")
+            lines.append("  Accuracy settings set differently in the inputs, as the input reviewer classified them:")
             lines += numerical
         if aids:
             lines.append("  Differ only in how a result is reached or what is printed, as the input reviewer "

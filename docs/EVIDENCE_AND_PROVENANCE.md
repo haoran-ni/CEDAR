@@ -58,7 +58,8 @@ Payloads cover the whole research process:
 | Agents | `agents_proposed` (by the Chief Scientist: per hypothesis a role and a first task), `agents_started` (by the researcher's command or after the review window; the agents are numbered A1, A2, ... in this order), `proposal_withdrawn`, `agent_retired`, `agent_task_queued` (work for an agent, the Judge, the input reviewer (naming the calculations it reviews), or a Chief Scientist review; a continuation names the task whose run was cut off), `agent_run_recorded` (model, tokens, web searches and fetches, what it cost at the model's prices, outcome, the event its briefing showed, and the report: a hypothesis agent's structured report, its final message, or, when the run ended without one, CEDAR's account of what it did, built from the record) |
 
 Events are never updated or deleted; database triggers refuse both. A correction is a new
-event.
+event. `cedar reset` and `cedar purge` delete the whole log, with everything else in the
+data directory; nothing deletes part of it.
 
 ## Evidence objects
 

@@ -2,8 +2,9 @@
 
 Implemented: ``auth`` (API keys), ``models`` (which model each agent role uses), ``setup``
 (the environment-setup agent), ``profile`` (review and approve compute profiles), ``start``
-(talk with the Chief Scientist), ``investigations`` and ``dispatch`` (the process that
-submits authorized work, follows jobs and runs agents between conversations).
+(talk with the Chief Scientist), ``investigations``, ``dispatch`` (the process that
+submits authorized work, follows jobs and runs agents between conversations), ``reset``
+(delete every investigation) and ``purge`` (delete everything CEDAR stored).
 """
 
 import argparse
@@ -368,6 +369,92 @@ def _dispatch(args) -> int:
     return 0
 
 
+def _reset(args) -> int:
+    return _clean(args, "reset")
+
+
+def _purge(args) -> int:
+    return _clean(args, "purge")
+
+
+def _clean(args, command: str) -> int:
+    """Delete what ``cedar reset`` or ``cedar purge`` deletes, once nothing runs on and the researcher confirms."""
+    from cedar.cleanup import Cleanup
+    from cedar.hpc.local import LocalBackend
+    from cedar.hpc.slurm import SlurmBackend
+    from cedar.protocols.fhiaims_run import current_host
+
+    cleanup = Cleanup(data_dir(), config_dir(), setup=command == "purge", runs=args.runs, slurm=SlurmBackend(),
+                      local=lambda root: LocalBackend(root, host=current_host))
+    if not cleanup.targets():
+        print(f"Nothing to delete: CEDAR has stored nothing that `cedar {command}` deletes.")
+        return 0
+    busy = cleanup.dispatcher()
+    if busy:
+        print(f"Nothing deleted: {busy}", file=sys.stderr)
+        return 1
+    jobs, unknown = cleanup.live()
+    if jobs and not (args.cancel_jobs or args.leave_jobs):
+        print("Nothing deleted: these calculations have not ended:\n" + "".join(f"  {j}\n" for j in jobs)
+              + f"Wait until they end, or cancel them first with `cedar {command} --cancel-jobs`.", file=sys.stderr)
+        return 1
+    if unknown and not args.leave_jobs:
+        print("Nothing deleted: CEDAR cannot tell whether these calculations still run:\n"
+              + "".join(f"  {u}\n" for u in unknown)
+              + f"Check them yourself (`squeue -u $USER`); once they have ended, or to leave them running with no "
+                f"record of them, run `cedar {command} --leave-jobs`.", file=sys.stderr)
+        return 1
+
+    print(f"`cedar {command}` deletes:\n" + "".join(f"  {line}\n" for line in cleanup.describe()), end="")
+    if jobs and args.cancel_jobs:
+        print("First it cancels:\n" + "".join(f"  {j}\n" for j in jobs), end="")
+    if (jobs or unknown) and args.leave_jobs:
+        print("It leaves these to run on, with nothing recording them:\n"
+              + "".join(f"  {j}\n" for j in [*jobs, *unknown]), end="")
+    kept = cleanup.kept()
+    if kept:
+        print("It keeps:\n" + "".join(f"  {line}\n" for line in kept), end="")
+    print("Close any `cedar start` chat first. This cannot be undone.", flush=True)
+    if not args.yes:
+        if not sys.stdin.isatty():
+            print(f"No terminal to confirm in; nothing deleted. Run `cedar {command} --yes` to go ahead.",
+                  file=sys.stderr)
+            return 1
+        if input(f"Type {command} to go ahead: ").strip() != command:
+            print("Nothing deleted.")
+            return 1
+
+    if jobs and args.cancel_jobs:
+        failed = cleanup.cancel(jobs)
+        if failed:
+            print("Nothing deleted: these could not be cancelled:\n" + "".join(f"  {f}\n" for f in failed)
+                  + f"Cancel them where they run, then run `cedar {command}` again.", file=sys.stderr)
+            return 1
+        still, unknown = cleanup.wait()
+        if still or unknown:
+            print("Nothing deleted: asked to stop, these have not ended yet:\n"
+                  + "".join(f"  {s}\n" for s in [*still, *unknown])
+                  + f"Run `cedar {command} --cancel-jobs` again once they have.", file=sys.stderr)
+            return 1
+        print(f"Cancelled {len(jobs)} calculation{'s' if len(jobs) != 1 else ''}.")
+    busy = cleanup.dispatcher()  # a chat may have started one meanwhile
+    if busy:
+        print(f"Nothing deleted: {busy}", file=sys.stderr)
+        return 1
+    problems = cleanup.delete()
+    for problem in problems:
+        print(f"Could not delete {problem}", file=sys.stderr)
+    for place in cleanup.left_over():
+        print(f"Kept {place}: CEDAR did not write those.")
+    if command == "purge":
+        for variable in cleanup.environment_keys():
+            print(f"{variable} is still set in your environment, where CEDAR cannot remove it: unset it, and remove "
+                  "it from your shell's startup files if it is set there.")
+    print(("Deleted what could be deleted." if problems else "Deleted.")
+          + (" To remove CEDAR itself: pip uninstall cedar" if command == "purge" else ""))
+    return 1 if problems else 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="cedar", description="CEDAR: Autonomous Scientific Agent Swarm for Computation-Experiment Discrepancies (pre-alpha).")
     parser.add_argument("--version", action="version", version=f"cedar {__version__}")
@@ -430,6 +517,19 @@ def main(argv: list[str] | None = None) -> int:
     dispatch.add_argument("--stop", action="store_true",
                           help="stop the dispatcher running on this data directory, after its agent runs finish")
     dispatch.set_defaults(handler=_dispatch)
+    for name, handler, summary in (
+            ("reset", _reset, "delete every investigation and its history; keep the setup (profiles, models, keys)"),
+            ("purge", _purge, "delete everything CEDAR stored: every investigation, the setup and the API keys")):
+        clean = commands.add_parser(name, help=summary)
+        clean.add_argument("--runs", action="store_true",
+                           help="also delete the run directories, with the calculations' inputs and outputs")
+        jobs = clean.add_mutually_exclusive_group()
+        jobs.add_argument("--cancel-jobs", action="store_true",
+                          help="cancel calculations that have not ended, and wait for them, before deleting")
+        jobs.add_argument("--leave-jobs", action="store_true",
+                          help="delete even if calculations may still run; nothing records them afterwards")
+        clean.add_argument("--yes", action="store_true", help="do not ask for confirmation")
+        clean.set_defaults(handler=handler)
 
     args = parser.parse_args(argv)
     if not hasattr(args, "handler"):

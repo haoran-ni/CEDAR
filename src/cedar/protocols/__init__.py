@@ -5,10 +5,11 @@ from cedar.protocols.fhiaims_run import (
     TOTAL_ENERGY,
     ZERO_BROADENING_ENERGY,
     FhiAimsRun,
+    FhiAimsRunJobChecked,
     FhiAimsRunReviewed,
     FhiAimsRunSlurmOnly,
 )
 
-__all__ = ["FhiAimsRun", "FhiAimsRunReviewed", "FhiAimsRunSlurmOnly", "Protocol",
+__all__ = ["FhiAimsRun", "FhiAimsRunJobChecked", "FhiAimsRunReviewed", "FhiAimsRunSlurmOnly", "Protocol",
            "ProtocolRegistry", "Reading", "RunReport",
            "TOTAL_ENERGY", "ZERO_BROADENING_ENERGY"]

@@ -177,7 +177,7 @@ def test_conversation_live_panel_and_approval(system):
         assert "Requested the PBE baseline; waiting for it." in conversation(app)
 
         await send(pilot, f"/approve submit {short_id(calc)}")
-        assert f"Submission of {calc} authorized" in conversation(app)
+        assert "Approved 1 calculation to run" in conversation(app) and calc in conversation(app)
         await refresh(pilot)
         assert panel(app)[0][2] == f"{short_id(calc)} authorized, not yet submitted"
         assert "waiting for you" not in status(app)
@@ -389,10 +389,9 @@ def test_a_slash_at_the_start_of_a_line_lists_the_matching_commands(system):
         composer.value = "/a"
         await settle(pilot)
         assert shown() == ["/agents", "/approve agents", "/approve submit <calc>", "/approve submit all",
-                           "/approve submit <agent>", "/approve inputs <calc>", "/approve inputs all",
-                           "/approve inputs <agent>", "/approve close", "/attach <path> <note>"]
+                           "/approve submit <agent>", "/approve close", "/attach <path> <note>"]
         await pilot.press("up")  # the arrows wrap around the menu
-        assert app.query_one("#commands", OptionList).highlighted == 9
+        assert app.query_one("#commands", OptionList).highlighted == 6
         await pilot.press("down", "down", "down", "tab")
         submits = ["/approve submit <calc>", "/approve submit all", "/approve submit <agent>"]
         assert composer.value == "/approve submit " and shown() == submits

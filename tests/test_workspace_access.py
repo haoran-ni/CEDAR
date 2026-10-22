@@ -6,7 +6,7 @@ DOUBLE runs nothing.
 
 import pytest
 from factories import AGENT
-from sites import co_on_cu111, declared, geometry_text
+from sites import co_on_cu111, control_text, declared, geometry_text
 from worlds import World
 
 import cedar.agents.toolkits.files as files_module
@@ -149,9 +149,10 @@ def test_a_structure_written_in_the_workspace_can_be_requested(world, tree):
     assert not agent["write_file"].invoke({"path": "atop/geometry.in",
                                            "text": geometry_text(slab, fixed=bottom)}).is_error
     outcome = agent["request_calculation"].invoke({
-        "protocol_name": "fhiaims.run", "protocol_version": "0.3", "observable_name": "total energy",
+        "protocol_name": "fhiaims.run", "protocol_version": "0.4", "observable_name": "total energy",
         "observable_definition": "final total energy", "observable_unit": "eV", "estimand": "E(atop)",
         "system_label": "CO/Cu(111) atop", "structure_path": str(tree["workspace"] / "atop/geometry.in"),
+        "input_files": {"control.in": control_text(world.site, geometry_text(slab, fixed=bottom))},
         "rationale": "baseline", **declared()})
     assert not outcome.is_error, outcome.content
     (calc,) = world.state().calculations.values()

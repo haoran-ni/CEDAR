@@ -16,7 +16,6 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from cedar.contracts.events import RecordedEvent
-from cedar.contracts.examination import ExaminationVerdict
 from cedar.contracts.plan import PermissionAction
 from cedar.contracts.review import ReviewDecision
 from cedar.contracts.status import CalculationState, HypothesisStatus, InvestigationMode
@@ -36,7 +35,7 @@ from cedar.state.projection import (
     awaits_reviewer,
     hypothesis_evidence,
 )
-from cedar.summaries import approval_requests, job_text, short_id
+from cedar.summaries import approval_requests, job_text, needs_inputs_approval, short_id
 from cedar.swarm import FIRST_TASK, WAKE_TASK, minutes_left
 from cedar.web import web_summary
 
@@ -80,15 +79,14 @@ def job_status(state: InvestigationState, calc: CalculationRecord) -> str:
             text = "being examined"
         elif exam.agent_review and awaits_reviewer(state, calc):
             text = "with the input reviewer"
-        elif (exam.agent_review or exam.verdict is ExaminationVerdict.NEEDS_REVIEW) and authorization_for(
-                state, PermissionAction.APPROVE_INPUTS, calc.calculation_id) is None:
+        elif needs_inputs_approval(state, calc):
             warned = calc.input_review is not None and calc.input_review.decision is ReviewDecision.WARNED
-            text = "needs /approve inputs" + (" (the input reviewer warned)" if warned else "")
+            text = "needs /approve submit" + (" (the input reviewer warned)" if warned else "")
         else:
             text = "examined"
     elif calc.state is _C.REJECTED:
-        text = "inputs rejected" + (" by you" if calc.rejected_by_researcher else
-                                    " by the input reviewer" if calc.rejected_by_reviewer else "")
+        text = "inputs rejected " + ("by you" if calc.rejected_by_researcher else
+                                     "by the input reviewer" if calc.rejected_by_reviewer else "by CEDAR's check")
     elif calc.state is _C.VALIDATED_INPUT:
         needs = state.spec.constraints.submit_requires_approval and authorization_for(
             state, PermissionAction.SUBMIT, calc.calculation_id) is None
@@ -330,11 +328,17 @@ def swarm_rows(state: InvestigationState) -> list[SwarmRow]:
         calcs = [state.calculations[c] for c in hyp.calculation_ids]
         qualities = Counter(r.evidence.quality.value for r in hypothesis_evidence(state, hyp.hypothesis_id))
         last = hyp.assessments[-1] if hyp.assessments else None
+        # A rejected request followed by another is a draft its agent has moved past.
+        latest = max((c.requested_at for c in calcs if not c.registered), default=0)
+        replaced = [c for c in calcs if c.state is _C.REJECTED and c.requested_at < latest]
+        jobs = [job_status(state, c) for c in calcs if c not in replaced]
+        if replaced:
+            jobs.append(f"{len(replaced)} rejected request{'s' * (len(replaced) != 1)} replaced")
         rows.append(SwarmRow(
             hypothesis_id=hyp.hypothesis_id,
             lifecycle=hyp.status.value,
             priority=state.plan.priority(hyp.hypothesis_id).value,
-            jobs="; ".join(job_status(state, c) for c in calcs) or "none",
+            jobs="; ".join(jobs) or "none",
             evidence=", ".join(f"{n} {quality}" for quality, n in qualities.items()) or "none",
             assessment=f"{last.assessment.value} ({last.completeness.value.lower()})" if last else "NOT_TESTED",
         ))

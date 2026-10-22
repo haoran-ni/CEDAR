@@ -1,5 +1,5 @@
-"""The researcher's say over examined inputs: approving those needing review in bulk, rejecting inputs with a reason
-that reaches the agent, and seeing where the files are.
+"""The researcher's say over examined inputs: approving calculations to run, those needing a look included, one by one
+or in bulk; rejecting inputs with a reason that reaches the agent; and seeing where the files are.
 
 Everything here is SYNTHETIC: the models are scripted (TEST DOUBLES), the scheduler is the FakeScheduler TEST
 DOUBLE, and every directory is under the test's temporary directory.
@@ -62,10 +62,12 @@ def test_pending_names_calculations_briefly_and_says_where_their_inputs_are(syst
     calc = needs_review(world, baseline, "some_new_keyword")
     pending = chat.handle("/pending")
     runs = Path(system["site"].runs_root)
-    assert (f"/approve inputs {short_id(calc)}  (A1 agent-hyp-xc on hyp-xc; needs review: some_new_keyword is not "
-            "known to fhiaims.run 0.1; its effect cannot be verified (control.in:") in pending
-    assert f"; files in {runs / world.inv / calc})" in pending
-    assert f"/approve submit {short_id(baseline)}  (" in pending
+    assert (f"/approve submit {short_id(calc)}  (A1 agent-hyp-xc on hyp-xc; CO/Cu(111) atop (synthetic): total energy "
+            "of CO/Cu(111) atop; through Slurm") in pending
+    assert ("core-hours; needs review: some_new_keyword is not known to fhiaims.run 0.1; its effect cannot be verified "
+            "(control.in:") in pending
+    assert f"in the run directory {runs / world.inv / calc})" in pending
+    assert f"/approve submit {short_id(baseline)}  (" in pending and "/approve inputs" not in pending
     assert f"in the run directory {runs / world.inv / baseline})" in pending
     assert "Refuse any of these calculations with /reject inputs <calc> <reason>" in pending
     assert (runs / world.inv / calc / "control.in").read_text().count("some_new_keyword 1") == 1
@@ -77,37 +79,41 @@ def test_short_ids_grow_until_they_tell_calculations_apart():
     assert short_id(first, [first, second]) == "1eea8563dd" and short_id(second, [first, second]) == "1eea8563de"
 
 
-def test_approving_all_inputs_takes_only_those_the_researcher_was_shown(world, chat, baseline):
+def test_one_approval_lets_a_calculation_run_and_in_bulk_takes_only_inputs_the_researcher_was_shown(
+        world, chat, baseline):
     first, second = needs_review(world, baseline, "keyword_one"), needs_review(world, baseline, "keyword_two")
-    assert sum("[waiting for you] /approve inputs" in n.text for n in chat.notices()) == 2
+    assert sum("[waiting for you] /approve submit" in n.text for n in chat.notices()) == 3  # the baseline too
     late = needs_review(world, baseline, "keyword_three")  # arrives after the researcher looked
 
-    answer = chat.handle("/approve inputs all")
-    assert answer.startswith("Inputs of 2 calculations approved (msg-1). They still need /approve submit to run:")
-    assert first in answer and second in answer and "keyword_one is not known" in answer
+    answer = chat.handle("/approve submit all")
+    assert answer.startswith("Approved 3 calculations to run (msg-1). The dispatcher submits them on its next tick:")
+    assert baseline in answer and first in answer and second in answer and "keyword_one is not known" in answer
     assert answer.endswith(f"Not approved, because you have not been shown them yet: {late}. /pending shows them.")
     state = world.state()
     assert [state.calculations[c].state for c in (first, second, late)] == [
         CalculationState.VALIDATED_INPUT, CalculationState.VALIDATED_INPUT, CalculationState.SPECIFIED]
-    (authorization,) = state.interventions["msg-1"].authorizations
-    assert authorization.action is PermissionAction.APPROVE_INPUTS and authorization.target_ids == (first, second)
+    inputs, submission = state.interventions["msg-1"].authorizations
+    assert inputs.action is PermissionAction.APPROVE_INPUTS and inputs.target_ids == (first, second)
+    assert submission.action is PermissionAction.SUBMIT and submission.target_ids == (baseline, first, second)
 
-    assert chat.handle("/approve inputs all") == (f"Not approved, because you have not been shown them yet: {late}. "
+    assert chat.handle("/approve submit all") == (f"Not approved, because you have not been shown them yet: {late}. "
                                                   "/pending shows them.")
-    assert f"/approve inputs {short_id(late)}" in chat.handle("/pending")
-    assert chat.handle("/approve input all").startswith("Inputs of 1 calculation approved (msg-2).")
-    assert chat.handle("/approve inputs all") == "No inputs wait for your review."
+    assert f"/approve submit {short_id(late)}" in chat.handle("/pending")
+    assert chat.handle("/approve submit all").startswith("Approved 1 calculation to run (msg-2).")
+    assert chat.handle("/approve submit all") == "No calculation waits for your approval to run."
+    assert chat.handle("/approve inputs all").startswith("A calculation's inputs and its submission are approved "
+                                                         "together")
 
 
 def test_approving_one_agents_inputs_leaves_the_others(world, chat, baseline):
     other = add_hypothesis(world.ledger, world.inv, "hyp-b")
     mine, theirs = needs_review(world, baseline, "keyword_one"), needs_review(world, baseline, "keyword_two", other)
     chat.handle("/pending")
-    answer = chat.handle("/approve inputs A2")
-    assert answer.startswith("Inputs of 1 calculation of A2 agent-hyp-b approved") and theirs in answer
+    answer = chat.handle("/approve submit A2")
+    assert answer.startswith("Approved 1 calculation of A2 agent-hyp-b to run") and theirs in answer
     assert world.calc(theirs).state is CalculationState.VALIDATED_INPUT
     assert world.calc(mine).state is CalculationState.SPECIFIED
-    assert chat.handle("/approve inputs A2") == "No inputs of A2 agent-hyp-b wait for your review."
+    assert chat.handle("/approve submit A2") == "No calculation of A2 agent-hyp-b waits for your approval to run."
 
 
 def test_a_rejection_reaches_the_agent_with_the_researchers_reason(system, world, chat, baseline):
@@ -121,7 +127,7 @@ def test_a_rejection_reaches_the_agent_with_the_researchers_reason(system, world
     assert (rejected.end_reason, rejected.ended_by) == ("don't add keywords the examiner can't check", "msg-1")
     (authorization,) = world.state().interventions["msg-1"].authorizations
     assert authorization.action is PermissionAction.REJECT_INPUTS and authorization.target_ids == (calc,)
-    assert "/approve inputs" not in chat.handle("/pending")
+    assert f"/approve submit {short_id(calc)}" not in chat.handle("/pending")
 
     assert system["dispatcher"]._wake(world.inv) == [f"woke the agent for {world.hyp}"]
     (task,) = world.state().pending_tasks

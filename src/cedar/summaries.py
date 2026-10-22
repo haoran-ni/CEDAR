@@ -176,7 +176,8 @@ def task_owner(task) -> str:
 
 
 def awaiting_submission(state: InvestigationState) -> list[str]:
-    """Calculations whose examined inputs wait for the researcher's authorization to be submitted."""
+    """Calculations whose inputs passed examination and review and wait for the researcher's authorization to be
+    submitted."""
     if not state.spec.constraints.submit_requires_approval:
         return []
     return [c.calculation_id for c in state.calculations.values() if c.state is CalculationState.VALIDATED_INPUT
@@ -191,18 +192,28 @@ def requested_by(state: InvestigationState, calc: CalculationRecord) -> str:
     return f"{agent.tag} {agent.agent_id} on {hypothesis_id}" if agent else (hypothesis_id or "no hypothesis")
 
 
+def needs_inputs_approval(state: InvestigationState, calc: CalculationRecord) -> bool:
+    """Whether a calculation's inputs wait for the researcher to look at them, now that the input reviewer has
+    finished: the examiner could not verify part of the job script, or the input reviewer warned, could not send them
+    back again, or reached no decision."""
+    exam = calc.examination
+    if (calc.state is not CalculationState.SPECIFIED or exam is None or exam.verdict is ExaminationVerdict.REJECTED
+            or authorization_for(state, PermissionAction.APPROVE_INPUTS, calc.calculation_id) is not None):
+        return False
+    return not awaits_reviewer(state, calc) if exam.agent_review else exam.verdict is ExaminationVerdict.NEEDS_REVIEW
+
+
 def awaiting_review(state: InvestigationState) -> list[str]:
-    """Calculations whose inputs wait for the researcher's review: the examiner could not verify part of them, or
-    the input reviewer warned, could not send them back again, or reached no decision."""
-    found = []
-    for c in state.calculations.values():
-        exam = c.examination
-        if (c.state is not CalculationState.SPECIFIED or exam is None or exam.verdict is ExaminationVerdict.REJECTED
-                or authorization_for(state, PermissionAction.APPROVE_INPUTS, c.calculation_id) is not None):
-            continue
-        if not awaits_reviewer(state, c) if exam.agent_review else exam.verdict is ExaminationVerdict.NEEDS_REVIEW:
-            found.append(c.calculation_id)
-    return found
+    """Calculations whose inputs wait for the researcher to look at them; approving one to run approves its inputs
+    too."""
+    return [c.calculation_id for c in state.calculations.values() if needs_inputs_approval(state, c)]
+
+
+def awaiting_researcher(state: InvestigationState) -> list[str]:
+    """Calculations that run once the researcher approves them, the last step before they run: their inputs passed
+    examination and the input reviewer has finished. In the order they were requested."""
+    ready = set(awaiting_review(state)) | set(awaiting_submission(state))
+    return [c for c in state.calculations if c in ready]
 
 
 def run_directory(calc: CalculationRecord, runs_root: str | Path | None = None) -> str | None:
@@ -212,11 +223,11 @@ def run_directory(calc: CalculationRecord, runs_root: str | Path | None = None) 
     return str(Path(runs_root) / calc.workdir) if runs_root is not None else calc.workdir
 
 
-def review_note(state: InvestigationState, calc: CalculationRecord, runs_root: str | Path | None = None) -> str:
-    """What the researcher needs to review inputs: who asks, what the input reviewer found, what the examiner could
-    not verify and where, and where the files are."""
+def review_note(state: InvestigationState, calc: CalculationRecord) -> str:
+    """What the researcher should look at in inputs waiting for them: what the input reviewer found, or that it
+    reached no decision, and what the examiner could not verify in the job script, and where."""
     exam = calc.examination
-    parts = [requested_by(state, calc)]
+    parts = []
     review = calc.input_review
     if exam.agent_review and review is None:
         parts.append(f"the input reviewer reached no decision in {review_attempts(state, calc.calculation_id)} "
@@ -231,12 +242,12 @@ def review_note(state: InvestigationState, calc: CalculationRecord, runs_root: s
     reasons = "; ".join(f"{f.message}{_place(f)}" for f in exam.findings if f.severity is FindingSeverity.REVIEW)
     if reasons:
         parts.append(f"needs review: {reasons}")
-    directory = run_directory(calc, runs_root)
-    return "; ".join(parts) + (f"; files in {directory}" if directory else "")
+    return "; ".join(parts)
 
 
 def submission_note(state: InvestigationState, calc: CalculationRecord, runs_root: str | Path | None = None) -> str:
-    """What the researcher needs to decide on a submission: who asks, for what, where it runs and what it costs."""
+    """What the researcher needs to decide whether a calculation runs: who asks, for what, where it runs and what it
+    costs, what to look at in its inputs if anything, and where they are."""
     exam = calc.examination
     directory = run_directory(calc, runs_root)
     where = ("locally, on the interactive node" if calc.task.execution == "local"
@@ -245,8 +256,9 @@ def submission_note(state: InvestigationState, calc: CalculationRecord, runs_roo
             if exam.requested_tasks and exam.requested_minutes and exam.requested_core_hours is not None
             else "size not known")
     warnings = [f.code for f in exam.findings if f.severity is FindingSeverity.WARNING]
+    look = review_note(state, calc) if needs_inputs_approval(state, calc) else ""
     parts = [requested_by(state, calc), f"{calc.task.system_label}: {calc.task.estimand}", where, size,
-             f"warnings: {', '.join(warnings)}" if warnings else "no warnings",
+             look or (f"warnings: {', '.join(warnings)}" if warnings else "no warnings"),
              f"examined inputs ({', '.join(sorted(exam.files))}) in the run directory {directory}"
              if directory else f"examined inputs: {', '.join(sorted(exam.files))}"]
     return "; ".join(parts)
@@ -254,20 +266,18 @@ def submission_note(state: InvestigationState, calc: CalculationRecord, runs_roo
 
 def approval_requests(state: InvestigationState, runs_root: str | Path | None = None) -> list[tuple[str, str]]:
     """What waits for the researcher: the command that grants it, naming a calculation by the short form of its
-    id, and what it concerns, with run directories under ``runs_root`` if given. In full automation, what the
-    approver may still decide is not the researcher's to wait on."""
+    id, and what it concerns, with run directories under ``runs_root`` if given. A calculation is asked about once,
+    when the input reviewer has finished with it. In full automation, what the approver may still decide is not the
+    researcher's to wait on."""
     needs = []
     for_approver = {d.target_id for d in pending_decisions(state)}
     proposal = state.pending_proposal
     if proposal is not None and proposal.proposal_id not in for_approver:
         needs.append(("/approve agents", proposal_note(state, proposal)))
-    review, submission = set(awaiting_review(state)), set(awaiting_submission(state))
-    for calc in state.calculations.values():
-        short = short_id(calc.calculation_id, state.calculations)
-        if calc.calculation_id in review:
-            needs.append((f"/approve inputs {short}", review_note(state, calc, runs_root)))
-        if calc.calculation_id in submission and calc.calculation_id not in for_approver:
-            needs.append((f"/approve submit {short}", submission_note(state, calc, runs_root)))
+    for calculation_id in awaiting_researcher(state):
+        if calculation_id not in for_approver:
+            needs.append((f"/approve submit {short_id(calculation_id, state.calculations)}",
+                          submission_note(state, state.calculations[calculation_id], runs_root)))
     closing = state.pending_closing
     if closing is not None:
         needs.append(("/approve close", f"the Chief Scientist proposes closing the investigation as "

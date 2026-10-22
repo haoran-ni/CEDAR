@@ -1,4 +1,4 @@
-"""One FHI-aims run of one structure, at fixed geometry or relaxing it (``fhiaims.run`` 0.2, and 0.1).
+"""One FHI-aims run of one structure, at fixed geometry or relaxing it (``fhiaims.run`` 0.4, and 0.3 to 0.1).
 
 The protocol examines the inputs before the run and checks the run's health after it. What
 to take from a healthy run is declared by the agent, who reads it from the outputs or
@@ -18,6 +18,9 @@ of a Slurm job script, ``local.sh``, the approved job template without its Slurm
 whose task count and time limit must fit the researcher's allocation here. On a login node a
 local run is refused. Version 0.1 runs through Slurm only; it stays for the calculations
 recorded under it.
+
+Versions 0.3 and 0.4 leave what the keywords mean to the input reviewer, an agent: see
+``FhiAimsRunReviewed`` and ``FhiAimsRunJobChecked``.
 """
 
 import math
@@ -166,7 +169,9 @@ class FhiAimsRun(Protocol):
     execution_files = ("job.sh", "local.sh")
     output_files = ("aims.out",)
     runs_locally = True
-    superseded_by = "0.3"
+    superseded_by = "0.4"
+    generates_control = True
+    """Whether a missing control.in is written from the declared keywords; from 0.4 on the agent writes it."""
 
     def __init__(self, profile: ComputeProfile, host: Callable[[], ExecutionHost] | None = None) -> None:
         """``host`` says where CEDAR runs, which bounds a local run."""
@@ -309,7 +314,7 @@ class FhiAimsRun(Protocol):
     def generate(self, task: ScientificTaskSpec, present: Mapping[str, bytes]) -> tuple[dict[str, bytes], list[Finding]]:
         generated: dict[str, bytes] = {}
         findings: list[Finding] = []
-        if "control.in" not in present and "geometry.in" in present:
+        if self.generates_control and "control.in" not in present and "geometry.in" in present:
             values, problems = self.resolve(task)
             if SPECIES_DEFAULTS not in values and not any(f.severity is _E for f in problems):
                 findings.append(Finding(severity=_E, code="missing_variable", file="control.in",
@@ -413,6 +418,12 @@ class FhiAimsRun(Protocol):
             findings += self._examine_geometry(geometry, values)
         if "control.in" in files and geometry is not None and not any(f.severity is _E for f in problems):
             findings += self._examine_control(files["control.in"].decode(errors="replace"), values, geometry)
+        return findings + self._examine_scripts(task, files)
+
+    def _examine_scripts(self, task: ScientificTaskSpec, files: Mapping[str, bytes]) -> list[Finding]:
+        """The job script against the approved template, its resources against the budget and, for a local run,
+        the allocation."""
+        findings: list[Finding] = []
         if "job.sh" in files:
             script = examine_job_script(files["job.sh"].decode(errors="replace"), self._profile, self._code,
                                         output_file="aims.out")
@@ -673,7 +684,9 @@ class FhiAimsRunReviewed(FhiAimsRun):
 
     ref = ProtocolRef(name="fhiaims.run", version="0.3")
     reviewed_by_agent = True
-    superseded_by = None
+    superseded_by = "0.4"
+    limitation = REVIEWED_LIMITATION
+    """What a run's evidence must say about how its inputs were checked."""
 
     def describe(self) -> str:
         root = self._species_root
@@ -807,7 +820,103 @@ class FhiAimsRunReviewed(FhiAimsRun):
         scheduler = QualityCheck(name="scheduler_completed", passed=scheduler_state is SchedulerState.COMPLETED,
                                  detail=f"scheduler state {scheduler_state}")
         return output_report(raw, relax=relax, method=method, checks=(scheduler,),
-                             expected_version=self.code_version, limitations=(RUN_LIMITATION, REVIEWED_LIMITATION))
+                             expected_version=self.code_version, limitations=(RUN_LIMITATION, self.limitation))
+
+
+JOB_CHECKED_LIMITATION = (
+    "Its inputs were checked deterministically only for what runs on the machine (the job script against the approved "
+    "template, its resources and the task's budget). Whether FHI-aims runs them as the task describes was judged by "
+    "the input reviewer, an agent, or by the researcher, not verified by rules; the settings the task declares are "
+    "its own description, and what control.in sets is recorded from the file.")
+
+
+class FhiAimsRunJobChecked(FhiAimsRunReviewed):
+    """``fhiaims.run`` 0.4: nothing about the DFT settings is enforced by rules; the input reviewer checks the inputs.
+
+    The examination checks only what runs on the machine: that the files are there, the job script against the
+    approved template, its resources, the budget and, for a local run, the allocation. A fixed list of rules cannot
+    know a code's inputs and raises false alarms, so the task's declared settings are the agent's own description of
+    the calculation, in whatever terms suit it, and are not compared with control.in. What control.in sets, the
+    structure and which species defaults the blocks equal are recorded as facts for the input reviewer, which checks
+    that FHI-aims will run the files as the task describes and that nothing in them is harmful. The agent writes
+    control.in itself; only the job script is generated.
+    """
+
+    ref = ProtocolRef(name="fhiaims.run", version="0.4")
+    superseded_by = None
+    generates_control = False
+    checks_declarations = False
+    limitation = JOB_CHECKED_LIMITATION
+
+    def describe(self) -> str:
+        root = self._species_root
+        levels = sorted(d.name for d in root.iterdir() if d.is_dir()) if root and root.is_dir() else []
+        return "\n".join([
+            Protocol.describe(self),
+            f"Code: FHI-aims {self.code_version}",
+            "Write control.in and geometry.in yourself, for example by copying the researcher's files and changing "
+            "what your test changes. Only the job script is generated, from the researcher's approved template, if "
+            "you do not write it.",
+            "Declare what the calculation is, in whatever terms describe it: what you vary as interventions, physical "
+            "conditions you hold fixed as controls, accuracy settings as numerical_settings, e.g. {\"dispersion\": "
+            "\"MBD-NL\"}, {\"adsorption_site\": \"top\", \"n_layers\": 4}, {\"k_grid\": [4, 4, 1]}. These describe "
+            "the calculation for the record, the input reviewer and the comparisons; CEDAR does not check them "
+            "against the files, and records what control.in actually sets from the file.",
+            f"{SPECIES_DEFAULTS} levels available on this system: {', '.join(levels) or 'none found'}",
+            "The input reviewer, an agent, checks that FHI-aims will run your files as you describe and that nothing "
+            "in them is harmful; your scientific choices are yours. If it finds a problem, you are woken with its "
+            "reasons. Then the researcher approves the run, the last step before it starts.",
+            "The job script is checked against the researcher's approved template, its limits and your budget.",
+            *self._where(),
+        ])
+
+    def resolve(self, task: ScientificTaskSpec) -> tuple[dict[str, object], list[Finding]]:
+        """Every declared variable as declared; none is refused, since none is written into control.in."""
+        return {**task.interventions, **task.controls, **task.numerical_settings}, []
+
+    def examine(self, task: ScientificTaskSpec, files: Mapping[str, bytes]) -> list[Finding]:
+        findings: list[Finding] = self._examine_where() if task.execution == "local" else []
+        for name in ("control.in", "geometry.in", self._script(task)):
+            if name not in files:
+                findings.append(Finding(severity=_E, code="missing_file", file=name, message=f"{name} is missing"
+                                        + ("; write it, this protocol generates only the job script"
+                                           if name == "control.in" else "")))
+        if "geometry.in" in files:
+            geometry = parse_geometry(files["geometry.in"].decode(errors="replace"))
+            findings += self._structure_facts(geometry)
+            if "control.in" in files and not geometry.malformed_lines:
+                findings += self._species_facts(parse_control(files["control.in"].decode(errors="replace")), geometry)
+        return findings + self._examine_scripts(task, files)
+
+    def _structure_facts(self, geometry: Geometry) -> list[Finding]:
+        """What the structure is, and what CEDAR's reader could not read, as facts: FHI-aims is the judge of its
+        own input."""
+        f = "geometry.in"
+        unread = [Finding(severity=_I, code="geometry_unread", file=f, line=line or None,
+                          message=f"CEDAR's reader cannot read this line: {text}")
+                  for line, text in geometry.malformed_lines]
+        if unread:
+            return unread
+        if not geometry.atoms:
+            return [Finding(severity=_I, code="structure", file=f, message="CEDAR's reader finds no atoms")]
+        return super()._examine_geometry(geometry, {})
+
+    def _species_facts(self, control: ControlFile, geometry: Geometry) -> list[Finding]:
+        """Which species-defaults level each element's block equals, or that it has none."""
+        notes: list[Finding] = []
+        levels = _species_levels(control, geometry, self._species_root, notes)
+        facts = [Finding(severity=_I, code=n.code, file=n.file, line=n.line, message=n.message) for n in notes]
+        if isinstance(levels, str):
+            facts.append(Finding(severity=_I, code="species_level", file="control.in",
+                                 message=f"every species block equals the {levels} species defaults"))
+        else:
+            facts.append(Finding(severity=_I, code="species_level", file="control.in",
+                                 message="species blocks: " + ", ".join(f"{element} {level}"
+                                                                         for element, level in levels.items())))
+        facts += [Finding(severity=_I, code="unused_species", file="control.in", line=block.line,
+                          message=f"species {block.species} does not occur in the structure")
+                  for block in control.species if block.species not in geometry.elements]
+        return facts
 
 
 # -- runs computed outside CEDAR ----------------------------------------------------------

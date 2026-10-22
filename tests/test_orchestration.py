@@ -10,7 +10,7 @@ import sys
 from datetime import datetime, timedelta, timezone
 
 import pytest
-from sites import aims_output, co_on_cu111, declared, geometry_text
+from sites import aims_output, co_on_cu111, control_text, declared, geometry_text
 
 from cedar.agents.toolkits.chief import ChiefContext, chief_tools
 from cedar.chat import CHIEF, ChatSession
@@ -153,10 +153,11 @@ def agent_requests(system):
     workspace = system["workspace"]
     return [
         reply(call("set_hypothesis_status", status="PLANNING_TEST", reason="baseline first"),
-              call("request_calculation", protocol_name="fhiaims.run", protocol_version="0.3",
+              call("request_calculation", protocol_name="fhiaims.run", protocol_version="0.4",
                    observable_name="total energy", observable_definition="final total energy printed by FHI-aims",
                    observable_unit="eV", estimand="total energy of CO/Cu(111) atop",
                    system_label="CO/Cu(111) atop (synthetic)", structure_text=geometry_text(slab, fixed=bottom),
+                   input_files={"control.in": control_text(system["site"], geometry_text(slab, fixed=bottom))},
                    rationale="baseline", **declared())),
         lambda c: reply(call("register_prediction", prediction_id="pred-1", statement="converges",
                              observable_name="total energy", observable_definition="final energy",
@@ -260,8 +261,8 @@ def test_full_loop(system):
     assert any(f"agent-{HYP} ({ROLE})" in n and "Requested the PBE baseline" in n for n in notices)
     assert any(f"/approve submit {short_id(calc)}  (" in n for n in notices)
 
-    # The researcher authorizes; the dispatcher submits; the job finishes.
-    assert "authorized" in chat.handle(f"/approve submit {calc}")
+    # The researcher approves the run, the last step; the dispatcher submits; the job finishes.
+    assert chat.handle(f"/approve submit {calc}").startswith("Approved 1 calculation to run (msg-3).")
     output = aims_output(energy=ENERGY)
     scheduler.on_submit = lambda job, workdir: (workdir / "aims.out").write_text(output)
     assert any(f"submitted {calc}" in n for n in dispatcher.tick())
@@ -544,7 +545,13 @@ def test_calculations_can_be_named_by_a_unique_start_of_their_id(system):
     dispatcher.tick()
     calc = latest_calc(workspace)
     assert chat.handle(f"/approve submit {calc[5:8]}") == f"No calculation {calc[5:8]} in this investigation."
-    assert "authorized" in chat.handle(f"/approve submit {calc[:12]}")
+    # Approving a run is the last step before it runs: not while the input reviewer still checks it.
+    assert chat.handle(f"/approve submit {calc[:12]}").startswith(
+        f"The input reviewer is still checking the inputs of {calc}; you are asked to approve it once it has finished")
+    assert "msg-3" not in workspace.ledger.load(INV).interventions
+    clients.add("input_reviewer", *reviewer_decides(system))
+    dispatcher.tick()
+    assert chat.handle(f"/approve submit {calc[:12]}").startswith("Approved 1 calculation to run (msg-3).")
     assert workspace.ledger.load(INV).interventions["msg-3"].authorizations[0].target_ids == (calc,)
 
 

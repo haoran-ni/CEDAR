@@ -464,11 +464,10 @@ def test_pending_shows_what_a_submission_costs_and_approvals_go_by_agent_or_all(
     assert f"examined inputs (control.in, geometry.in, job.sh) in the run directory {directory}" in pending
 
     answer = chat.handle("/approve submit A2")
-    assert answer.startswith("Submission of 1 calculation of A2 agent-hyp-b authorized") and theirs in answer
-    assert chat.handle("/approve submit A2") == "No calculation of A2 agent-hyp-b waits for your authorization to " \
-                                                "be submitted."
+    assert answer.startswith("Approved 1 calculation of A2 agent-hyp-b to run") and theirs in answer
+    assert chat.handle("/approve submit A2") == "No calculation of A2 agent-hyp-b waits for your approval to run."
     answer = chat.handle("/approve submit all")
-    assert answer.startswith("Submission of 2 calculations authorized") and mine in answer and another in answer
+    assert answer.startswith("Approved 2 calculations to run") and mine in answer and another in answer
     assert "/approve submit" not in chat.handle("/pending")
 
 

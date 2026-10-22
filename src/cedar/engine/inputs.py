@@ -86,6 +86,7 @@ class ProtocolEngine:
         examination = InputExamination(protocol=protocol.ref, code_version=protocol.code_version, files=refs,
                                        execution_files=execution, input_hash=input_hash, findings=tuple(findings),
                                        verdict=verdict, agent_review=protocol.reviewed_by_agent,
+                                       declarations_checked=protocol.checks_declarations,
                                        settings=protocol.input_settings(files),
                                        **_requested(protocol.requested_resources(files)))
         workdir = f"{investigation_id}/{calculation_id}"

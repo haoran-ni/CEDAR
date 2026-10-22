@@ -1,10 +1,12 @@
-"""Tools of the input reviewer: judge the scientific content of a calculation's inputs before they can run.
+"""Tools of the input reviewer: check, before a calculation can run, that the code will run its inputs as the
+calculation the task describes, and that nothing in them is harmful.
 
-Deterministic checks have already covered what runs on the machine (the job script, its resources, the budget) and
-that control.in sets what the task declares. The reviewer reads the files, the installed code's manual and source and
-the code's documentation on the web, and decides: the inputs are fine (the researcher still authorizes submission),
-the researcher should look at them first, or they go back to the agent with the reviewer's reasons. Claims about what
-a keyword does cite their source; quotes from local files are checked. Its verdicts are its own, never evidence.
+Deterministic checks have already covered what runs on the machine (the job script, its resources, the budget). The
+reviewer reads the files, with the installed code's manual and source and the code's documentation on the web where
+it is unsure, and decides: the inputs are fine (the researcher then approves the run), the researcher should look at
+something first, or they go back to the agent with the reviewer's reasons. The scientific choices in them are the
+agent's and the researcher's, not the reviewer's. Claims about what a keyword does cite their source; quotes from
+local files are checked. Its verdicts are its own, never evidence.
 """
 
 import re
@@ -38,7 +40,6 @@ from cedar.state.projection import (
     awaits_reviewer,
     escalated,
     reviewer_rejections,
-    same_request,
 )
 from cedar.store.artifacts import ArtifactStore
 from cedar.summaries import rejection_reason, requested_by, run_directory
@@ -77,14 +78,18 @@ class SourceArgs(Contract):
 
 
 class FindingArgs(Contract):
-    severity: ReviewSeverity = Field(description="note: worth knowing; warning: the researcher should look before "
-                                                 "it runs; problem: the inputs must change.")
+    severity: ReviewSeverity = Field(description="note: worth knowing, including any view on the scientific "
+                                                 "choices; warning: something the run depends on that you could not "
+                                                 "verify, for the researcher to look at; problem: FHI-aims would "
+                                                 "stop, the run would not be the calculation described, or something "
+                                                 "is harmful.")
     text: NonEmptyStr = Field(description="What you found and why it matters for this calculation.")
     file: FileName | None = Field(default=None, description="The input file it concerns, e.g. control.in.")
     line: int | None = Field(default=None, ge=1, description="The line of that file.")
     keyword: str | None = Field(default=None, description="The keyword it concerns, if any.")
     sources: list[SourceArgs] = Field(default_factory=list, description="The documentation it rests on. Cite a "
-                                      "source for every claim about what a keyword does or which values it takes.")
+                                      "source for every warning or problem about what a keyword does or which "
+                                      "values it takes.")
 
 
 class ReviewArgs(Contract):
@@ -148,22 +153,18 @@ def _file_text(ctx: ReviewerContext, calc: CalculationRecord, name: str) -> str:
 
 
 def review_material(ctx: ReviewerContext, state: InvestigationState, calc: CalculationRecord) -> str:
-    """Everything the reviewer needs to judge one calculation's inputs."""
+    """Everything the reviewer needs to check one calculation's inputs."""
     task, exam = calc.task, calc.examination
+    declared = ("checked against control.in by the examination" if exam.declarations_checked
+                else "in the agent's own terms, not checked against the files")
     lines = [f"Calculation {calc.calculation_id}, requested by {requested_by(state, calc)}",
              f"  protocol {task.protocol.name} {task.protocol.version}; runs "
              + ("locally on the interactive node" if task.execution == "local" else "through Slurm"),
              f"  observable: {task.observable.name} ({task.observable.definition})"
              + (f" [{task.observable.unit}]" if task.observable.unit else ""),
              f"  estimand: {task.estimand}; system: {task.system_label}",
-             f"  declared interventions {task.interventions}; controls {task.controls}; numerical settings "
-             f"{task.numerical_settings}"]
-    for hypothesis_id in calc.hypothesis_ids:
-        hyp = state.hypotheses[hypothesis_id]
-        lines.append(f"  for hypothesis {hypothesis_id}: {hyp.spec.statement}")
-    lines += [f"  predicted by {r.hypothesis_id} ({r.prediction_id}): {r.prediction.expected_outcome}; falsified if "
-              f"{r.prediction.falsified_if}" for r in state.predictions.values()
-              if calc.calculation_id in r.prediction.calculation_ids]
+             f"  declared ({declared}): interventions {task.interventions}; controls {task.controls}; numerical "
+             f"settings {task.numerical_settings}"]
     directory = run_directory(calc, ctx.profile.runs_root if ctx.profile else None)
     lines.append(f"  files in {directory}" if directory else "  no run directory")
     lines.append("What the deterministic examination recorded (errors would have rejected the inputs already; "
@@ -181,26 +182,9 @@ def review_material(ctx: ReviewerContext, state: InvestigationState, calc: Calcu
                      + ("you cannot send this one back: if you find a problem, the researcher decides" if
                         escalated(state, calc) else "check that your reasons were addressed") + "):")
         lines += [f"  {c}: {state.calculations[c].end_reason}" for c in earlier]
-    siblings = [c for c in state.calculations.values() if c.calculation_id != calc.calculation_id
-                and c.examination is not None and not c.registered and set(c.hypothesis_ids) & set(calc.hypothesis_ids)
-                and c.state is not CalculationState.REJECTED]
-    if siblings:
-        lines.append("Other calculations of the same hypothesis, which its tests may compare with this one (keywords "
-                     "whose setting differs from this one's):")
-        for other in siblings:
-            keys = sorted(set(other.examination.settings) | set(exam.settings))
-            differ = [f"{k}: {other.examination.settings.get(k, '(absent)')!r} vs {exam.settings.get(k, '(absent)')!r}"
-                      for k in keys if other.examination.settings.get(k) != exam.settings.get(k)]
-            same = " (the same request)" if same_request(other, calc) else ""
-            lines.append(f"  {other.calculation_id}{same}, {other.state.value}: {task_line(other)}; "
-                         + ("; ".join(differ) if differ else "no keyword differs"))
     lines += ["", *installation_lines(ctx.profile), ""]
     lines += [_file_text(ctx, calc, name) for name in sorted(exam.files)]
     return "\n".join(lines)
-
-
-def task_line(calc: CalculationRecord) -> str:
-    return f"{calc.task.system_label}: {calc.task.estimand}"
 
 
 def _normalized(text: str) -> str:
@@ -283,8 +267,7 @@ def reviewer_tools(ctx: ReviewerContext) -> list[AgentTool]:
         checked = (f" {unverified} web source{'s' * (unverified != 1)} could not be checked and are recorded as "
                    "cited." if unverified else "")
         if outcome == ["approved"]:
-            return (f"Recorded {review.review_id}: approved; the inputs wait for the researcher to authorize "
-                    "submission." + checked)
+            return f"Recorded {review.review_id}: approved; the researcher is asked to approve the run." + checked
         if outcome == ["rejected"]:
             return f"Recorded {review.review_id}: rejected; the agent is woken with your reasons." + checked
         why = ("you sent back the most revisions of this request you may" if args.decision is ReviewDecision.REJECTED
@@ -293,13 +276,12 @@ def reviewer_tools(ctx: ReviewerContext) -> list[AgentTool]:
         return f"Recorded {review.review_id}: the researcher decides, since {why}." + checked
 
     return [
-        AgentTool("inputs_to_review", "The inputs your task reviews: what each calculation is for, the deterministic "
-                  "examination's facts, earlier rejected revisions, the hypothesis's other calculations, where the "
-                  "installed code's manual and source are, and the files, numbered by line.", NoArgs,
-                  inputs_to_review),
+        AgentTool("inputs_to_review", "The inputs your task reviews: what each calculation is, the deterministic "
+                  "examination's facts, earlier rejected revisions, where the installed code's manual and source "
+                  "are, and the files, numbered by line.", NoArgs, inputs_to_review),
         AgentTool("record_input_review", "Record your verdict on one calculation's inputs, with every finding and its "
-                  "sources, and what every keyword control.in sets does. Approved inputs wait for the researcher to "
-                  "authorize submission; warned ones for the researcher to look at; rejected ones go back to the "
-                  "agent with your reasons.", ReviewArgs, record),
+                  "sources, and what every keyword control.in sets does. The researcher is then asked to approve the "
+                  "run, with your warnings shown; rejected inputs go back to the agent with your reasons.",
+                  ReviewArgs, record),
     ]
 

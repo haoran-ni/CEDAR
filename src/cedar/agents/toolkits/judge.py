@@ -68,24 +68,31 @@ def _analysis_lines(run, artifacts: ArtifactStore | None) -> list[str]:
     return lines
 
 
-def input_differences(calcs, varied) -> tuple[list[str], list[str]]:
-    """Keywords the examined control.in files set differently that no task declares and the comparison does not
-    vary: those the input reviewer classified as convergence aids or output only, and the rest, which are
-    uncontrolled."""
+def input_differences(calcs, varied) -> tuple[list[str], list[str], list[str]]:
+    """Keywords the examined control.in files set differently that the comparison does not vary, by what the input
+    reviewer classified them as: uncontrolled (the physical model, or unclassified), numerical (accuracy settings,
+    which need a convergence justification) and convergence aids or output only. A keyword a task declares is left
+    to the comparison of declarations when every examination made sure the files set what their tasks declare."""
     examined = [c for c in calcs if c.examination is not None and c.examination.settings and not c.registered]
     if len(examined) < 2:
-        return [], []
-    declared = {name for c in calcs for name in (*c.task.interventions, *c.task.controls, *c.task.numerical_settings)}
+        return [], [], []
+    declared = ({name for c in calcs for name in (*c.task.interventions, *c.task.controls, *c.task.numerical_settings)}
+                if all(c.examination.declarations_checked for c in examined) else set())
     names = sorted(set().union(*(c.examination.settings for c in examined)) - declared - set(varied))
-    uncontrolled, aids = [], []
+    uncontrolled, numerical, aids = [], [], []
     for name in names:
         values = [c.examination.settings.get(name, "(absent)") for c in examined]
         if len(set(values)) == 1:
             continue
         roles = {c.input_review.settings.get(name) for c in examined if c.input_review is not None} - {None}
         line = f"    {name}: {values}" + (f" ({', '.join(sorted(roles))})" if roles else "")
-        (aids if roles and roles <= {"convergence_aid", "output"} else uncontrolled).append(line)
-    return uncontrolled, aids
+        if roles and roles <= {"convergence_aid", "output"}:
+            aids.append(line)
+        elif roles and roles <= {"numerical", "convergence_aid", "output"}:
+            numerical.append(line)
+        else:
+            uncontrolled.append(line)
+    return uncontrolled, numerical, aids
 
 
 def judge_tools(ctx: JudgeContext) -> list[AgentTool]:
@@ -180,17 +187,20 @@ def judge_tools(ctx: JudgeContext) -> list[AgentTool]:
             raise ToolFailure(f"unknown calculations: {missing}")
         calcs = [state.calculations[c] for c in args.calculation_ids]
         report = compare_tasks([c.task for c in calcs], args.varied)
-        uncontrolled, aids = input_differences(calcs, args.varied)
+        uncontrolled, numerical, aids = input_differences(calcs, args.varied)
         lines = [f"Controlled comparison: {'yes' if report.is_controlled and not uncontrolled else 'NO'}"]
         lines += [f"  {d.variable} ({d.category}, {d.kind.value}): {list(d.values)}" for d in report.differences]
         if uncontrolled:
-            lines.append("  Set differently in control.in, and declared by no task nor as varied (uncontrolled):")
+            lines.append("  Set differently in control.in, and not varied by the comparison (uncontrolled):")
             lines += uncontrolled
+        if numerical:
+            lines.append("  Accuracy settings set differently in control.in, as the input reviewer classified them:")
+            lines += numerical
         if aids:
             lines.append("  Differ only in how a result is reached or what is printed, as the input reviewer "
                          "classified them:")
             lines += aids
-        if report.needs_numerical_justification:
+        if report.needs_numerical_justification or numerical:
             lines.append("  Numerical settings differ: the comparison needs evidence that the target quantity is "
                          "converged with respect to them.")
         if report.unused_declarations:

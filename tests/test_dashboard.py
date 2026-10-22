@@ -109,11 +109,11 @@ def test_job_status_follows_the_calculation_and_the_scheduler(ledger):
 
     b = new(xc="PBE0")
     examine(ledger, inv, b, ExaminationVerdict.NEEDS_REVIEW)
-    assert status(b) == "needs /approve inputs"
+    assert status(b) == "needs /approve submit"  # one approval covers its inputs and its submission
     c = new(xc="HSE06")
     examine(ledger, inv, c, ExaminationVerdict.REJECTED)
     move(ledger, inv, c, ENGINE, CalculationState.REJECTED, reason="bad inputs")
-    assert status(c) == "inputs rejected"
+    assert status(c) == "inputs rejected by CEDAR's check"
 
 
 def test_rows_keep_jobs_evidence_and_assessment_apart(ledger):
@@ -133,6 +133,19 @@ def test_rows_keep_jobs_evidence_and_assessment_apart(ledger):
     assert row.evidence == "1 VALIDATED, 1 INVALID"
     assert row.assessment == "NOT_TESTED"
     assert work_summary(state) == "1 hypothesis · jobs: none active · evidence: 1 VALIDATED, 1 INVALID"
+
+
+def test_rejected_requests_their_agent_has_replaced_leave_the_panel(ledger):
+    inv = start_investigation(ledger)
+    hyp = add_hypothesis(ledger, inv)
+    first = ledger.request_calculation(inv, AGENT, hyp, task(), "test").calculation_id
+    examine(ledger, inv, first, ExaminationVerdict.REJECTED)
+    move(ledger, inv, first, ENGINE, CalculationState.REJECTED, reason="the job script asks for too many tasks")
+    (row,) = swarm_rows(ledger.load(inv))
+    assert row.jobs == f"{short_id(first)} inputs rejected by CEDAR's check"
+    again = ledger.request_calculation(inv, AGENT, hyp, task(xc="PBE0"), "test").calculation_id
+    (row,) = swarm_rows(ledger.load(inv))
+    assert row.jobs == f"{short_id(again)} being examined; 1 rejected request replaced"
 
 
 def test_the_agents_table_shows_every_agent_and_what_it_is_doing(workspace):

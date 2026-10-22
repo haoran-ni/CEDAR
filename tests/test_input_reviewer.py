@@ -1,5 +1,6 @@
-"""The input reviewer: an agent judges the scientific content of inputs under fhiaims.run 0.3, while deterministic
-checks keep to what runs on the machine and to the task's own declarations.
+"""The input reviewer: an agent checks that FHI-aims will run the inputs as the calculation the task describes, and
+that nothing in them is harmful. Under fhiaims.run 0.4 deterministic checks keep to what runs on the machine; under
+0.3, kept for the calculations recorded under it, they also held the files to the task's declarations.
 
 Everything here is SYNTHETIC: the models are scripted (TEST DOUBLES), the scheduler is the FakeScheduler TEST
 DOUBLE, and every directory is under the test's temporary directory.
@@ -7,6 +8,7 @@ DOUBLE, and every directory is under the test's temporary directory.
 
 import pytest
 from factories import AGENT, ENGINE, MANAGER, add_hypothesis, agent_for, authorize, draft, move
+from sites import control_text
 from test_orchestration import make_system
 from test_teamwork import record_run
 from worlds import World
@@ -17,14 +19,18 @@ from cedar.contracts import (
     Actor,
     ActorKind,
     AgentTaskQueued,
+    Prediction,
+    PredictionRegistered,
     CalculationState,
     ExaminationVerdict,
     InputReviewRecorded,
     PermissionAction,
+    ResourceBudget,
     ReviewDecision,
 )
 from cedar.dispatch import needs_dispatcher
 from cedar.errors import RuleViolation
+from cedar.protocols import TOTAL_ENERGY
 from cedar.state.projection import MAX_REVIEW_ATTEMPTS, MAX_REVIEW_REJECTIONS
 from cedar.summaries import awaiting_review, short_id
 
@@ -50,10 +56,18 @@ def chat(system, world):
                        backend=system["scheduler"], clock=system["clock"])
 
 
-def examined(world, hypothesis="hyp-xc", **task):
-    """A calculation requested under fhiaims.run 0.3 and examined."""
-    cid = world.ledger.request_calculation(world.inv, agent_for(hypothesis), hypothesis,
-                                           world.task(version="0.3", **task), "test").calculation_id
+def examined(world, hypothesis="hyp-xc", version="0.4", geometry: bytes | None = None, budget=None, **task):
+    """A calculation requested under fhiaims.run ``version`` and examined; under 0.4 with a control.in that sets
+    what the task declares, unless the task gives one. ``geometry`` replaces the structure, ``budget`` the budget."""
+    authored = dict(task.pop("authored", None) or {})
+    structure = world.structure if geometry is None else world.artifacts.put_bytes(geometry, label="geometry.in")
+    if version == "0.4" and "control.in" not in authored:
+        groups = {k: task[k] for k in ("interventions", "controls", "numerical") if k in task}
+        text = control_text(world.site, world.artifacts.read(structure).decode(), **groups)
+        authored["control.in"] = world.artifacts.put_bytes(text.encode(), label="control.in")
+    spec = world.task(version=version, authored=authored, **task).model_copy(
+        update={"structure": structure} | ({"budget": budget} if budget is not None else {}))
+    cid = world.ledger.request_calculation(world.inv, agent_for(hypothesis), hypothesis, spec, "test").calculation_id
     world.engine.examine(world.inv, cid)
     return cid
 
@@ -73,12 +87,70 @@ def with_control(world, text: bytes, **task) -> str:
     return examined(world, authored={"control.in": world.artifacts.put_bytes(text, label="control.in")}, **task)
 
 
-# -- the examination under 0.3 -----------------------------------------------------------------
+# -- the examination under 0.4 ----------------------------------------------------------------------
+
+
+def test_nothing_about_the_dft_settings_is_enforced(world):
+    """Declarations in the agent's own terms, settings they do not mention and keywords no list knows: none of it
+    is held against the files, which go to the input reviewer."""
+    geometry = world.artifacts.read(world.structure).decode()
+    control = control_text(world.site, geometry, interventions={"xc": "pbe0"}).encode().replace(
+        b"\nspin", b"\nKS_method parallel\ncompute_forces .true.\nsome_new_keyword 1\nspin", 1)
+    cid = with_control(world, control, interventions={"adsorption_site": "top (x, y fixed)", "xc": "pbe"},
+                       numerical={"KS_method": "parallel", "compute_forces": True, "n_layers": 4})
+    calc = world.calc(cid)
+    exam = calc.examination
+    assert exam.verdict is ExaminationVerdict.APPROVED and exam.agent_review and not exam.declarations_checked
+    assert calc.state is CalculationState.SPECIFIED and awaiting_review(world.state()) == []  # for the reviewer
+    assert {f.severity.value for f in exam.findings} <= {"info", "warning"}
+    assert exam.settings["xc"] == "pbe0" and exam.settings["ks_method"] == "parallel"
+    assert exam.settings["some_new_keyword"] == "1"
+
+
+def test_the_agent_writes_control_in_and_only_the_job_script_is_generated(world):
+    cid = world.ledger.request_calculation(world.inv, AGENT, world.hyp, world.task(version="0.4"), "test").calculation_id
+    world.engine.examine(world.inv, cid)
+    calc = world.calc(cid)
+    assert calc.state is CalculationState.REJECTED and calc.rejected_by is None
+    assert calc.end_reason == "control.in is missing; write it, this protocol generates only the job script"
+    written = world.calc(examined(world))
+    assert sorted(written.examination.files) == ["control.in", "geometry.in", "job.sh"]
+    assert [f.file for f in written.examination.findings if f.code == "generated"] == ["job.sh"]
+
+
+def test_the_job_script_is_still_checked_deterministically(world):
+    script = generated(world, "job.sh") + b"echo unexpected\n"
+    calc = world.calc(examined(world, authored={"job.sh": world.artifacts.put_bytes(script, label="job.sh")}))
+    assert calc.examination.verdict is ExaminationVerdict.NEEDS_REVIEW
+    assert "unapproved_command" in {f.code for f in calc.examination.findings}
+    over = world.calc(examined(world, numerical={"k_grid": [5, 5, 1]}, budget=ResourceBudget(max_core_hours=0.01),
+                               authored={"job.sh": world.artifacts.put_bytes(generated(world, "job.sh"),
+                                                                             label="job.sh")}))
+    assert over.state is CalculationState.REJECTED and "core-hours requested; the task allows" in over.end_reason
+
+
+def test_the_structure_and_species_blocks_are_facts_for_the_reviewer(world):
+    calc = world.calc(examined(world))
+    facts = {f.code: f for f in calc.examination.findings}
+    assert facts["species_level"].message == "every species block equals the light species defaults"
+    assert "shortest interatomic distance" in facts["structure"].message
+    changed = world.calc(with_control(world, generated(world) + b"    cut_pot 4.0 2.0 1.0\n",
+                                      numerical={"k_grid": [5, 5, 1]}))
+    facts = {f.code: f for f in changed.examination.findings}
+    assert facts["species_not_a_default"].severity.value == "info" and "sha256:" in facts["species_level"].message
+    odd = world.calc(examined(world, numerical={"k_grid": [6, 6, 1]},
+                              geometry=world.artifacts.read(world.structure) + b"atom 1.0 two 3.0 Cu\n"))
+    unread = [f for f in odd.examination.findings if f.code == "geometry_unread"]
+    assert unread and unread[0].severity.value == "info"  # FHI-aims is the judge of its own input
+    assert odd.examination.verdict is ExaminationVerdict.APPROVED
+
+
+# -- the examination under 0.3, kept for the calculations recorded under it ---------------------
 
 
 def test_keywords_no_list_knows_go_to_the_reviewer_as_facts_not_to_the_researcher(world):
     control = generated(world).replace(b"\nspin", b"\nd3\noverride_kgrid_checks .true.\nspin", 1)
-    cid = with_control(world, control)
+    cid = with_control(world, control, version="0.3")
     calc = world.calc(cid)
     exam = calc.examination
     assert exam.verdict is ExaminationVerdict.APPROVED and exam.agent_review
@@ -91,16 +163,17 @@ def test_keywords_no_list_knows_go_to_the_reviewer_as_facts_not_to_the_researche
 
 
 def test_any_keyword_can_be_declared_and_must_then_be_set_as_declared(world):
-    cid = examined(world, controls={"d3": True})
+    cid = examined(world, version="0.3", controls={"d3": True})
     assert world.calc(cid).examination.settings["d3"] == ""  # generated into control.in
     contradicting = generated(world).replace(b"xc pbe", b"xc pbe0", 1)
-    calc = world.calc(with_control(world, contradicting, numerical={"k_grid": [3, 3, 1]}))
+    calc = world.calc(with_control(world, contradicting, version="0.3", numerical={"k_grid": [3, 3, 1]}))
     assert calc.state is CalculationState.REJECTED
     assert "contradicts_task" in {f.code for f in calc.examination.findings}
 
 
 def test_facts_about_species_and_structure_are_recorded_for_the_reviewer(world):
-    calc = world.calc(with_control(world, generated(world) + b"    cut_pot 4.0 2.0 1.0\n"))  # in the last block
+    calc = world.calc(with_control(world, generated(world) + b"    cut_pot 4.0 2.0 1.0\n",  # in the last block
+                                   version="0.3"))
     codes = {f.code: f for f in calc.examination.findings}
     assert codes["species_differs"].severity.value == "info"
     assert "atoms (" in codes["structure"].message and "shortest interatomic distance" in codes["structure"].message
@@ -110,17 +183,17 @@ def test_facts_about_species_and_structure_are_recorded_for_the_reviewer(world):
 
 def test_the_job_script_and_forbidden_keywords_are_still_checked_deterministically(world):
     script = generated(world, "job.sh") + b"echo unexpected\n"
-    calc = world.calc(examined(world, authored={"job.sh": world.artifacts.put_bytes(script, label="job.sh")},
-                               numerical={"k_grid": [5, 5, 1]}))
+    calc = world.calc(examined(world, version="0.3", numerical={"k_grid": [5, 5, 1]},
+                               authored={"job.sh": world.artifacts.put_bytes(script, label="job.sh")}))
     assert calc.examination.verdict is ExaminationVerdict.NEEDS_REVIEW
     assert "unapproved_command" in {f.code for f in calc.examination.findings}
-    forbidden = with_control(world, generated(world) + b"postprocess_anyway .true.\n", numerical={"k_grid": [6, 6, 1]})
+    forbidden = with_control(world, generated(world) + b"postprocess_anyway .true.\n", version="0.3",
+                             numerical={"k_grid": [6, 6, 1]})
     assert world.calc(forbidden).state is CalculationState.REJECTED
 
 
 def test_new_requests_cannot_use_the_superseded_versions(world):
-    assert world.registry.current_refs()[0].version == "0.3"
-    assert [r.version for r in world.registry.current_refs()] == ["0.3"]
+    assert [r.version for r in world.registry.current_refs()] == ["0.4"]
 
 
 # -- the reviewer's verdicts ------------------------------------------------------------------------
@@ -129,7 +202,7 @@ def test_new_requests_cannot_use_the_superseded_versions(world):
 def test_an_approval_lets_the_inputs_wait_for_the_researchers_authorization(world):
     cid = examined(world)
     outcome = world.review(cid)
-    assert not outcome.is_error and "approved; the inputs wait for the researcher" in outcome.content
+    assert not outcome.is_error and "approved; the researcher is asked to approve the run" in outcome.content
     calc = world.calc(cid)
     assert calc.state is CalculationState.VALIDATED_INPUT
     assert calc.input_review.decision is ReviewDecision.APPROVED
@@ -143,10 +216,12 @@ def test_a_warning_sends_the_inputs_to_the_researcher_with_what_to_look_at(world
                             "file": "control.in", "line": 7, "keyword": "occupation_type"}])
     assert world.calc(cid).state is CalculationState.SPECIFIED and awaiting_review(world.state()) == [cid]
     pending = chat.handle("/pending")
-    assert (f"/approve inputs {short_id(cid)}  (A1 agent-hyp-xc on hyp-xc; input reviewer: input_agent_warned: "
-            "Unusual mixing. warning: Check the smearing width for this metal. (control.in:7)") in pending
-    chat.handle("/approve inputs all")
+    assert f"/approve submit {short_id(cid)}  (A1 agent-hyp-xc on hyp-xc; " in pending
+    assert ("input reviewer: input_agent_warned: Unusual mixing. warning: Check the smearing width for this metal. "
+            "(control.in:7)") in pending
+    chat.handle("/approve submit all")
     assert world.calc(cid).state is CalculationState.VALIDATED_INPUT
+    assert chat.handle("/pending") == "Nothing waits for your approval."  # the one approval let it run
 
 
 def test_a_rejection_goes_back_to_the_agent_with_the_reviewers_reasons(system, world):
@@ -293,17 +368,26 @@ def test_the_dispatcher_queues_one_review_per_hypothesis_once(system, world):
     assert dispatcher._key(world.inv, tasks[0]) != dispatcher._key(world.inv, tasks[1])  # they run side by side
 
 
-def test_the_reviewer_is_shown_the_installation_the_files_and_the_other_calculations(world, tmp_path):
+def test_the_reviewer_is_shown_the_installation_and_the_files_not_the_science_around_them(world, tmp_path):
     first = examined(world)
-    second = with_control(world, generated(world).replace(b"\nspin", b"\nd3\nspin", 1))
+    world.ledger.record(world.inv, [draft(AGENT, PredictionRegistered(
+        prediction_id="pred-1", hypothesis_id=world.hyp, prediction=Prediction(
+            statement="atop is preferred", observable=TOTAL_ENERGY, expected_outcome="lower than fcc",
+            falsified_if="higher than fcc", calculation_ids=(first,))))])
+    second = with_control(world, generated(world).replace(b"\nspin", b"\nd3\nspin", 1),
+                          controls={"dispersion": "D3"})
     material = world.reviewer_material(second)
     assert f"Installed FHI-aims {world.site.codes['fhi-aims'].version}" in material
     line = world.artifacts.read(world.calc(second).examination.files["control.in"]).decode().splitlines().index("d3")
     assert "--- control.in ---" in material and f"{line + 1:>5}  d3\n" in material
-    assert (f"  {first} (the same request), SPECIFIED: CO/Cu(111) atop (synthetic): total energy of CO/Cu(111) "
-            "atop; d3: '(absent)' vs ''") in material
-    assert "[info] undeclared_setting: d3 is set but not declared by the task (control.in:" in material
+    assert "  declared (in the agent's own terms, not checked against the files): " in material
+    assert "'dispersion': 'D3'" in material
     assert "Keywords control.in sets (classify every one of them): " in material
+    # What it checks needs no hypothesis, predictions or other calculations to compare with.
+    assert first not in material and "atop is preferred" not in world.reviewer_material(first)
+    assert "for hypothesis" not in material
+    older = examined(world, version="0.3", numerical={"k_grid": [7, 7, 1]})
+    assert "declared (checked against control.in by the examination)" in world.reviewer_material(older)
 
 
 # -- the Judge compares what the inputs actually set ------------------------------------------------
@@ -329,6 +413,27 @@ def test_an_undeclared_difference_makes_a_comparison_uncontrolled(world):
 
 
 
+def test_comparisons_rest_on_what_the_files_set_when_declarations_are_not_checked(world):
+    geometry = world.artifacts.read(world.structure).decode()
+    coarse = examined(world)
+    fine = with_control(world, control_text(world.site, geometry, numerical={"k_grid": [8, 8, 1]}).encode())
+    assert world.calc(fine).task.numerical_settings["k_grid"] == [4, 4, 1]  # declared as coarse's, set otherwise
+    judge = {t.name: t for t in judge_tools(JudgeContext(ledger=world.ledger, investigation_id=world.inv,
+                                                          actor=Actor(kind=ActorKind.EVIDENCE_JUDGE, id="j")))}
+
+    def compare():
+        return judge["compare_calculations"].invoke({"calculation_ids": [coarse, fine], "varied": []}).content
+
+    assert compare().startswith("Controlled comparison: NO") and "    k_grid: ['4 4 1', '8 8 1']" in compare()
+    for cid in (coarse, fine):
+        world.review(cid, settings={**{k: "physical_model" for k in world.calc(cid).examination.settings},
+                                    "k_grid": "numerical"})
+    text = compare()
+    assert text.startswith("Controlled comparison: yes")
+    assert "Accuracy settings set differently in control.in, as the input reviewer classified them:" in text
+    assert "    k_grid: ['4 4 1', '8 8 1'] (numerical)" in text and "converged with respect to them" in text
+
+
 # -- after the run ----------------------------------------------------------------------------------
 
 
@@ -348,3 +453,4 @@ def test_a_relaxation_the_task_does_not_declare_is_still_checked_for_convergence
     check = world.calc(cid).run_check
     assert {c.name: c.passed for c in check.checks}["geometry_converged"] is False
     assert check.failure_quality is EvidenceQuality.INCONCLUSIVE
+    assert any("the settings the task declares are its own description" in text for text in check.limitations)

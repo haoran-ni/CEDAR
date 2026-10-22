@@ -12,7 +12,14 @@ from cedar.contracts import PermissionAction, ProtocolRef, SchedulerState, Scien
 from cedar.engine import JobManager, JobMonitor, ProtocolEngine, ResultValidator
 from cedar.engine.analysis import AnalysisRunner
 from cedar.hpc.fake import FakeScheduler
-from cedar.protocols import TOTAL_ENERGY, FhiAimsRun, FhiAimsRunReviewed, FhiAimsRunSlurmOnly, ProtocolRegistry
+from cedar.protocols import (
+    TOTAL_ENERGY,
+    FhiAimsRun,
+    FhiAimsRunJobChecked,
+    FhiAimsRunReviewed,
+    FhiAimsRunSlurmOnly,
+    ProtocolRegistry,
+)
 
 
 class World:
@@ -21,7 +28,8 @@ class World:
     def __init__(self, ledger, store, artifacts, site, **constraints):
         self.ledger, self.store, self.artifacts, self.site = ledger, store, artifacts, site
         self.scheduler = FakeScheduler()
-        self.registry = ProtocolRegistry([FhiAimsRunReviewed(site), FhiAimsRun(site), FhiAimsRunSlurmOnly(site)])
+        self.registry = ProtocolRegistry([FhiAimsRunJobChecked(site), FhiAimsRunReviewed(site), FhiAimsRun(site),
+                                          FhiAimsRunSlurmOnly(site)])
         self.runs = Path(site.runs_root)
         self.engine = ProtocolEngine(ledger, self.registry, artifacts, self.runs)
         self.manager = JobManager(ledger, self.scheduler, self.runs)

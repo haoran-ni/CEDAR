@@ -53,6 +53,8 @@ class Protocol(ABC):
     on the machine and records facts for the reviewer."""
     superseded_by: str | None = None
     """The version new requests use instead; this one stays for the calculations recorded under it."""
+    checks_declarations: bool = True
+    """The examination rejects input files that do not set the task's declared settings as declared."""
 
     def input_settings(self, files: Mapping[str, bytes]) -> dict[str, str]:
         """Every setting the inputs make, as written, for the record and for comparisons; empty if this protocol

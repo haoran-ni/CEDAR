@@ -92,8 +92,12 @@ class InputExamination(Contract):
     partition: str | None = None
     """The Slurm partition it asks for; "local" for a run on the interactive node."""
     agent_review: bool = False
-    """The scientific content waits for the input reviewer: the deterministic checks covered only what runs on the
-    machine (the job script, its resources and the budget)."""
+    """The content waits for the input reviewer: the deterministic checks covered only what runs on the machine (the
+    job script, its resources and the budget)."""
+    declarations_checked: bool = True
+    """The examination made sure the input files set the task's declared settings as declared (``fhiaims.run`` 0.1
+    to 0.3). From 0.4 on it does not: the declarations are the agent's own description of the calculation, and
+    ``settings`` is what the files set."""
     settings: dict[NonEmptyStr, str] = {}
     """Every keyword set in the main input file, with its arguments as written (repeats joined by '; '): what the
     inputs actually set, declared or not."""

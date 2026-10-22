@@ -10,6 +10,7 @@ import re
 import pytest
 from factories import AGENT, authorize
 from sites import aims_output, co_on_cu111, declared, geometry_text
+from sites import control_text as written_control
 from worlds import World
 
 from cedar.agents import AgentRunner, TranscriptStore, record_agent_run
@@ -53,14 +54,18 @@ def calc_id(call) -> str:
 
 
 def request_args(world, control_text=None, **overrides):
+    """A request under fhiaims.run 0.4 with ``control_text`` as its control.in: by default one that sets what it
+    declares; "" for none."""
     slab, bottom = co_on_cu111()
     decl = declared(**overrides)
-    args = {"protocol_name": "fhiaims.run", "protocol_version": "0.3", "observable_name": "total energy",
+    geometry = geometry_text(slab, fixed=bottom)
+    args = {"protocol_name": "fhiaims.run", "protocol_version": "0.4", "observable_name": "total energy",
             "observable_definition": "final total energy printed by FHI-aims", "observable_unit": "eV",
             "estimand": "total energy of CO/Cu(111) atop", "system_label": "CO/Cu(111) atop (synthetic)",
-            "structure_text": geometry_text(slab, fixed=bottom), "rationale": "baseline total energy", **decl}
-    if control_text is not None:
-        args["input_files"] = {"control.in": control_text}
+            "structure_text": geometry, "rationale": "baseline total energy", **decl}
+    control = written_control(world.site, geometry, **overrides) if control_text is None else control_text
+    if control:
+        args["input_files"] = {"control.in": control}
     return args
 
 
@@ -77,7 +82,7 @@ def test_full_cycle(world, agent, tmp_path):
     # Invocation 1: plan and request.
     first_script = [
         reply(ToolCall(id="t1", name="investigation_overview", arguments={}),
-              ToolCall(id="t2", name="describe_protocol", arguments={"name": "fhiaims.run", "version": "0.3"})),
+              ToolCall(id="t2", name="describe_protocol", arguments={"name": "fhiaims.run", "version": "0.4"})),
         reply(ToolCall(id="t3", name="request_calculation", arguments=request_args(world))),
         lambda call: reply(ToolCall(id="t4", name="register_prediction", arguments={
             "prediction_id": "pred-1", "statement": "The run converges.", "observable_name": "total energy",
@@ -91,8 +96,10 @@ def test_full_cycle(world, agent, tmp_path):
     ]
     result, model = run_agent(world, agent, tmp_path, first_script, "Plan a first test.")
     assert result.outcome == "waiting"
-    assert "No keyword list limits what you may set" in latest_tool_text(model.calls[1])
-    assert "The input reviewer, an agent, now reviews the inputs" in latest_tool_text(model.calls[2])
+    assert "CEDAR does not check them against the files" in latest_tool_text(model.calls[1])
+    reply_text = latest_tool_text(model.calls[2])
+    assert "The input reviewer, an agent, now checks that FHI-aims will run these inputs" in reply_text
+    assert "CEDAR asks the researcher to approve the run. Do not ask them yourself." in reply_text
     state = world.state()
     (cid,) = state.hypotheses[world.hyp].calculation_ids
     assert state.calculations[cid].state is CalculationState.SPECIFIED  # waiting for the input reviewer
@@ -160,12 +167,12 @@ def test_full_cycle(world, agent, tmp_path):
 
 
 def test_examiner_findings_reach_the_agent(world, agent, tmp_path):
-    bad_control = "xc pbe0\nspin none\ncharge 0\nrelativistic atomic_zora scalar\n"
-    script = [reply(ToolCall(id="t1", name="request_calculation", arguments=request_args(world, bad_control))),
+    script = [reply(ToolCall(id="t1", name="request_calculation", arguments=request_args(world, ""))),
               reply(TextPart(text="Rejected; will fix."))]
-    _, model = run_agent(world, agent, tmp_path, script, "Request with your own control.in.")
+    _, model = run_agent(world, agent, tmp_path, script, "Request without writing control.in.")
     text = latest_tool_text(model.calls[1])
-    assert "REJECTED" in text and "contradicts_task" in text and "Fix the errors above" in text
+    assert "REJECTED" in text and "control.in is missing; write it" in text
+    assert "CEDAR's check rejected the request. Fix the errors above" in text
 
 
 def test_unverifiable_reading_is_refused(world, agent, tmp_path):
@@ -210,8 +217,9 @@ def test_new_requests_use_the_reviewed_protocol(world, agent):
     request = {t.name: t for t in agent}["request_calculation"]
     outcome = request.invoke({**request_args(world), "protocol_version": "0.2"})
     assert outcome.is_error and "fhiaims.run 0.2 is kept only for the calculations recorded under it; request " \
-                                 "fhiaims.run 0.3" in outcome.content
-    described = {t.name: t for t in agent}["describe_protocol"].invoke({"name": "fhiaims.run", "version": "0.1"})
-    assert described.content == ("fhiaims.run 0.1 is kept only for the calculations recorded under it; new requests "
-                                 "use fhiaims.run 0.3.")
+                                 "fhiaims.run 0.4" in outcome.content
+    for version in ("0.1", "0.3"):
+        described = {t.name: t for t in agent}["describe_protocol"].invoke({"name": "fhiaims.run", "version": version})
+        assert described.content == (f"fhiaims.run {version} is kept only for the calculations recorded under it; "
+                                     "new requests use fhiaims.run 0.4.")
     assert world.state().calculations == {}

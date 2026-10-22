@@ -107,6 +107,18 @@ def declared(**overrides):
     return {"interventions": interventions, "controls": controls, "numerical_settings": numerical}
 
 
+def control_text(site: ComputeProfile, geometry: str, **overrides) -> str:
+    """A control.in for ``geometry`` that sets ``declared(**overrides)`` with the site's species defaults, as an agent
+    writes one for fhiaims.run 0.4: by copying one generated under 0.3."""
+    from cedar.contracts import ProtocolRef, ScientificTaskSpec
+    from cedar.protocols import TOTAL_ENERGY, FhiAimsRunReviewed
+
+    task = ScientificTaskSpec(protocol=ProtocolRef(name="fhiaims.run", version="0.3"), observable=TOTAL_ENERGY,
+                              estimand="for its control.in", system_label="for its control.in", **declared(**overrides))
+    generated, _ = FhiAimsRunReviewed(site).generate(task, {"geometry.in": geometry.encode()})
+    return generated["control.in"].decode()
+
+
 def aims_output(*, version: str = VERSION, energy: float = -1234.567890123, relax: bool = False,
                 geometry_converged: bool = True, normal_end: bool = True, scf_failure: bool = False) -> str:
     """SYNTHETIC aims.out reproducing the marker formats of real FHI-aims output."""

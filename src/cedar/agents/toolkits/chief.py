@@ -67,6 +67,7 @@ from cedar.hpc.profile import ProfileStore
 from cedar.protocols.base import ProtocolRegistry
 from cedar.state.ledger import ResearchLedger
 from cedar.state.projection import review_deadline
+from cedar.store.event_store import IdempotencyConflict
 from cedar.summaries import calculation_summary, investigation_summary, pending_approvals
 from cedar.swarm import agent_label, agents_summary, clock_time
 
@@ -349,9 +350,17 @@ def chief_tools(ctx: ChiefContext) -> list[AgentTool]:
                                           measured=observable(args.measured_observable)),
             constraints=InvestigationConstraints(compute_profile=args.compute_profile),
         )
-        ctx.ledger.record(args.investigation_id, [EventDraft(
-            actor=ctx.actor, payload=InvestigationCreated(spec=spec, plan=ResearchPlan(objective=args.objective)),
-            idempotency_key="investigation_created")])
+        try:
+            ctx.ledger.record(args.investigation_id, [EventDraft(
+                actor=ctx.actor, payload=InvestigationCreated(spec=spec, plan=ResearchPlan(objective=args.objective)),
+                idempotency_key="investigation_created")])
+        except IdempotencyConflict:
+            # The key makes a retry of the same opening safe; different content means the id is taken.
+            taken = ctx.ledger.load(args.investigation_id)
+            raise ToolFailure(f"the id {args.investigation_id} is taken by an earlier investigation "
+                              f"({taken.spec.title!r}, {taken.status.value}); nothing was recorded. Open this one "
+                              f"under a different id. The researcher continues the earlier one with `cedar start "
+                              f"{args.investigation_id}`.") from None
         ctx.investigation_id = args.investigation_id
         recorded = ctx.on_open(args.investigation_id) if ctx.on_open is not None else []
         note = (f" The researcher's messages so far are recorded as {', '.join(recorded)}; cite them when they "

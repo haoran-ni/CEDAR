@@ -456,6 +456,25 @@ def test_early_messages_get_ids_at_opening_and_delegation_waits_for_investigatin
     assert state.interventions["msg-1"].text.startswith("CO on Cu(111)") and state.pending_tasks == []
 
 
+def test_an_id_taken_by_an_earlier_investigation_is_refused_to_the_chief(system):
+    workspace, clients = system["workspace"], system["clients"]
+    opening = open_and_delegate(system["site"]).message.tool_calls[0].arguments
+    clients.add("chief_scientist", reply(call("open_investigation", **opening)), reply(TextPart(text="Opened.")))
+    system["chat"].handle("CO on Cu(111): PBE prefers fcc, experiment atop.")
+    again = {**opening, "title": "CO/Cu(111) site, asked again"}
+    clients.add("chief_scientist", reply(call("open_investigation", **again)),
+                reply(call("open_investigation", **{**again, "investigation_id": f"{INV}-2"})),
+                reply(TextPart(text="Opened under another id.")))
+    later = ChatSession(workspace, system["profiles"], clients, backend=system["scheduler"], clock=system["clock"])
+    later.handle("CO on Cu(111) again: PBE prefers fcc, experiment atop.")
+    refused = clients.models["chief_scientist"].calls[3].messages[-1].parts[0]
+    assert refused.is_error and f"the id {INV} is taken by an earlier investigation" in refused.content
+    assert f"`cedar start {INV}`" in refused.content
+    assert workspace.ledger.load(INV).spec.title == opening["title"]
+    assert workspace.ledger.load(f"{INV}-2").spec.title == again["title"]
+    assert later.investigation_id == f"{INV}-2"
+
+
 def test_cli_start_and_dispatch(system, monkeypatch, capsys, tmp_path):
     from cedar import cli
 

@@ -7,7 +7,9 @@ it to stop (checked before every model call, where the transcript is complete). 
 limit on the number of model calls unless the caller sets one. What each call costs follows
 from the model's prices (``models/prices.py``). Tools from a turn
 that was cut off (``max_tokens``) or refused are never run; their calls are answered with
-an error so the transcript stays valid for the next invocation.
+an error so the transcript stays valid for the next invocation. So are the calls of a run
+that ended while its tools ran (a bug in a tool, a killed process, a closed chat), once the
+session resumes: the transcript is only ever appended to.
 
 With ``web``, the provider's own web search and fetch run inside a model turn. When the
 provider pauses that loop, the paused reply is sent straight back so it can continue: up to
@@ -40,6 +42,9 @@ Outcome = Literal["finished", "waiting", "reported", "turn_limit", "budget_limit
                   "model_error", "stopped"]
 
 MAX_PAUSED_CONTINUATIONS = 5
+INTERRUPTED = ("No result: the run ended while this tool ran, so it may or may not have taken effect; check before "
+               "calling it again.")
+"""The answer to tool calls an earlier run left without results."""
 
 
 @dataclass(frozen=True)
@@ -101,6 +106,10 @@ class AgentRunner:
         by_name = {tool.name: tool for tool in tools}
         specs = [tool.spec() for tool in tools]
         history = self._transcripts.load(session_id)
+        unanswered = history[-1].tool_calls if history and history[-1].role == "assistant" else ()
+        if unanswered:
+            self._append(session_id, history, Message(role="user", parts=tuple(
+                ToolResult(call_id=c.id, content=INTERRUPTED, is_error=True) for c in unanswered)))
         self._append(session_id, history, Message(role="user", parts=(TextPart(text=instruction),)))
         result = RunResult(outcome="finished", cost_usd=0.0 if self._prices is not None else None)
         paused = 0

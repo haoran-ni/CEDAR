@@ -106,6 +106,22 @@ def test_bugs_in_tools_are_not_hidden(transcripts):
         run(transcripts, [reply(call("crash", text="x"))])
 
 
+def test_tool_calls_an_interrupted_run_left_unanswered_are_answered_when_the_session_resumes(transcripts):
+    # A bug in a tool, a killed process or a closed chat can end a run between a turn's tool calls and their results;
+    # the API refuses a conversation with a tool call left unanswered.
+    log = []
+    with pytest.raises(RuntimeError, match="bug"):
+        run(transcripts, [reply(call("crash", text="x"), call("echo", "c2", text="y"))], log)
+    assert log == [] and transcripts.load("s1")[-1].role == "assistant"
+    _, model = run(transcripts, [reply(TextPart(text="ok"))], instruction="Next.")
+    sent = model.calls[0].messages
+    assert [m.role for m in sent] == ["user", "assistant", "user", "user"] and sent[3].text == "Next."
+    answers = sent[2].parts
+    assert [a.call_id for a in answers] == ["c1", "c2"] and all(a.is_error for a in answers)
+    assert "may or may not have taken effect" in answers[0].content
+    assert transcripts.load("s1")[2] == sent[2]
+
+
 @pytest.mark.parametrize("stop, outcome", [("max_tokens", "truncated"), ("refusal", "refused")])
 def test_tools_from_cut_off_or_refused_turns_are_not_run(transcripts, stop, outcome):
     log = []

@@ -1,11 +1,13 @@
 """Calculations run locally, on the interactive node CEDAR runs on, inside the researcher's allocation.
 
-The host is a TEST DOUBLE (an interactive node with a made-up allocation, or a login node); the FHI-aims binary
+The host is a TEST DOUBLE (an interactive node with a made-up allocation, or a login node); so are the Slurm
+steps (``Steps``: a process pinned to the CPUs a step would get, started when the test says). The FHI-aims binary
 is a SYNTHETIC shell script that prints a synthetic aims.out. The local runs really start, as detached
 processes, and really end.
 """
 
 import json
+import os
 import socket
 import subprocess
 import sys
@@ -14,7 +16,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
-from factories import AGENT, ENGINE, agent_for, authorize, examine, move, start_agent, task
+from factories import AGENT, ENGINE, agent_for, authorize, examine, move, set_hypothesis_status, start_agent, task
 from sites import aims_output
 from test_orchestration import make_system
 from test_swarm import INV, investigation
@@ -25,22 +27,26 @@ from cedar.contracts import (
     EvidenceKind,
     EvidenceQuality,
     ExaminationVerdict,
+    HypothesisStatus,
     Observable,
     OutputReading,
     PermissionAction,
     Quantity,
+    SchedulerNoteRecorded,
     SchedulerState,
 )
 from cedar.contracts.evidence import FileCitation
+from cedar.dashboard import agent_rows, job_status, work_summary
 from cedar.dispatch import HOST, LOCK, Dispatcher, dispatcher_host, stop_dispatcher
 from cedar.engine import JobManager, JobMonitor, ProtocolEngine, ResultValidator
 from cedar.engine.workbench import Workbench
 from cedar.errors import RuleViolation
-from cedar.hpc.local import RECORDS, LocalBackend
+from cedar.hpc.local import RECORDS, LocalBackend, SlurmSteps
 from cedar.hpc.local_runner import main as run_locally
 from cedar.hpc.node import CorePool, ExecutionHost
 from cedar.hpc.slurm import SchedulerError
 from cedar.protocols import FhiAimsRun, FhiAimsRunSlurmOnly, ProtocolRegistry
+from cedar.summaries import calculation_summary, short_id
 from cedar.workspace import Workspace
 
 ENERGY = -2345.678901234
@@ -63,6 +69,37 @@ def interactive(cores=8, minutes=120) -> ExecutionHost:
 
 
 LOGIN = ExecutionHost("login1", cores=8, reason="not inside a Slurm allocation")
+EIGHT_CPUS = pytest.mark.skipif(len(os.sched_getaffinity(0)) < 8, reason="pins test steps to CPUs 0-7")
+
+
+class Steps:
+    """TEST DOUBLE for Slurm steps: a step starts ``delay`` seconds after its launcher, pinned to ``cpus`` (where
+    Slurm put it) or else to the CPUs CEDAR booked; meanwhile its launcher prints ``said``, as srun would. With
+    ``fail`` the step never starts: its launcher prints that and exits 1."""
+
+    def __init__(self) -> None:
+        self.delay, self.cpus, self.said, self.fail = 0.0, None, None, None
+
+    def unavailable(self) -> str | None:
+        return None
+
+    def launch(self, record) -> list[str]:
+        if self.fail:
+            return [sys.executable, "-c", f"print({self.fail!r}, flush=True); raise SystemExit(1)"]
+        cpus = sorted(self.cpus or record["cpus"])
+        return [sys.executable, "-c",
+                "import os, sys, time\n"
+                f"if {self.said!r}: print({self.said!r}, flush=True)\n"
+                f"time.sleep({self.delay})\n"
+                f"cpus = [c for c in {cpus!r} if c in os.sched_getaffinity(0)]\n"
+                "if cpus: os.sched_setaffinity(0, cpus)\n"
+                "os.execv(sys.argv[1], sys.argv[1:])\n"]
+
+    def stop(self) -> list[str]:
+        return []
+
+    def environment(self, environ) -> dict[str, str]:
+        return dict(environ)
 
 
 class Local:
@@ -82,6 +119,7 @@ class Local:
         w.registry = ProtocolRegistry([FhiAimsRun(site, host=lambda: self.host), FhiAimsRunSlurmOnly(site)])
         w.engine = ProtocolEngine(ledger, w.registry, artifacts, w.runs)
         self.pool = CorePool(list(cpus))
+        self.steps = Steps()
         self.backend = self.backend_again()
         self.manager = JobManager(ledger, self.backend, w.runs, execution="local")
         self.monitor = JobMonitor(ledger, self.backend, execution="local")
@@ -89,7 +127,7 @@ class Local:
 
     def backend_again(self, pool=None):
         """A local backend as a dispatcher (re)started on this host has it."""
-        return LocalBackend(self.world.runs, host=lambda: self.host, pool=pool or self.pool,
+        return LocalBackend(self.world.runs, host=lambda: self.host, pool=pool or self.pool, steps=self.steps,
                             allocation_state=lambda a: a not in self.ended_allocations)
 
     def code(self, *, sleep: float, fail: bool = False):
@@ -223,10 +261,156 @@ def test_local_runs_wait_for_free_cores(ledger, store, artifacts, site, tmp_path
     for cid in (first, second):
         authorize(w.ledger, w.inv, PermissionAction.SUBMIT, cid, intervention_id=f"submit-{cid}")
         local.manager.submit(w.inv, cid)
-    local.monitor.poll(w.inv)
-    assert w.calc(first).state is CalculationState.RUNNING and w.calc(second).state is CalculationState.QUEUED
+    local.wait_until(first, {CalculationState.RUNNING})
+    assert w.calc(second).state is CalculationState.QUEUED
+    assert w.calc(second).scheduler_note == "waiting for 1 free core"
+    assert w.calc(first).scheduler_note == "running on CPUs 0"
     local.wait_until(first, {CalculationState.SCHEDULER_TERMINAL})
     assert local.wait_until(second, {CalculationState.SCHEDULER_TERMINAL}).scheduler_state is SchedulerState.COMPLETED
+    assert w.calc(first).scheduler_note is None  # it COMPLETED, which says it all
+
+
+@EIGHT_CPUS
+def test_a_run_is_running_only_once_slurm_started_its_step_and_the_panel_says_what_it_waits_for(local, monkeypatch):
+    monkeypatch.setattr("cedar.hpc.local.START_SECONDS", 1.0)
+    local.code(sleep=1)
+    local.steps.delay, local.steps.said = 4.0, "srun: Job 777001 step creation temporarily disabled, retrying " \
+                                               "(Requested nodes are busy)"
+    w = local.world
+    cid = local.request_local(max_walltime_hours=1)
+    authorize(w.ledger, w.inv, PermissionAction.SUBMIT, cid, intervention_id=f"submit-{cid}")
+    local.manager.submit(w.inv, cid)
+    set_hypothesis_status(w.ledger, w.inv, w.hyp, HypothesisStatus.WAITING_FOR_JOB, awaiting=(cid,))
+    local.wait_until(cid, {CalculationState.QUEUED})
+    assert w.calc(cid).scheduler_note == "starting its Slurm step"
+    deadline = time.monotonic() + 10
+    while "Requested nodes" not in (w.calc(cid).scheduler_note or "") and time.monotonic() < deadline:
+        local.monitor.poll(w.inv)
+        time.sleep(0.2)
+    calc = w.calc(cid)
+    assert calc.state is CalculationState.QUEUED  # not RUNNING: Slurm has not started the step
+    assert calc.scheduler_note == "waiting for Slurm to start its step (Requested nodes are busy)"
+    state = w.state()
+    assert job_status(state, calc).endswith("PENDING (waiting for Slurm to start its step (Requested nodes are busy))")
+    row = next(r for r in agent_rows(state, w.store.read_stream(w.inv), [], datetime.now(timezone.utc))
+               if r.hypothesis_id == w.hyp)
+    assert (row.status, row.task) == ("waiting for jobs", f"calculations {short_id(cid)} (waiting for Slurm to start "
+                                                          "its step (Requested nodes are busy))")
+    assert "(local: 4 waiting)" in work_summary(state)
+    calc = local.wait_until(cid, {CalculationState.RUNNING})
+    assert calc.scheduler_note == "running on CPUs 0-3" and "(local: 4 cores running)" in work_summary(w.state())
+    row = next(r for r in agent_rows(w.state(), w.store.read_stream(w.inv), [], datetime.now(timezone.utc))
+               if r.hypothesis_id == w.hyp)
+    assert row.task == f"calculations {short_id(cid)} (running on CPUs 0-3)"
+    assert "running on CPUs 0-3" in calculation_summary(w.state(), calc)
+    assert local.wait_until(cid, {CalculationState.SCHEDULER_TERMINAL}).scheduler_state is SchedulerState.COMPLETED
+    notes = [e.payload.note for e in w.store.read_stream(w.inv) if isinstance(e.payload, SchedulerNoteRecorded)]
+    assert notes == ["waiting for Slurm to start its step (Requested nodes are busy)"]
+
+
+def test_a_step_slurm_would_not_start_fails_with_what_srun_said(local):
+    local.steps.fail = ("srun: error: Unable to create step for job 777001: Invalid generic resource (gres) "
+                        "specification")
+    w = local.world
+    cid = local.request_local(max_walltime_hours=1)
+    authorize(w.ledger, w.inv, PermissionAction.SUBMIT, cid, intervention_id=f"submit-{cid}")
+    local.manager.submit(w.inv, cid)
+    calc = local.wait_until(cid, {CalculationState.SCHEDULER_TERMINAL})
+    assert calc.scheduler_state is SchedulerState.FAILED
+    assert calc.scheduler_note == ("its Slurm step did not start: error: Unable to create step for job 777001: "
+                                   "Invalid generic resource (gres) specification")
+
+
+@EIGHT_CPUS
+def test_the_pool_holds_the_cpus_slurm_gave_the_step_not_the_ones_booked(local):
+    local.code(sleep=3)
+    local.steps.cpus = [4, 5, 6, 7]  # CEDAR booked 0-3; Slurm chose otherwise
+    w = local.world
+    cid = local.request_local(max_walltime_hours=1)
+    authorize(w.ledger, w.inv, PermissionAction.SUBMIT, cid, intervention_id=f"submit-{cid}")
+    local.manager.submit(w.inv, cid)
+    assert local.wait_until(cid, {CalculationState.RUNNING}).scheduler_note == "running on CPUs 4-7"
+    command = local.pool.acquire(4, timeout=0.1)  # the agents' commands get what the step does not use
+    assert sorted(command) == [0, 1, 2, 3]
+    local.pool.release(command)
+    local.wait_until(cid, {CalculationState.SCHEDULER_TERMINAL})
+    assert local.pool.take(8) is not None  # all given back
+
+
+@EIGHT_CPUS
+def test_a_restarted_dispatcher_keeps_exactly_the_cpus_its_runs_use(local):
+    local.code(sleep=4)
+    local.steps.cpus = [2, 3, 4, 5]
+    w = local.world
+    cid = local.request_local(max_walltime_hours=1)
+    authorize(w.ledger, w.inv, PermissionAction.SUBMIT, cid, intervention_id=f"submit-{cid}")
+    local.manager.submit(w.inv, cid)
+    local.wait_until(cid, {CalculationState.RUNNING})
+    pool = CorePool(list(range(8)))
+    local.backend_again(pool)  # as a dispatcher started after the first one stopped
+    assert sorted(pool.take(4)) == [0, 1, 6, 7]  # not 0-3, which would share 2 and 3 with the running step
+
+
+def test_a_run_that_waited_until_its_limit_no_longer_fits_fails_without_starting(ledger, store, artifacts, site,
+                                                                                    tmp_path):
+    local = Local(ledger, store, artifacts, site, tmp_path, host=interactive(cores=5), cpus=(0, 1, 2, 3, 4))
+    local.code(sleep=300)
+    w = local.world
+    first, second = local.request_local(max_walltime_hours=1), local.request_local((6, 6, 1), max_walltime_hours=1)
+    for cid in (first, second):
+        authorize(w.ledger, w.inv, PermissionAction.SUBMIT, cid, intervention_id=f"submit-{cid}")
+        local.manager.submit(w.inv, cid)
+    local.wait_until(first, {CalculationState.RUNNING})
+    local.host = interactive(cores=5, minutes=50)  # time passed: the allocation ends in 50 minutes
+    calc = local.wait_until(second, {CalculationState.SCHEDULER_TERMINAL})
+    assert calc.scheduler_state is SchedulerState.FAILED
+    assert calc.scheduler_note.startswith("it waited for free cores until its 60-minute limit no longer fit in "
+                                          "allocation 777001") and calc.scheduler_note.endswith("it never started")
+    assert not (w.runs / RECORDS / f"{calc.scheduler_job_id}.started").exists()
+    authorize(w.ledger, w.inv, PermissionAction.CANCEL, first, intervention_id=f"cancel-{first}")
+    local.manager.cancel(w.inv, first, "test")
+
+
+def test_the_script_runs_without_the_steps_slurm_variables(tmp_path):
+    record = tmp_path / "local-x.json"
+    script = tmp_path / "run.sh"
+    script.write_text("#!/bin/sh\nenv | grep '^SLURM_' > slurm.env\nexit 0\n")
+    launch = [sys.executable, "-c", "import os, sys\nos.environ.update(SLURM_JOB_ID='777001', SLURM_STEP_ID='7', "
+                                    "SLURM_CPU_BIND='quiet,mask_cpu:0xFF')\nos.execv(sys.argv[1], sys.argv[1:])\n"]
+    record.write_text(json.dumps({"job_id": "local-x", "workdir": str(tmp_path), "script": str(script),
+                                  "minutes": 5, "cpus": [0], "launch": launch, "stop": []}))
+    run_locally(str(record))
+    assert json.loads((tmp_path / "local-x.exit").read_text())["exit_code"] == 0
+    assert (tmp_path / "slurm.env").read_text() == ""
+    assert json.loads((tmp_path / "local-x.inside").read_text())["step"] == "777001.7"
+
+
+def test_the_time_limit_counts_from_when_the_step_started(tmp_path):
+    record = tmp_path / "local-x.json"
+    script = tmp_path / "run.sh"
+    script.write_text("#!/bin/sh\nsleep 300\n")
+    launch = [sys.executable, "-c", "import os, sys, time\ntime.sleep(2)\nos.execv(sys.argv[1], sys.argv[1:])\n"]
+    record.write_text(json.dumps({"job_id": "local-x", "workdir": str(tmp_path), "script": str(script),
+                                  "minutes": 0.05, "cpus": [0], "launch": launch, "stop": []}))
+    run_locally(str(record))
+    started = json.loads((tmp_path / "local-x.started").read_text())["started_at"]
+    inside = json.loads((tmp_path / "local-x.inside").read_text())["started_at"]
+    ended = json.loads((tmp_path / "local-x.exit").read_text())
+    assert ended["timed_out"] and inside - started >= 1.9 and ended["ended_at"] - inside >= 2.9
+
+
+def test_each_local_run_is_a_slurm_step_of_its_own_size_on_this_node(monkeypatch):
+    record = {"allocation": "674593", "node": "trace29", "ntasks": 60, "minutes": 240, "job_name": "cedar-ab12"}
+    command = SlurmSteps().launch(record)
+    assert command == ["srun", "--jobid=674593", "--nodes=1", "--nodelist=trace29", "--exact", "--gres=none",
+                       "--mpi=none", "--ntasks=1", "--cpus-per-task=60", "--time=04:05:00", "--job-name=cedar-ab12"]
+    shell = {"SLURM_JOB_ID": "674593", "SLURM_STEP_ID": "0", "SLURM_CPU_BIND": "quiet,mask_cpu:0xFFFF",
+             "SLURM_CONF": "/etc/slurm/slurm.conf", "PATH": "/usr/bin"}
+    assert SlurmSteps().environment(shell) == {"SLURM_CONF": "/etc/slurm/slurm.conf", "PATH": "/usr/bin"}
+    monkeypatch.setattr("cedar.hpc.local.shutil.which", lambda name: None)
+    assert "srun is not on this machine's PATH" in SlurmSteps().unavailable()
+    backend = LocalBackend("/nowhere", host=interactive, steps=SlurmSteps())
+    assert "srun is not on this machine's PATH" in backend.unavailable(interactive())
 
 
 def test_a_cancelled_local_run_stops(local):

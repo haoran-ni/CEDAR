@@ -13,6 +13,7 @@ import socket
 import subprocess
 import threading
 import time
+from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -37,6 +38,8 @@ class ExecutionHost:
     """When the allocation ends, if it has a time limit."""
     reason: str = ""
     """Why this is, or is not, an interactive node."""
+    node: str | None = None
+    """This machine's name in the allocation's node list, which Slurm steps name."""
 
     @property
     def interactive(self) -> bool:
@@ -115,7 +118,8 @@ def detect_host(environ: Mapping[str, str] = os.environ, *, runner: Runner = sub
         cores = own_cores
     return ExecutionHost(name, allocation=job, cores=min(cores, own_cores),
                          ends_at=now() + remaining if remaining is not None else None,
-                         reason=f"this machine is a node of running Slurm job {job}")
+                         reason=f"this machine is a node of running Slurm job {job}",
+                         node=short if short in nodes else name)
 
 
 def local_dft(host: ExecutionHost) -> str:
@@ -126,7 +130,9 @@ def local_dft(host: ExecutionHost) -> str:
                 "otherwise calculations run through Slurm")
     if host.interactive:
         return (f"possible: CEDAR runs on the {host.describe()}; a local run may use up to {host.dft_cores} cores, "
-                f"since {WORKBENCH_CORES} are kept for the agents' commands")
+                f"since {WORKBENCH_CORES} are kept for the agents' commands. Local runs share those cores: each runs "
+                "as its own Slurm step on cores no other run uses, and one that does not fit waits, first come, first "
+                "served, until enough are free")
     return (f"not possible: CEDAR runs on the {host.describe()}, and DFT cannot run locally on login nodes. The "
             "researcher can start CEDAR on an interactive node (inside a Slurm allocation) to run calculations "
             "locally; otherwise they run through Slurm")
@@ -149,14 +155,32 @@ class HostWatch:
 
 class CorePool:
     """The CPUs of this machine (of the allocation, on an interactive node) that workbench commands and local runs
-    are pinned to, handed out so that no two share one."""
+    use, handed out so that no two share one.
+
+    Commands get the highest free CPUs. A local run books the lowest, the ones Slurm gives a new step first, and
+    once its step has started holds the CPUs Slurm actually gave it (``rebook``). A CPU held twice, because a step
+    landed on a command's CPU, stays taken until both have let go."""
 
     def __init__(self, cpus: Sequence[int] | None = None) -> None:
-        available = cpus if cpus is not None else sorted(os.sched_getaffinity(0))
-        self._free = list(available)
-        self.size = len(self._free)
+        self._cpus = sorted(cpus if cpus is not None else os.sched_getaffinity(0))
+        self._holders: Counter[int] = Counter()
+        self.size = len(self._cpus)
         self._running = 0
         self._changed = threading.Condition()
+
+    def _free(self) -> list[int]:
+        return [c for c in self._cpus if not self._holders[c]]
+
+    def _hold(self, cpus: Sequence[int]) -> tuple[int, ...]:
+        """Hold ``cpus``; the ones another holder had already."""
+        shared = tuple(c for c in cpus if self._holders[c])
+        self._holders.update(cpus)
+        return shared
+
+    def _let_go(self, cpus: Sequence[int]) -> None:
+        for c in cpus:
+            if self._holders[c] > 0:
+                self._holders[c] -= 1
 
     def acquire(self, count: int, *, most_running: int | None = None, timeout: float = WAIT_SECONDS
                 ) -> tuple[int, ...] | None:
@@ -164,18 +188,19 @@ class CorePool:
         that does not happen within ``timeout`` seconds."""
         deadline = time.monotonic() + timeout
         with self._changed:
-            while len(self._free) < count or (most_running is not None and self._running >= most_running):
+            while len(self._free()) < count or (most_running is not None and self._running >= most_running):
                 left = deadline - time.monotonic()
                 if left <= 0 or not self._changed.wait(left):
-                    if len(self._free) < count or (most_running is not None and self._running >= most_running):
+                    if len(self._free()) < count or (most_running is not None and self._running >= most_running):
                         return None
-            taken, self._free = tuple(self._free[-count:]), self._free[:-count]
+            taken = tuple(self._free()[-count:])
+            self._hold(taken)
             self._running += 1
             return taken
 
     def release(self, cpus: Sequence[int]) -> None:
         with self._changed:
-            self._free += list(cpus)
+            self._let_go(cpus)
             self._running -= 1
             self._changed.notify_all()
 
@@ -183,13 +208,28 @@ class CorePool:
         """``count`` CPUs for a local run, if that many are free now with ``keep`` more left over; a run is not a
         command."""
         with self._changed:
-            if len(self._free) - count < keep or len(self._free) < count:
+            free = self._free()
+            if len(free) - count < keep or len(free) < count:
                 return None
-            taken, self._free = tuple(self._free[-count:]), self._free[:-count]
+            taken = tuple(free[:count])
+            self._hold(taken)
             return taken
 
-    def give(self, cpus: Sequence[int]) -> None:
-        """Return what ``take`` handed out."""
+    def claim(self, cpus: Sequence[int]) -> tuple[int, ...]:
+        """Hold exactly these CPUs, a running step's, free or not; the ones another holder has too."""
         with self._changed:
-            self._free += [c for c in cpus if c not in self._free]
+            return self._hold(cpus)
+
+    def rebook(self, booked: Sequence[int], actual: Sequence[int]) -> tuple[int, ...]:
+        """Exchange the CPUs ``take`` booked for a run for the ones its step got; the ones another holder has too."""
+        with self._changed:
+            self._let_go(booked)
+            shared = self._hold(actual)
+            self._changed.notify_all()
+            return shared
+
+    def give(self, cpus: Sequence[int]) -> None:
+        """Return what ``take``, ``claim`` or ``rebook`` handed out."""
+        with self._changed:
+            self._let_go(cpus)
             self._changed.notify_all()

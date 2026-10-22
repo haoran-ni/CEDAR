@@ -30,6 +30,13 @@ from cedar.swarm import agent_label, proposal_note
 from cedar.web import web_summary
 
 
+def job_text(calc: CalculationRecord) -> str:
+    """A calculation's job in the scheduler's terms, with what the scheduler last said beyond its state: e.g.
+    ``job local-3f… PENDING (waiting for 60 free cores)``."""
+    state = calc.scheduler_state.value if calc.scheduler_state else "SUBMITTED"
+    return f"job {calc.scheduler_job_id} {state}" + (f" ({calc.scheduler_note})" if calc.scheduler_note else "")
+
+
 def calculation_summary(state: InvestigationState, calc: CalculationRecord, *, findings: bool = True) -> str:
     """One calculation: its state, what it is for, what every hypothesis predicted for it, and its evidence with
     whose it is. Every agent sees all of it."""
@@ -46,8 +53,7 @@ def calculation_summary(state: InvestigationState, calc: CalculationRecord, *, f
         if calc.examination is not None:
             head += f"; inputs {calc.examination.verdict.value}"
         if calc.scheduler_job_id:
-            job_state = calc.scheduler_state.value if calc.scheduler_state else "submitted"
-            head += f"; job {calc.scheduler_job_id} {job_state}"
+            head += f"; {job_text(calc)}"
         lines = [head, f"  {calc.task.observable.name} via {calc.task.protocol.name} {calc.task.protocol.version}; "
                        f"estimand: {calc.task.estimand}; for {', '.join(calc.hypothesis_ids)}"]
         if calc.rejected_by_researcher:

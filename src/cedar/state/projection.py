@@ -47,6 +47,7 @@ from cedar.contracts.events import (
     RoundStarted,
     RunChecked,
     RunRegistered,
+    SchedulerNoteRecorded,
     SynthesisRecorded,
     BudgetChanged,
     UserInterventionRecorded,
@@ -109,6 +110,7 @@ EVENT_ACTORS: dict[type, frozenset[ActorKind]] = {
     CalculationLinked: frozenset({_A.CHIEF_SCIENTIST, _A.HYPOTHESIS_AGENT}),
     CalculationInputsExamined: frozenset({_A.PROTOCOL_ENGINE}),
     CalculationStateChanged: frozenset({_A.PROTOCOL_ENGINE, _A.JOB_MANAGER, _A.JOB_MONITOR, _A.VALIDATOR}),
+    SchedulerNoteRecorded: frozenset({_A.JOB_MONITOR}),
     RunChecked: frozenset({_A.VALIDATOR}),
     RunRegistered: frozenset({_A.VALIDATOR}),
     WorkbenchRunRecorded: frozenset({_A.WORKBENCH}),
@@ -222,6 +224,9 @@ class CalculationRecord:
     state: CalculationState = CalculationState.SPECIFIED
     scheduler_state: SchedulerState | None = None
     scheduler_job_id: str | None = None
+    scheduler_note: str | None = None
+    """What the scheduler last said the job is doing or how it ended, where it says more than its state, e.g. a
+    local run's "waiting for 60 free cores" or "running on CPUs 0-59"."""
     evidence_ids: list[str] = field(default_factory=list)
     """Evidence read from this run directly or computed by analyses that used it."""
     examination: InputExamination | None = None
@@ -1281,7 +1286,16 @@ def _on_calculation_state(state: InvestigationState, event: RecordedEvent, p: Ca
         calc.scheduler_state = scheduler_state
     if p.scheduler_job_id is not None:
         calc.scheduler_job_id = p.scheduler_job_id
+    if p.state in (_C.QUEUED, _C.RUNNING, _C.SCHEDULER_TERMINAL):
+        calc.scheduler_note = p.reason
     calc.history.append((event.stream_version, new_state))
+
+
+def _on_scheduler_note(state: InvestigationState, event: RecordedEvent, p: SchedulerNoteRecorded) -> None:
+    calc = _calculation(state, p.calculation_id)
+    if calc.state not in (_C.QUEUED, _C.RUNNING):
+        raise RuleViolation(f"a scheduler note is for a queued or running job; {calc.calculation_id} is {calc.state}")
+    calc.scheduler_note = p.note
 
 
 def _on_run_checked(state: InvestigationState, event: RecordedEvent, p: RunChecked) -> None:
@@ -1594,6 +1608,7 @@ _HANDLERS = {
     CalculationLinked: _on_calculation_linked,
     CalculationInputsExamined: _on_inputs_examined,
     CalculationStateChanged: _on_calculation_state,
+    SchedulerNoteRecorded: _on_scheduler_note,
     RunChecked: _on_run_checked,
     RunRegistered: _on_run_registered,
     WorkbenchRunRecorded: _on_workbench_run,

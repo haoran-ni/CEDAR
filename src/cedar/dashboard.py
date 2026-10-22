@@ -36,7 +36,7 @@ from cedar.state.projection import (
     awaits_reviewer,
     hypothesis_evidence,
 )
-from cedar.summaries import approval_requests, short_id
+from cedar.summaries import approval_requests, job_text, short_id
 from cedar.swarm import FIRST_TASK, WAKE_TASK, minutes_left
 from cedar.web import web_summary
 
@@ -101,8 +101,7 @@ def job_status(state: InvestigationState, calc: CalculationRecord) -> str:
     elif calc.state is _C.CANCELLED:
         text = "cancelled" + (f" (job {calc.scheduler_job_id})" if calc.scheduler_job_id else "")
     else:
-        scheduler = calc.scheduler_state.value if calc.scheduler_state else "SUBMITTED"
-        text = f"job {calc.scheduler_job_id} {scheduler}"
+        text = job_text(calc)
         if calc.state in (_C.SCHEDULER_TERMINAL, _C.PARSING):
             text += ", run not yet checked"
         elif calc.run_check is not None and not calc.run_check.healthy:
@@ -299,7 +298,7 @@ def _hypothesis_agent_row(state: InvestigationState, agent: AgentRecord, mine: S
                       and e.payload.hypothesis_id == agent.hypothesis_id
                       and e.payload.status is HypothesisStatus.WAITING_FOR_JOB), None)
         status = ("waiting for jobs", ago(at(since)),
-                  "calculations " + ", ".join(short_id(c) for c in hyp.awaiting_calculation_ids))
+                  "calculations " + ", ".join(_awaited(state, c) for c in hyp.awaiting_calculation_ids))
     else:
         runs = [r for r in state.agent_runs if r.actor_id == agent.agent_id]
         if runs:
@@ -309,6 +308,20 @@ def _hypothesis_agent_row(state: InvestigationState, agent: AgentRecord, mine: S
             status = ("idle", ago(at(agent.started_at)), "not run yet")
     return AgentRow(agent.agent_id, f"{agent.tag} {agent.agent_id}", _short(agent.spec.role, 32), *status,
                     hypothesis_id=agent.hypothesis_id)
+
+
+_AWAITED = {_C.SUBMISSION_PENDING: "submitting", _C.SUBMITTED: "submitted", _C.QUEUED: "queued",
+            _C.RUNNING: "running", _C.SCHEDULER_TERMINAL: "ended, being checked", _C.PARSING: "ended, being checked"}
+
+
+def _awaited(state: InvestigationState, calculation_id: str) -> str:
+    """A calculation an agent waits for, with what its job is doing: e.g. ``3f2a91c0 (waiting for 60 free cores)``,
+    so that a local run that waits for cores is not taken for one that runs."""
+    calc = state.calculations.get(calculation_id)
+    if calc is None or calc.state not in _AWAITED:
+        return short_id(calculation_id)
+    doing = calc.scheduler_note if calc.state in (_C.QUEUED, _C.RUNNING) and calc.scheduler_note else None
+    return f"{short_id(calculation_id)} ({doing or _AWAITED[calc.state]})"
 
 
 def swarm_rows(state: InvestigationState) -> list[SwarmRow]:
@@ -426,7 +439,18 @@ def work_summary(state: InvestigationState) -> str:
     qualities = Counter(record.evidence.quality.value for record in state.evidence.values())
     evidence = ", ".join(f"{n} {quality}" for quality, n in qualities.items()) or "none"
     n = len(state.hypotheses)
-    return f"{n} hypothes{'is' if n == 1 else 'es'} · jobs: {jobs} · evidence: {evidence}"
+    return f"{n} hypothes{'is' if n == 1 else 'es'} · jobs: {jobs}{_local_cores(calcs)} · evidence: {evidence}"
+
+
+def _local_cores(calcs: Sequence[CalculationRecord]) -> str:
+    """The cores local runs use and wait for, from their examined task counts; empty without local runs."""
+    def tasks(states) -> int:
+        return sum(c.examination.requested_tasks or 0 for c in calcs
+                   if c.task.execution == "local" and c.state in states and c.examination is not None)
+
+    running, waiting = tasks({_C.RUNNING}), tasks({_C.SUBMISSION_PENDING, _C.SUBMITTED, _C.QUEUED})
+    parts = [f"{running} cores running" if running else "", f"{waiting} waiting" if waiting else ""]
+    return f" (local: {', '.join(p for p in parts if p)})" if running or waiting else ""
 
 
 def mode_line(state: InvestigationState | None, web: RetrievalRecord | None = None) -> tuple[str, bool]:

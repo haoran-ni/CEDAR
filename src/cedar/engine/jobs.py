@@ -5,7 +5,9 @@ and a calculation found in that state is reconciled by job name before anything 
 submitted again, so a crash between the two never produces a duplicate job.
 
 Each manager and monitor serves calculations of one execution: ``slurm`` through the Slurm
-adapter, ``local`` through the local backend on the interactive node CEDAR runs on.
+adapter, ``local`` through the local backend on the interactive node CEDAR runs on. For local
+runs the monitor also records what the backend says a job waits for or where it runs (a
+scheduler note), with each state change and whenever it changes within a state.
 """
 
 import hashlib
@@ -13,12 +15,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from cedar.contracts.base import Actor, ActorKind
-from cedar.contracts.events import CalculationStateChanged, EventDraft, RecordedEvent
+from cedar.contracts.events import CalculationStateChanged, EventDraft, RecordedEvent, SchedulerNoteRecorded
 from cedar.contracts.plan import PermissionAction
 from cedar.contracts.status import SCHEDULER_TERMINAL_STATES, CalculationState, SchedulerState
 from cedar.contracts.task import Execution
 from cedar.errors import RuleViolation
-from cedar.hpc.slurm import SchedulerBackend, SchedulerError, default_lookback
+from cedar.hpc.slurm import SchedulerBackend, SchedulerError, SchedulerObservation, default_lookback
 from cedar.state.ledger import ResearchLedger
 from cedar.state.projection import CalculationRecord, authorization_for
 
@@ -168,14 +170,32 @@ class JobMonitor:
             else:
                 result.unknown.append(calc.calculation_id)
                 continue
+            note = self._note(seen)
             if target is calc.state:
+                if note is not None and note != calc.scheduler_note:
+                    draft = EventDraft(
+                        actor=self._actor,
+                        idempotency_key=f"{calc.calculation_id}:{len(calc.history)}:note:{_digest(note)}",
+                        payload=SchedulerNoteRecorded(calculation_id=calc.calculation_id, note=note))
+                    result.recorded.extend(self._ledger.record(investigation_id, [draft]).events)
                 continue
             draft = EventDraft(
                 actor=self._actor,
                 idempotency_key=f"{calc.calculation_id}:{len(calc.history)}:{target}",
                 payload=CalculationStateChanged(
                     calculation_id=calc.calculation_id, state=target,
-                    scheduler_state=seen.state if target is _C.SCHEDULER_TERMINAL else None),
+                    scheduler_state=seen.state if target is _C.SCHEDULER_TERMINAL else None, reason=note),
             )
             result.recorded.extend(self._ledger.record(investigation_id, [draft]).events)
         return result
+
+    def _note(self, seen: SchedulerObservation) -> str | None:
+        """What the observation says beyond its state; for local runs, whose backend says what they wait for and
+        where they run."""
+        if self.execution != "local" or not seen.raw_state or seen.raw_state == seen.state.value:
+            return None
+        return seen.raw_state
+
+
+def _digest(text: str) -> str:
+    return hashlib.sha256(text.encode()).hexdigest()[:12]

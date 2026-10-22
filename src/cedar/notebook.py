@@ -58,6 +58,7 @@ from cedar.contracts.events import (
     RoundStarted,
     BudgetChanged,
     RunChecked,
+    SchedulerNoteRecorded,
     RunRegistered,
     UserInterventionRecorded,
     WorkbenchPolicyChanged,
@@ -1050,6 +1051,8 @@ def _describe(event: RecordedEvent) -> str:
                 f", authorized by {p.authorization_id}" if p.authorization_id else "",
                 f": {_said(p.reason)}" if p.reason else ""))
             return f"{p.calculation_id} moved to {p.state.value}{extra}"
+        case SchedulerNoteRecorded():
+            return f"{p.calculation_id}: {_said(p.note)}"
         case EvidenceRecorded():
             ev = p.evidence
             return f"{p.evidence_id} recorded: {ev.quality.value}, {ev.observable.name} = {_quantity(ev.value)}"

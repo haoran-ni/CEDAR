@@ -147,7 +147,7 @@ When a job ends, the validator checks the run and stores `aims.out` and the sche
 
 These marker strings were checked against the FHI-aims source and real outputs of versions 240507 and 260331.1.
 
-A local run's checks are the same; its scheduler state comes from the local backend, and its run check records where it ran (`execution`, `host`, `allocation`).
+A local run's checks are the same; its scheduler state comes from the local backend, and its run check records where it ran (`execution`, `host`, `allocation`, and the CPUs and id of its Slurm step).
 
 ## Every version
 

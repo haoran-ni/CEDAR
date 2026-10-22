@@ -350,6 +350,15 @@ class CalculationStateChanged(Contract):
     """User intervention that authorizes this change, where one is required."""
 
 
+class SchedulerNoteRecorded(Contract):
+    """What a queued or running calculation's scheduler says it is doing, when that changes without its state: a
+    local run that waited for free cores and now waits for Slurm to start its step."""
+
+    type: Literal["scheduler_note_recorded"] = "scheduler_note_recorded"
+    calculation_id: Identifier
+    note: NonEmptyStr
+
+
 class RunChecked(Contract):
     """The validator's health check of a finished run, with the run's output files stored."""
 
@@ -630,6 +639,7 @@ EventPayload = Annotated[
     | CalculationLinked
     | CalculationInputsExamined
     | CalculationStateChanged
+    | SchedulerNoteRecorded
     | RunChecked
     | RunRegistered
     | WorkbenchRunRecorded

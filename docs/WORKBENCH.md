@@ -58,7 +58,7 @@ the same way, writes only in the workspace, no programs, no sockets.
 
 | | Login node | Interactive node |
 |---|---|---|
-| Cores per command | 1 | what the allocation has free; local DFT never takes the last 4 |
+| Cores per command | 1 | what the allocation has free; local DFT never takes the last 4; a local run's Slurm step can land on a command's cores, which it then shares until the command ends |
 | Commands at once | 2, across all agents | as cores allow |
 | Time per command | 10 minutes by default, at most 30 | 10 by default, at most 60, never past the allocation's end |
 | Memory, disk | no limit | no limit |
@@ -104,12 +104,54 @@ researcher's allocation, under `fhiaims.run` 0.2:
 
 The local backend (`hpc/local.py`) has the scheduler adapter's interface, so the journaled
 submission, reconciliation by job name, the job monitor, run checks and agent wake-ups are
-the same as for Slurm. It records each job under `<runs_root>/.cedar-local/`, starts it once
-the allocation's cores are free, and runs it through a detached wrapper
-(`hpc/local_runner.py`) that pins it to its cores, stops it at its time limit and records its
-exit code. A run whose allocation ended before it recorded an exit code is FAILED; one on
-another node whose allocation still runs is UNKNOWN. Evidence from a local run records where
-it ran (`execution`, `host`, `allocation`).
+the same as for Slurm. It records each job under `<runs_root>/.cedar-local/` and runs it
+through a detached wrapper (`hpc/local_runner.py`) that outlives the dispatcher.
+
+Each local run is its own Slurm job step in the allocation, of exactly its task count, on
+this node: `srun --jobid=<allocation> --nodes=1 --nodelist=<node> --exact --gres=none
+--mpi=none --ntasks=1 --cpus-per-task=N`. Slurm fences the step to its own CPUs with a cgroup,
+which every MPI library and code respects however it starts its processes. Pinning the
+script with `taskset` does not hold: on an interactive node (Slurm 22.05, 128 cores), Intel
+MPI's `mpirun` started its ranks through `srun`, outside the pin, so a second run waited for
+the first and then landed on the same cores; Open MPI ignored the pin and bound its ranks
+anew. Two runs sharing cores do not just slow down: MPI ranks spin while they wait, and two
+60-rank runs sharing 30 cores had not finished after six times their normal time. As steps,
+Intel MPI, Open MPI and FHI-aims each ran side by side on their own cores. `--exact` gives the
+step only the CPUs it asks for; `--gres=none` keeps it from taking the allocation's GPUs,
+which a step otherwise does, so that the next would wait for them. `srun` starts without the
+researcher's shell's `SLURM_*` variables, which describe the shell's step (its CPU binding
+made steps fail). Inside the step the script runs without the step's `SLURM_*` variables, so
+its `mpirun` starts the ranks itself, inside the step, instead of asking Slurm for another
+step (Intel MPI) or reading a slot count of 1 (Open MPI). A site using Open MPI needs
+`--map-by core` in its template's launch line: by default Open MPI spreads ranks over
+sockets, which a step of part of a node does not have whole.
+
+The cores local DFT may use (the allocation's less 4) are shared first come, first served:
+a run starts only when that many are free in CEDAR's core pool, which counts the runs' cores
+and the agents' commands' (`CorePool`), so that Slurm never has to hold a step back while the
+run's time passes. The pool books a run the lowest free CPUs, the ones Slurm gives a new step
+first, and commands the highest; once the step starts, the run holds the CPUs Slurm gave it,
+which a dispatcher restarted while it runs takes back exactly. The time limit counts from when
+the step started; Slurm's own limit for the step is five minutes longer, in case the wrapper
+dies. A run that waited until its time limit no longer fits in the allocation fails without
+starting.
+
+A run is PENDING (the calculation QUEUED) until its step has started, RUNNING while it runs,
+then COMPLETED, FAILED, TIMEOUT or CANCELLED. The job monitor records what the backend says
+beyond the state as the calculation's scheduler note: "waiting for 60 free cores", "starting
+its Slurm step", "waiting for Slurm to start its step (Requested nodes are busy)", "running on
+CPUs 0-59", or why it failed ("its Slurm step did not start: …"); with a state change, or as a
+`scheduler_note_recorded` event when only the note changes. The live panel, `/status`, the
+agents' briefings and the Chief Scientist show it, so a run that waits for cores is never
+shown as running: an agent waiting for its jobs shows e.g. `calculations 3f2a91c0 (waiting
+for 60 free cores)`, and the jobs summary counts the cores local runs use and wait for.
+"Waiting for Slurm" while CEDAR's cores are free means something else in the allocation holds
+them; a shell started with `srun --pty bash` may hold all of the allocation's CPUs unless it
+was started with `--overlap` (one from `salloc` usually holds none).
+
+A run whose allocation ended before it recorded an exit code is FAILED; one on another node
+whose allocation still runs is UNKNOWN. Evidence from a local run records where it ran
+(`execution`, `host`, `allocation`, the step's `cpus` and `slurm_step`).
 
 A calculation's identity does not include where it runs: requesting on Slurm a calculation
 identical to a healthy local one links the existing run instead of computing it again.

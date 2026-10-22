@@ -24,7 +24,7 @@ from cedar.models.types import (
     WebAccess,
 )
 
-ADAPTERS = ("anthropic",)
+ADAPTERS = ("anthropic", "openai")
 
 
 def create_client(settings: ModelSettings, credentials: CredentialStore) -> ModelClient:
@@ -33,6 +33,10 @@ def create_client(settings: ModelSettings, credentials: CredentialStore) -> Mode
         from cedar.models.anthropic_client import AnthropicClient
 
         return AnthropicClient(credentials.get("anthropic"))
+    if settings.provider == "openai":
+        from cedar.models.openai_client import OpenAIClient
+
+        return OpenAIClient(credentials.get("openai"))
     raise ValueError(f"no adapter for provider {settings.provider!r}; available: {', '.join(ADAPTERS)}")
 
 

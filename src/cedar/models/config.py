@@ -11,9 +11,9 @@ from cedar.contracts.base import Contract
 from cedar.models.types import ModelSettings
 
 STARTER = """# Which model each CEDAR agent role uses. Roles without a section use [roles.default].
-# provider: an adapter CEDAR knows ("anthropic"); model: the provider's exact model id.
-# Budgets are in dollars. CEDAR knows the published prices of the current Claude models; for any other model, or
-# when prices change, give them in dollars per million tokens (web_search: dollars per search), e.g.
+# provider: an adapter CEDAR knows ("anthropic" or "openai"); model: the provider's exact model id.
+# Budgets are in dollars. CEDAR knows the published prices of the current Claude models and of GPT-5.6 Sol; for any
+# other model, or when prices change, give them in dollars per million tokens (web_search: dollars per search), e.g.
 #   [roles.default.prices]
 #   input = 4.0
 #   output = 20.0
@@ -25,6 +25,12 @@ STARTER = """# Which model each CEDAR agent role uses. Roles without a section u
 provider = "anthropic"
 model = "claude-opus-5-5"
 effort = "medium"
+
+# A role can use another provider's model, e.g. OpenAI's (its key: cedar auth add openai):
+#   [roles.hypothesis_agent]
+#   provider = "openai"
+#   model = "gpt-5.6-sol"
+#   effort = "medium"
 """
 
 

@@ -220,10 +220,12 @@ def test_a_model_without_known_prices_does_not_run_under_a_budget(transcripts):
     assert free.outcome == "finished" and free.cost_usd is None
 
 
-def test_published_prices_are_known_for_the_current_claude_models():
+def test_published_prices_are_known_for_the_current_models():
     from cedar.models.prices import prices_for
     assert prices_for(ModelSettings(provider="anthropic", model="claude-opus-5-5")).cache_read == 0.2
+    assert prices_for(ModelSettings(provider="openai", model="gpt-5.6-sol")).cache_read == 0.4
     assert prices_for(ModelSettings(provider="anthropic", model="claude-opus-9")) is None
+    assert prices_for(ModelSettings(provider="openai", model="claude-opus-5-5")) is None
 
 
 def test_a_run_stops_before_its_next_model_call_when_asked(transcripts):

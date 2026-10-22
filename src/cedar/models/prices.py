@@ -15,9 +15,11 @@ PUBLISHED: dict[tuple[str, str], ModelPrices] = {
                                                     web_search=0.01),
     ("anthropic", "claude-fable-5-1"): ModelPrices(input=10.0, output=50.0, cache_read=0.25, cache_write=12.5,
                                                    web_search=0.01),
+    ("openai", "gpt-5.6-sol"): ModelPrices(input=4.0, output=20.0, cache_read=0.40, cache_write=5.0, web_search=0.01),
 }
-"""As Anthropic published them in October 2026: cache writes are five-minute writes, at 1.25 times fresh input
-(CEDAR asks for no longer cache); web search is $10 per 1,000 searches. Set prices in models.toml for any other
+"""As Anthropic and OpenAI published them in October 2026. Cache writes are the default writes, at 1.25 times fresh
+input: five-minute ones at Anthropic, thirty-minute ones at OpenAI (CEDAR asks for no longer cache). Web search is
+$10 per 1,000 searches; OpenAI bills its searches, not the pages it opens. Set prices in models.toml for any other
 model, or when these change."""
 
 

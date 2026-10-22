@@ -44,6 +44,7 @@ _PREFIX_MISMATCH = ("drop_block", "error", "off")
 _STOPS = {"end_turn": "end_turn", "tool_use": "tool_use", "max_tokens": "max_tokens", "refusal": "refusal",
           "pause_turn": "pause_turn"}
 _WEB_SEARCH, _WEB_FETCH = "web_search_20260209", "web_fetch_20260209"
+_RETRYABLE_ERRORS = {"rate_limit_error", "api_error", "overloaded_error"}
 
 
 class AnthropicClient:
@@ -97,8 +98,11 @@ class AnthropicClient:
         except anthropic.RateLimitError as exc:
             raise ModelError(self._clean(f"Anthropic rate limit: {exc}"), retryable=True) from None
         except anthropic.APIStatusError as exc:
-            raise ModelError(self._clean(f"Anthropic error {exc.status_code}: {exc}"),
-                             retryable=exc.status_code >= 500) from None
+            # An error Anthropic sends after the stream has started comes with the stream's status, 200; only its
+            # type says what it is.
+            status = exc.status_code if exc.status_code >= 400 else "partway through the reply"
+            raise ModelError(self._clean(f"Anthropic error {status}: {exc}"),
+                             retryable=exc.status_code >= 500 or exc.type in _RETRYABLE_ERRORS) from None
         except anthropic.APIConnectionError as exc:
             raise ModelError(self._clean(f"cannot reach Anthropic: {exc}"), retryable=True) from None
         return self._from_wire(response, settings.model)

@@ -1,5 +1,7 @@
 """The Anthropic adapter against a stub SDK client returning real SDK response objects. No network."""
 
+import json
+
 import anthropic
 import httpx2
 import pytest
@@ -197,6 +199,28 @@ def test_errors_are_classified_and_never_leak_the_key(error, retryable):
                         messages=[Message(role="user", parts=(TextPart(text="go"),))])
     assert raised.value.retryable is retryable
     assert KEY not in str(raised.value)
+
+
+@pytest.mark.parametrize("error_type, retryable", [
+    ("overloaded_error", True), ("api_error", True), ("invalid_request_error", False),
+])
+def test_errors_sent_partway_through_the_stream_are_classified_by_type(error_type, retryable):
+    """The real SDK, fed a stream that fails after it started: it raises the error on the stream's 200 response."""
+    events = [
+        ("message_start", {"type": "message_start", "message": {
+            "id": "msg_01", "type": "message", "role": "assistant", "model": "claude-opus-5-5", "content": [],
+            "stop_reason": None, "stop_sequence": None, "usage": {"input_tokens": 120, "output_tokens": 1}}}),
+        ("error", {"type": "error", "error": {"type": error_type, "message": f"failed with {KEY}"}}),
+    ]
+    body = "".join(f"event: {name}\ndata: {json.dumps(data)}\n\n" for name, data in events).encode()
+    transport = httpx2.MockTransport(
+        lambda request: httpx2.Response(200, headers={"content-type": "text/event-stream"}, content=body))
+    sdk = anthropic.Anthropic(api_key=KEY, max_retries=0, http_client=httpx2.Client(transport=transport))
+    with pytest.raises(ModelError) as raised:
+        AnthropicClient(KEY, client=sdk).complete(system="s", tools=[], settings=SETTINGS,
+                                                  messages=[Message(role="user", parts=(TextPart(text="go"),))])
+    assert raised.value.retryable is retryable
+    assert error_type in str(raised.value) and KEY not in str(raised.value)
 
 
 # -- web search and fetch, images and PDFs ------------------------------------------------------

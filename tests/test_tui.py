@@ -29,6 +29,7 @@ from test_orchestration import (
 from textual.color import Color
 from textual.widgets import Collapsible, DataTable, Footer, Markdown, OptionList, Static, TextArea
 
+from cedar.chat import ChatSession
 from cedar.contracts import Assessment, AssessmentRecorded, Completeness, EventDraft, SchedulerState
 from cedar.dashboard import short_id
 from cedar.dispatch import JUDGE
@@ -362,6 +363,50 @@ def test_the_chief_scientists_reviews_appear_as_its_messages(system):
             w.source for w in app.query_one("#chat").query(Markdown)]
 
     drive(app, script)
+
+
+def test_a_reopened_investigation_shows_the_conversation_so_far(system, monkeypatch):
+    clients, chat = system["clients"], system["chat"]
+    clients.add("chief_scientist", reply(TextPart(text="Which site do the experiments see?")),
+                open_and_delegate(system["site"]), reply(TextPart(text="Opened and **delegated**.")))
+    chat.handle("PBE puts CO in the fcc hollow on Cu(111).")
+    chat.handle("Atop, at low coverage.")  # the investigation opens: both messages are recorded only now
+    chat.handle("/approve agents")
+    clients.add("hypothesis_agent", reply(TextPart(text="Nothing to compute before the baseline is approved.")))
+    system["dispatcher"].tick()
+    clients.add("chief_scientist", reply(TextPart(text="Noted.")))
+    chat.handle("Thanks.")
+
+    def reopened() -> CedarApp:
+        session = ChatSession(system["workspace"], system["profiles"], clients, investigation_id=INV,
+                              backend=system["scheduler"], clock=system["clock"])
+        return CedarApp(session, refresh_seconds=3600, clock=lambda: NOW)
+
+    app = reopened()
+
+    async def script(pilot):
+        await settle(pilot)
+        text = conversation(app)
+        shown = ["you › PBE puts CO in the fcc hollow", "Which site do the experiments see?",
+                 "you › Atop, at low coverage.", "Opened and **delegated**.", "› /approve agents",
+                 "Nothing to compute before the baseline", "you › Thanks.", "Noted.",
+                 f"Investigation {INV}, continued: the conversation so far is above."]
+        assert [text.index(line) for line in shown] == sorted(text.index(line) for line in shown)
+        assert text.count("Nothing to compute before the baseline") == 1  # not shown again as news
+        view = app.query_one("#chat")
+        assert view.max_scroll_y > 0 and view.scroll_y == view.max_scroll_y
+
+    drive(app, script, size=(100, 30))
+    monkeypatch.setattr("cedar.tui.HISTORY_SHOWN", 2)
+    app = reopened()
+
+    async def shortened(pilot):
+        await settle(pilot)
+        text = conversation(app)
+        assert "earlier messages and notices are not shown" in text and "Noted." in text
+        assert "you › Thanks." in text and "Opened and **delegated**." not in text
+
+    drive(app, shortened)
 
 
 def test_the_panel_is_always_there_with_the_logo_across_its_top_border(system):

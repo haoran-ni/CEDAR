@@ -7,7 +7,8 @@ commands are handled here, not by a model: authorizations to run a calculation, 
 start agents early or close the investigation can only come from the researcher's own
 command. A calculation is approved to run once, after the input reviewer has finished
 with it: that approval covers its inputs and its submission, and is the last step before
-it runs.
+it runs. A session reopened on an investigation rebuilds the conversation so far from the
+record, with the Chief Scientist's answers and the notices shown meanwhile.
 
 The Chief Scientist also reviews the agents' reports in the background, in a conversation
 of its own; what it concluded is shown here, and passed to it at the start of its next
@@ -257,6 +258,14 @@ class Notice:
         return f"[{head}] {body}" if head else body
 
 
+@dataclass(frozen=True)
+class Said:
+    """A turn of the conversation as recorded: the researcher's message or command, or the Chief Scientist's answer."""
+
+    text: str
+    researcher: bool
+
+
 _ROLE_NAMES = {"input_reviewer": "input reviewer", "evidence_judge": "Evidence Judge", "approver": "approver",
                "chief_scientist": "Chief Scientist"}
 _FAILED_RUNS = {"turn_limit", "budget_limit", "truncated", "refused", "model_error", "stopped"}
@@ -296,6 +305,77 @@ def _is_review(run: AgentRunRecord) -> bool:
     return run.role == "chief_scientist" and run.run.task_id is not None
 
 
+def _recorded_notices(state: InvestigationState, after: int, until: int) -> list[tuple[int, Notice]]:
+    """The notices for what was recorded after event ``after`` up to event ``until``, each with the event it came
+    from: agent reports and what they ask the researcher, the Chief Scientist's reviews and next steps, the approver's
+    decisions, and full automation ending."""
+    def new(recorded_at: int) -> bool:
+        return after < recorded_at <= until
+
+    fresh = [r for r in state.agent_runs if new(r.recorded_at) and (r.role != "chief_scientist" or _is_review(r))]
+    recommended = [r for r in state.recommendations.values() if new(r.recorded_at)]
+    decided = [a for a in state.approvals.values() if new(a.recorded_at)]
+    ended = [m for m in state.modes if new(m.recorded_at) and m.actor.kind is not ActorKind.USER]
+    notices = []
+    for run in fresh:
+        if _is_review(run):
+            notices.append((run.recorded_at, Notice((run.run.report or f"(the review ended {run.run.outcome} without "
+                                                                       "a message)").strip(), review=True)))
+            continue
+        if run.role == "approver" and run.run.outcome not in _FAILED_RUNS:
+            continue  # each of its decisions is shown below, with its reason
+        notice = _report_notice(state, run)
+        notices.append((run.recorded_at, notice))
+        asked = run.run.structured.requests if run.run.structured is not None else ()
+        notices += [(run.recorded_at, Notice(r.text, notice.source, "asks you", attention=True)) for r in asked
+                    if r.to == "researcher"]
+    notices += [(r.recorded_at, _next_steps_notice(state, r)) for r in recommended]
+    for a in decided:
+        what = (f"the agents of {a.target_id}" if a.action is PermissionAction.START_AGENTS else
+                f"submitting {a.target_id}" + (f" ({a.core_hours:g} core-hours)" if a.core_hours else ""))
+        notices.append((a.recorded_at, Notice(f"{'approved' if a.approved else 'declined'} {what}: {a.reason}",
+                                              "approver", "full automation")))
+    notices += [(m.recorded_at, Notice(f"{m.reason}. It is paused: ask the Chief Scientist to resume it, or switch "
+                                       "full automation on again with /mode.", label="full automation ended",
+                                       attention=True)) for m in ended]
+    return notices
+
+
+def _answer(run: AgentRunRecord) -> Said:
+    """The Chief Scientist's answer to the researcher, as recorded (the record keeps the first REPORT_LIMIT
+    characters)."""
+    stopped = f"\n\n[the Chief Scientist stopped: {run.run.outcome}]" if run.run.outcome != "finished" else ""
+    return Said(((run.run.report or "") + stopped).strip() or "(no reply)", researcher=False)
+
+
+def _in_turns(entries: list[tuple[int, Said | Notice]]) -> list[Said | Notice]:
+    """The entries, each with the event it came from, in the order they were shown. Messages sent before the
+    investigation opened are recorded as it opens, and the answers to them together at the end of that turn: each of
+    those answers is put right after its message. A message whose answer was never recorded (the window was closed
+    while the Chief Scientist worked) stays without one."""
+    entries = sorted(entries, key=lambda e: e[0])
+    keys = [(at, 0) for at, _ in entries]
+    asked: list[int] = []  # the messages since the last answers, by the event that recorded them
+    answers: list[int] = []  # answers recorded one after another, by their place in ``entries``
+
+    def pair() -> None:
+        # The last answer is to the last message and stays where it was recorded; each before it goes after its own.
+        for place, at in list(zip(reversed(answers), reversed(asked)))[1:]:
+            keys[place] = (at, 1)
+        asked.clear()
+        answers.clear()
+
+    for place, (at, entry) in enumerate(entries):
+        if isinstance(entry, Said) and not entry.researcher:
+            answers.append(place)
+        elif isinstance(entry, Said) and not entry.text.startswith("/"):
+            if answers:
+                pair()
+            asked.append(at)
+    pair()
+    return [entry for _, (_, entry) in sorted(zip(keys, entries), key=lambda keyed: keyed[0])]
+
+
 @dataclass
 class ChatSession:
     workspace: Workspace
@@ -313,6 +393,8 @@ class ChatSession:
     _announced_materials: set[str] = field(default_factory=set)
     _unrecorded_runs: list[RunResult] = field(default_factory=list)
     _seen_runs: int = 0
+    _history_until: int = 0
+    """The last event ``history`` shows; ``notices`` shows what came after."""
     _shown_approvals: set[str] = field(default_factory=set)
     _shown_reviews: set[str] = field(default_factory=set)
     """Calculations whose inputs needing a look the researcher has been shown; /approve submit all approves only these
@@ -340,6 +422,7 @@ class ChatSession:
                 [i.recorded_at for i in state.interventions.values()]
                 + [r.recorded_at for r in state.agent_runs if r.role == "chief_scientist" and not _is_review(r)],
                 default=0)
+            self._history_until = self._seen_runs
             chats = [r for r in state.agent_runs if r.role == "chief_scientist" and not _is_review(r)]
             self.chief_session = chats[-1].session_id if chats else f"{self.investigation_id}.chief"
             self._shown_starts = set(state.agents)
@@ -1109,44 +1192,36 @@ class ChatSession:
 
     # -- what happened meanwhile ----------------------------------------------------------------
 
+    def history(self) -> list[Said | Notice]:
+        """The conversation before this session, rebuilt from the record in the order it was shown: the researcher's
+        messages and the commands that changed the record, the Chief Scientist's answers, and the notices that came
+        meanwhile. What other commands answered is not recorded; requests for approval are shown by ``notices``
+        while they wait."""
+        if self.investigation_id is None:
+            return []
+        state = self.workspace.ledger.load(self.investigation_id)
+        until = self._history_until
+        entries: list[tuple[int, Said | Notice]] = [
+            (i.recorded_at, Said(i.text, researcher=True)) for i in state.interventions.values()
+            if i.recorded_at <= until]
+        entries += [(r.recorded_at, _answer(r)) for r in state.agent_runs
+                    if r.role == "chief_scientist" and not _is_review(r) and r.recorded_at <= until]
+        return _in_turns(entries + _recorded_notices(state, 0, until))
+
     def notices(self) -> list[Notice]:
         """What arrived since the researcher last looked: agent reports, the Chief Scientist's reviews and the next
         steps it recommended, agents that started, and each request for approval the first time it is seen."""
         if self.investigation_id is None:
             return []
         state = self.workspace.ledger.load(self.investigation_id)
-        fresh = [r for r in state.agent_runs if r.recorded_at > self._seen_runs
-                 and (r.role != "chief_scientist" or _is_review(r))]
-        recommended = [r for r in state.recommendations.values() if r.recorded_at > self._seen_runs]
-        decided = [a for a in state.approvals.values() if a.recorded_at > self._seen_runs]
-        ended = [m for m in state.modes if m.recorded_at > self._seen_runs and m.actor.kind is not ActorKind.USER]
-        self._seen_runs = state.version
         notices = []
         for agent in state.agents.values():  # the researcher's own /approve agents already said who started
             if agent.agent_id not in self._shown_starts and agent.authorization_id is None:
                 notices.append(Notice(f"on {agent.hypothesis_id}, after the review window passed with no reply",
                                       f"{agent.tag} {agent.agent_id}", "started"))
             self._shown_starts.add(agent.agent_id)
-        for run in fresh:
-            if _is_review(run):
-                notices.append(Notice((run.run.report or f"(the review ended {run.run.outcome} without a "
-                                                         "message)").strip(), review=True))
-                continue
-            if run.role == "approver" and run.run.outcome not in _FAILED_RUNS:
-                continue  # each of its decisions is shown below, with its reason
-            notice = _report_notice(state, run)
-            notices.append(notice)
-            asked = run.run.structured.requests if run.run.structured is not None else ()
-            notices += [Notice(r.text, notice.source, "asks you", attention=True) for r in asked
-                        if r.to == "researcher"]
-        notices += [_next_steps_notice(state, r) for r in recommended]
-        for a in decided:
-            what = (f"the agents of {a.target_id}" if a.action is PermissionAction.START_AGENTS else
-                    f"submitting {a.target_id}" + (f" ({a.core_hours:g} core-hours)" if a.core_hours else ""))
-            notices.append(Notice(f"{'approved' if a.approved else 'declined'} {what}: {a.reason}", "approver",
-                                  "full automation"))
-        notices += [Notice(f"{m.reason}. It is paused: ask the Chief Scientist to resume it, or switch full automation "
-                           "on again with /mode.", label="full automation ended", attention=True) for m in ended]
+        notices += [notice for _, notice in _recorded_notices(state, self._seen_runs, state.version)]
+        self._seen_runs = state.version
         for command, note in approval_requests(state, brief=True):
             if f"{command} {note}" not in self._shown_approvals:
                 self._shown_approvals.add(f"{command} {note}")

@@ -2,7 +2,8 @@
 
 The interface is only a client. It reads the record and the dispatcher's status files,
 and talks to the Chief Scientist through ``ChatSession``. Closing it interrupts nothing,
-and reopening it shows the same investigation.
+and reopening it shows the same investigation, with the conversation so far rebuilt from
+the record: what other commands answered is not recorded, so only the commands show.
 
 Top to bottom: the panel, always shown: the logo, set across its top border, with the
 tagline and the models in use beside it; the mode, on its own line and highlighted in full
@@ -51,7 +52,7 @@ from textual.message import Message
 from textual.widgets import Collapsible, DataTable, Footer, Markdown, OptionList, Static, TextArea
 from textual.widgets.option_list import Option
 
-from cedar.chat import COMMANDS, HELP, ChatSession, Command, Notice, command_lines
+from cedar.chat import COMMANDS, HELP, ChatSession, Command, Notice, Said, command_lines
 from cedar.dashboard import (
     AgentRow,
     SwarmRow,
@@ -154,6 +155,9 @@ class Composer(TextArea):
 
 NARROW_COLUMNS = 110
 """Below this terminal width the panel's table starts hidden; the status lines still summarize it."""
+HISTORY_SHOWN = 100
+"""How much of the conversation so far a reopened window shows, at most: its latest messages and notices. Each long
+answer takes a moment to lay out."""
 
 TAGLINE = "Autonomous Scientific Agent Swarm for Computation-Experiment Discrepancies"
 _LOGO_ANSI = (
@@ -474,8 +478,17 @@ class CedarApp(App):
         self.query_one("#chat", VerticalScroll).anchor()  # follows what comes until the researcher scrolls up
         self.query_one("#agents", DataTable).add_columns(*self.AGENT_COLUMNS)
         self.query_one("#swarm", DataTable).add_columns(*self.COLUMNS)
+        history = self.session.history()
+        if len(history) > HISTORY_SHOWN:
+            self.say(f"({len(history) - HISTORY_SHOWN} earlier messages and notices are not shown: the timeline "
+                     f"(/timeline) lists every event, and {self.workspace.transcripts.root} holds the Chief "
+                     "Scientist's conversations.)", "notice")
+        for entry in history[-HISTORY_SHOWN:]:
+            self._replay(entry)
         if self.session.investigation_id:
-            self.say(f"Investigation {self.session.investigation_id}. Type /help for commands.", "notice")
+            self.say(f"Investigation {self.session.investigation_id}"
+                     + (", continued: the conversation so far is above" if history else "")
+                     + ". Type /help for commands.", "notice")
         else:
             self.say("New conversation with the Chief Scientist. Describe the simulation-experiment discrepancy you "
                      "want to investigate. Type /help for commands.", "notice")
@@ -502,6 +515,15 @@ class CedarApp(App):
     def say(self, text: str, kind: str) -> None:
         """Add a line to the conversation, shown exactly as written."""
         self.query_one("#chat", VerticalScroll).mount(Static(Text(text), classes=kind))
+
+    def _replay(self, entry: Said | Notice) -> None:
+        """Show a part of the conversation before this window opened as it was shown then."""
+        if isinstance(entry, Notice):
+            self._notice(entry)
+        elif not entry.researcher:
+            self._chief_says(entry.text)
+        else:
+            self.say(f"› {entry.text}" if entry.text.startswith("/") else f"you › {entry.text}", "user")
 
     # -- input --------------------------------------------------------------------------------
 
@@ -629,17 +651,20 @@ class CedarApp(App):
             box.collapsed = True
         else:
             box.remove()
-        chat = self.query_one("#chat", VerticalScroll)
         if error is not None:
-            chat.mount(Static(Text(error), classes="error"))
+            self.say(error, "error")
         else:
-            chat.mount(Static("Chief Scientist ›", classes="speaker"))
-            chat.mount(Markdown(reply or "(no reply)", open_links=False))
+            self._chief_says(reply or "(no reply)")
         self.chief_busy, self._chief_since = False, None
         self._working("")
         self.refresh_state()
         if self.waiting:
             self._ask(self.waiting.popleft())
+
+    def _chief_says(self, text: str, heading: str = "Chief Scientist ›") -> None:
+        chat = self.query_one("#chat", VerticalScroll)
+        chat.mount(Static(heading, classes="speaker"))
+        chat.mount(Markdown(text, open_links=False))
 
     def _working(self, text: str) -> None:
         self._working_text = text
@@ -745,19 +770,21 @@ class CedarApp(App):
             fill_table(self.query_one("#swarm", DataTable), cells)
             self._fit_panel()
         for notice in snapshot.notices:
-            if notice.review:
-                chat = self.query_one("#chat", VerticalScroll)
-                chat.mount(Static("Chief Scientist (review of the agents' reports) ›", classes="speaker"))
-                chat.mount(Markdown(notice.text, open_links=False))
-            elif notice.source:
-                self._agent_says(notice)
-            elif not notice.command:
-                self.say(notice.text, "notice attention" if notice.attention else "notice")
+            self._notice(notice)
         waiting = [n for n in snapshot.notices if n.command]
         if waiting:
             self._ask_approval(waiting)
         for alert in snapshot.alerts:
             self.notify(alert, title="New result", timeout=10, markup=False)
+
+    def _notice(self, notice: Notice) -> None:
+        """Show a notice in the conversation; those waiting for the researcher are gathered by ``_ask_approval``."""
+        if notice.review:
+            self._chief_says(notice.text, "Chief Scientist (review of the agents' reports) ›")
+        elif notice.source:
+            self._agent_says(notice)
+        elif not notice.command:
+            self.say(notice.text, "notice attention" if notice.attention else "notice")
 
     def _agent_says(self, notice: Notice) -> None:
         """An agent's message, set apart from the conversation: a bar and its name in its colour, how its task ended,

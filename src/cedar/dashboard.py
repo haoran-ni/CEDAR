@@ -18,6 +18,7 @@ from datetime import datetime
 from cedar.contracts.events import RecordedEvent
 from cedar.contracts.examination import ExaminationVerdict
 from cedar.contracts.plan import PermissionAction
+from cedar.contracts.review import ReviewDecision
 from cedar.contracts.status import CalculationState, HypothesisStatus, InvestigationMode
 from cedar.dispatch import Activity
 from cedar.models.prices import dollars
@@ -32,6 +33,7 @@ from cedar.state.projection import (
     RetrievalRecord,
     agent_id_for,
     authorization_for,
+    awaits_reviewer,
     hypothesis_evidence,
 )
 from cedar.summaries import approval_requests, short_id
@@ -76,13 +78,17 @@ def job_status(state: InvestigationState, calc: CalculationRecord) -> str:
     if calc.state is _C.SPECIFIED:
         if exam is None:
             text = "being examined"
-        elif exam.verdict is ExaminationVerdict.NEEDS_REVIEW and authorization_for(
+        elif exam.agent_review and awaits_reviewer(state, calc):
+            text = "with the input reviewer"
+        elif (exam.agent_review or exam.verdict is ExaminationVerdict.NEEDS_REVIEW) and authorization_for(
                 state, PermissionAction.APPROVE_INPUTS, calc.calculation_id) is None:
-            text = "needs /approve inputs"
+            warned = calc.input_review is not None and calc.input_review.decision is ReviewDecision.WARNED
+            text = "needs /approve inputs" + (" (the input reviewer warned)" if warned else "")
         else:
             text = "examined"
     elif calc.state is _C.REJECTED:
-        text = "inputs rejected"
+        text = "inputs rejected" + (" by you" if calc.rejected_by_researcher else
+                                    " by the input reviewer" if calc.rejected_by_reviewer else "")
     elif calc.state is _C.VALIDATED_INPUT:
         needs = state.spec.constraints.submit_requires_approval and authorization_for(
             state, PermissionAction.SUBMIT, calc.calculation_id) is None
@@ -134,6 +140,8 @@ def task_label(task: AgentTaskRecord | None) -> str:
         return f"assess {task.hypothesis_id}"
     if task.role == "approver":
         return "decide on proposals and submissions"
+    if task.role == "input_reviewer":
+        return f"review the inputs of {', '.join(short_id(c) for c in task.calculation_ids)}"
     if task.instruction.startswith(WAKE_TASK):
         return "analyze its finished calculations"
     return _short(task.instruction.removeprefix(FIRST_TASK).splitlines()[0], 70)
@@ -238,6 +246,24 @@ def agent_rows(state: InvestigationState | None, events: Sequence[RecordedEvent]
                      "assesses when the Chief Scientist asks", None)
     rows.append(AgentRow("judge", "Evidence Judge", "assesses evidence", *judge[:3], hypothesis_id=judge[3]))
 
+    # The input reviewer: once it has had inputs to review.
+    if state is not None and any(t.role == "input_reviewer" for t in state.tasks.values()):
+        reviewing = [a for a in mine if a.role == "input_reviewer"]
+        waiting_reviews = [t for t in pending if t.role == "input_reviewer" and t.task_id not in
+                           {a.task_id for a in reviewing}]
+        if reviewing:
+            more = f" (and {len(reviewing) - 1} more)" if len(reviewing) > 1 else ""
+            reviewer = ("working", ago(reviewing[0].started_at),
+                        task_label(state.tasks.get(reviewing[0].task_id)) + more)
+        elif waiting_reviews:
+            more = f" (and {len(waiting_reviews) - 1} more)" if len(waiting_reviews) > 1 else ""
+            reviewer = ("queued", ago(at(waiting_reviews[0].queued_at)), task_label(waiting_reviews[0]) + more)
+        else:
+            last = runs_of(role="input_reviewer")
+            done = state.tasks.get(last[-1].run.task_id) if last and last[-1].run.task_id else None
+            reviewer = ("idle", ago(at(last[-1].recorded_at)) if last else "", f"last: {task_label(done)}")
+        rows.append(AgentRow("reviewer", "Input reviewer", "reviews inputs before they run", *reviewer))
+
     # The approver: only in full automation, or once it has worked.
     if state is not None and (automated or any(t.role == "approver" for t in state.tasks.values())):
         deciding = next((a for a in mine if a.role == "approver"), None)
@@ -324,6 +350,8 @@ def dispatcher_status(heartbeat_age: float | None, activities: Sequence[Activity
             parts.append("the Chief Scientist's review")
         if roles["approver"]:
             parts.append("the approver")
+        if roles["input_reviewer"]:
+            parts.append("the input reviewer")
         return f"dispatcher running {' and '.join(parts)}", False
     return f"dispatcher seen {age(heartbeat_age)} ago", False
 
@@ -343,6 +371,8 @@ def subagent_status(state: InvestigationState | None, activities: Sequence[Activ
             working.append(f"Evidence Judge on {activity.hypothesis_id} ({took})")
         elif activity.role == "approver":
             working.append(f"approver deciding ({took})")
+        elif activity.role == "input_reviewer":
+            working.append(f"input reviewer on {activity.hypothesis_id} ({took})")
     text = f"Working sub-agents: {'; '.join(working)}" if working else "No working sub-agents"
     running = {a.task_id for a in mine}
     queued = [t for t in state.pending_tasks if t.task_id not in running] if state is not None else []
@@ -357,7 +387,7 @@ def subagent_status(state: InvestigationState | None, activities: Sequence[Activ
 
 
 MODEL_ROLES = (("chief_scientist", "Chief Scientist"), ("hypothesis_agent", "hypothesis agents"),
-               ("evidence_judge", "Evidence Judge"), ("approver", "approver"))
+               ("evidence_judge", "Evidence Judge"), ("approver", "approver"), ("input_reviewer", "input reviewer"))
 
 
 def model_line(settings: Callable[[str], ModelSettings], state: InvestigationState | None) -> str:

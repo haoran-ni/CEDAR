@@ -48,6 +48,16 @@ class Protocol(ABC):
     structure_file: str
     execution_files: tuple[str, ...]
     output_files: tuple[str, ...]
+    reviewed_by_agent: bool = False
+    """The scientific content of the inputs is judged by the input reviewer; the examination checks only what runs
+    on the machine and records facts for the reviewer."""
+    superseded_by: str | None = None
+    """The version new requests use instead; this one stays for the calculations recorded under it."""
+
+    def input_settings(self, files: Mapping[str, bytes]) -> dict[str, str]:
+        """Every setting the inputs make, as written, for the record and for comparisons; empty if this protocol
+        cannot read them."""
+        return {}
 
     @property
     @abstractmethod
@@ -109,3 +119,7 @@ class ProtocolRegistry:
 
     def refs(self) -> list[ProtocolRef]:
         return [p.ref for p in self._protocols.values()]
+
+    def current_refs(self) -> list[ProtocolRef]:
+        """The versions new requests may use: not superseded by another."""
+        return [p.ref for p in self._protocols.values() if p.superseded_by is None]

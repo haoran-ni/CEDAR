@@ -22,6 +22,8 @@ from test_orchestration import (
     make_system,
     open_and_delegate,
     open_and_start,
+    review_inputs,
+    reviewer_decides,
 )
 from textual.widgets import Collapsible, DataTable, Footer, Markdown, OptionList, Static, TextArea
 
@@ -113,6 +115,7 @@ def validated_run(system) -> str:
     open_and_start(system)
     clients.add("hypothesis_agent", *agent_requests(system))
     dispatcher.tick()
+    review_inputs(system)
     calc = latest_calc(system["workspace"])
     chat.handle(f"/approve submit {calc}")
     output = aims_output(energy=ENERGY)
@@ -159,6 +162,12 @@ def test_conversation_live_panel_and_approval(system):
         await asyncio.to_thread(dispatcher.tick)
         await refresh(pilot)
         calc = latest_calc(system["workspace"])
+        assert panel(app)[0][2] == f"{short_id(calc)} with the input reviewer"
+        clients.add("input_reviewer", *reviewer_decides(system))
+        await asyncio.to_thread(dispatcher.tick)
+        await refresh(pilot)
+        assert agents(app)["Input reviewer"][1] == "idle"
+        assert agents(app)["Input reviewer"][3] == f"last: review the inputs of {short_id(calc)}"
         (row,) = panel(app)
         assert row[2] == f"{short_id(calc)} needs /approve submit" and row[3] == "none" and row[4] == "NOT_TESTED"
         assert agents(app)[f"A1 agent-{HYP}"][1] == "waiting for jobs" and "dispatcher seen 0 s ago" in status(app)

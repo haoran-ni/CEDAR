@@ -19,6 +19,7 @@ from cedar.contracts.task import compare_tasks
 from cedar.state.ledger import ResearchLedger
 from cedar.state.projection import hypothesis_evidence, predicted_by
 from cedar.store.artifacts import ArtifactStore
+from cedar.summaries import review_lines, run_directory
 
 SCRIPT_SHOWN_CHARS = 4000
 
@@ -30,6 +31,8 @@ class JudgeContext:
     actor: Actor
     artifacts: ArtifactStore | None = None
     """Where analysis scripts are stored, so the dossier can show them."""
+    runs_root: str | None = None
+    """Where run directories are, so the dossier can say where each calculation's inputs and outputs are."""
 
 
 class HypothesisArg(Contract):
@@ -63,6 +66,26 @@ def _analysis_lines(run, artifacts: ArtifactStore | None) -> list[str]:
         shown = script if len(script) <= SCRIPT_SHOWN_CHARS else script[:SCRIPT_SHOWN_CHARS] + "\n…[script truncated]"
         lines += ["  script:", *(f"    {line}" for line in shown.splitlines())]
     return lines
+
+
+def input_differences(calcs, varied) -> tuple[list[str], list[str]]:
+    """Keywords the examined control.in files set differently that no task declares and the comparison does not
+    vary: those the input reviewer classified as convergence aids or output only, and the rest, which are
+    uncontrolled."""
+    examined = [c for c in calcs if c.examination is not None and c.examination.settings and not c.registered]
+    if len(examined) < 2:
+        return [], []
+    declared = {name for c in calcs for name in (*c.task.interventions, *c.task.controls, *c.task.numerical_settings)}
+    names = sorted(set().union(*(c.examination.settings for c in examined)) - declared - set(varied))
+    uncontrolled, aids = [], []
+    for name in names:
+        values = [c.examination.settings.get(name, "(absent)") for c in examined]
+        if len(set(values)) == 1:
+            continue
+        roles = {c.input_review.settings.get(name) for c in examined if c.input_review is not None} - {None}
+        line = f"    {name}: {values}" + (f" ({', '.join(sorted(roles))})" if roles else "")
+        (aids if roles and roles <= {"convergence_aid", "output"} else uncontrolled).append(line)
+    return uncontrolled, aids
 
 
 def judge_tools(ctx: JudgeContext) -> list[AgentTool]:
@@ -102,6 +125,16 @@ def judge_tools(ctx: JudgeContext) -> list[AgentTool]:
                              f"{registration.description}")
             lines.append(f"  interventions {task.interventions}; controls {task.controls}; numerical "
                          f"{task.numerical_settings}")
+            exam = calc.examination
+            if exam is not None and not calc.registered:
+                if exam.settings:
+                    lines.append("  control.in actually sets: " + "; ".join(f"{k} {v}".strip()
+                                                                          for k, v in exam.settings.items()))
+                directory = run_directory(calc, ctx.runs_root)
+                if directory:
+                    lines.append(f"  inputs and outputs in {directory}")
+                if calc.input_review is not None:
+                    lines += ["  " + line for line in review_lines(calc.input_review)]
             if calc.run_check is not None:
                 failed = [c.name for c in calc.run_check.checks if not c.passed]
                 lines.append("  run check: " + (f"FAILED {', '.join(failed)}" if failed else "healthy"))
@@ -145,9 +178,18 @@ def judge_tools(ctx: JudgeContext) -> list[AgentTool]:
         missing = [c for c in args.calculation_ids if c not in state.calculations]
         if missing:
             raise ToolFailure(f"unknown calculations: {missing}")
-        report = compare_tasks([state.calculations[c].task for c in args.calculation_ids], args.varied)
-        lines = [f"Controlled comparison: {'yes' if report.is_controlled else 'NO'}"]
+        calcs = [state.calculations[c] for c in args.calculation_ids]
+        report = compare_tasks([c.task for c in calcs], args.varied)
+        uncontrolled, aids = input_differences(calcs, args.varied)
+        lines = [f"Controlled comparison: {'yes' if report.is_controlled and not uncontrolled else 'NO'}"]
         lines += [f"  {d.variable} ({d.category}, {d.kind.value}): {list(d.values)}" for d in report.differences]
+        if uncontrolled:
+            lines.append("  Set differently in control.in, and declared by no task nor as varied (uncontrolled):")
+            lines += uncontrolled
+        if aids:
+            lines.append("  Differ only in how a result is reached or what is printed, as the input reviewer "
+                         "classified them:")
+            lines += aids
         if report.needs_numerical_justification:
             lines.append("  Numerical settings differ: the comparison needs evidence that the target quantity is "
                          "converged with respect to them.")

@@ -15,6 +15,7 @@ from test_orchestration import (
     agent_reads,
     agent_requests,
     call,
+    review_inputs,
     latest_calc,
     make_system,
     open_and_delegate,
@@ -79,9 +80,11 @@ def test_in_full_automation_the_approver_and_the_judge_carry_the_investigation(t
     assert (f"[approver, full automation] approved the agents of {proposal.proposal_id}: A cheap baseline "
             "first.") in texts
 
-    # The agent requests a calculation; the approver approves its submission within the core-hours.
+    # The agent requests a calculation, the input reviewer approves its inputs, and the approver approves its
+    # submission within the core-hours.
     clients.add("hypothesis_agent", *agent_requests(system))
     dispatcher.tick()
+    review_inputs(system)
     calc = latest_calc(system["workspace"])
     hours = ledger.load(INV).calculations[calc].examination.requested_core_hours
     assert hours and approval_requests(ledger.load(INV)) == []
@@ -158,6 +161,7 @@ def test_the_approver_decides_only_in_full_automation_and_within_its_core_hours(
     open_and_start(system)
     system["clients"].add("hypothesis_agent", *agent_requests(system))
     dispatcher.tick()
+    review_inputs(system)
     calc = latest_calc(system["workspace"])
     hours = ledger.load(INV).calculations[calc].examination.requested_core_hours
 

@@ -64,6 +64,7 @@ from cedar.contracts.investigation import (
     discrepancy,
 )
 from cedar.contracts.plan import Authorization, PermissionAction, Priority, ResearchPlan
+from cedar.contracts.review import InputReviewRecorded, ReviewDecision
 from cedar.contracts.status import (
     CALCULATION_MACHINE,
     HYPOTHESIS_MACHINE,
@@ -114,7 +115,9 @@ EVENT_ACTORS: dict[type, frozenset[ActorKind]] = {
     AnalysisRecorded: frozenset({_A.ANALYSIS_RUNNER}),
     EvidenceRecorded: frozenset({_A.VALIDATOR, _A.HYPOTHESIS_AGENT, _A.USER}),
     AssessmentRecorded: frozenset({_A.EVIDENCE_JUDGE}),
-    AgentRunRecorded: frozenset({_A.CHIEF_SCIENTIST, _A.HYPOTHESIS_AGENT, _A.EVIDENCE_JUDGE, _A.APPROVER}),
+    AgentRunRecorded: frozenset({_A.CHIEF_SCIENTIST, _A.HYPOTHESIS_AGENT, _A.EVIDENCE_JUDGE, _A.APPROVER,
+                                _A.INPUT_REVIEWER}),
+    InputReviewRecorded: frozenset({_A.INPUT_REVIEWER}),
     AgentTaskQueued: frozenset({_A.USER, _A.CHIEF_SCIENTIST, _A.SYSTEM, _A.APPROVER}),
     AgentsProposed: frozenset({_A.CHIEF_SCIENTIST}),
     AgentsStarted: frozenset({_A.USER, _A.SYSTEM, _A.APPROVER}),
@@ -230,7 +233,12 @@ class CalculationRecord:
     end_reason: str | None = None
     """Why it was rejected or cancelled."""
     ended_by: str | None = None
-    """The researcher's message recorded with the rejection or cancellation, where the record requires one."""
+    """What authorized the rejection or cancellation, where the record requires it: the researcher's message, or
+    the input reviewer's review."""
+    rejected_by: str | None = None
+    """Who rejected inputs the examiner did not reject: "researcher" or "input_reviewer"."""
+    input_review: InputReviewRecorded | None = None
+    """The input reviewer's review of the inputs, if one was recorded."""
 
     @property
     def registered(self) -> bool:
@@ -238,7 +246,17 @@ class CalculationRecord:
 
     @property
     def rejected_by_researcher(self) -> bool:
-        return self.state is CalculationState.REJECTED and self.ended_by is not None
+        return self.state is CalculationState.REJECTED and self.rejected_by == "researcher"
+
+    @property
+    def rejected_by_reviewer(self) -> bool:
+        return self.state is CalculationState.REJECTED and self.rejected_by == "input_reviewer"
+
+    @property
+    def refused(self) -> bool:
+        """Rejected after its examination, by the researcher or the input reviewer: its agent hears of it later, with
+        the reason, rather than in reply to its request."""
+        return self.rejected_by is not None and self.state is CalculationState.REJECTED
 
     @property
     def shared(self) -> bool:
@@ -462,6 +480,8 @@ class AgentTaskRecord:
     """Stream version at which its agent was retired before carrying it out."""
     continues: str | None = None
     """The task it carries on with, after the run carrying that one out was cut off."""
+    calculation_ids: tuple[str, ...] = ()
+    """The calculations an input reviewer's task reviews."""
 
 
 @dataclass
@@ -837,6 +857,66 @@ def _require_authorization(
         raise RuleViolation(f"{action} of {target_id} requires a user authorization naming it")
 
 
+MAX_REVIEW_REJECTIONS = 3
+"""Revisions of one request the input reviewer may send back to the agent; it cannot reject the next one, which goes
+to the researcher."""
+MAX_REVIEW_ATTEMPTS = 2
+"""Reviewer tasks that may end without a decision on a calculation before the researcher decides on it instead."""
+
+
+def _by_review(calc: CalculationRecord, authorization_id: str | None, decision: ReviewDecision) -> bool:
+    """Whether ``authorization_id`` names the input reviewer's review of ``calc``, with ``decision``."""
+    review = calc.input_review
+    return review is not None and review.review_id == authorization_id and review.decision is decision
+
+
+def same_request(earlier: CalculationRecord, calc: CalculationRecord) -> bool:
+    """Whether ``earlier`` is a revision of the same request as ``calc``: for the same hypothesis, system and
+    estimand."""
+    return (earlier.hypothesis_ids[:1] == calc.hypothesis_ids[:1]
+            and earlier.task.system_label == calc.task.system_label and earlier.task.estimand == calc.task.estimand)
+
+
+def reviewer_rejections(state: InvestigationState, calc: CalculationRecord) -> list[str]:
+    """Earlier revisions of the same request that the input reviewer sent back to the agent."""
+    return [c.calculation_id for c in state.calculations.values()
+            if c.requested_at < calc.requested_at and c.rejected_by_reviewer and same_request(c, calc)]
+
+
+def escalated(state: InvestigationState, calc: CalculationRecord) -> bool:
+    """The input reviewer has sent back as many revisions of this request as it may: the researcher decides on it."""
+    return len(reviewer_rejections(state, calc)) >= MAX_REVIEW_REJECTIONS
+
+
+def review_attempts(state: InvestigationState, calculation_id: str) -> int:
+    """Reviewer tasks naming the calculation that were carried out."""
+    return sum(1 for t in state.tasks.values() if t.role == "input_reviewer" and calculation_id in t.calculation_ids
+               and t.completed_by is not None)
+
+
+def awaits_reviewer(state: InvestigationState, calc: CalculationRecord) -> bool:
+    """Examined inputs whose scientific content waits for the input reviewer, who has not decided yet and may still."""
+    exam = calc.examination
+    return (calc.state is _C.SPECIFIED and exam is not None and exam.agent_review
+            and exam.verdict is not ExaminationVerdict.REJECTED and calc.input_review is None
+            and review_attempts(state, calc.calculation_id) < MAX_REVIEW_ATTEMPTS)
+
+
+def _on_input_review(state: InvestigationState, event: RecordedEvent, p: InputReviewRecorded) -> None:
+    calc = _calculation(state, p.calculation_id)
+    exam = calc.examination
+    if calc.state is not _C.SPECIFIED or exam is None or not exam.agent_review \
+            or exam.verdict is ExaminationVerdict.REJECTED:
+        raise RuleViolation(f"the inputs of {p.calculation_id} do not wait for the input reviewer")
+    if calc.input_review is not None:
+        raise RuleViolation(f"the inputs of {p.calculation_id} were reviewed already ({calc.input_review.review_id})")
+    if p.task_id is not None:
+        task = state.tasks.get(p.task_id)
+        if task is None or task.role != "input_reviewer" or p.calculation_id not in task.calculation_ids:
+            raise RuleViolation(f"task {p.task_id} is not a review of {p.calculation_id}")
+    calc.input_review = p
+
+
 def _on_status_changed(state: InvestigationState, event: RecordedEvent, p: InvestigationStatusChanged) -> None:
     closing = state.pending_closing
     if p.status in CLOSING_STATUSES:
@@ -1168,6 +1248,8 @@ def _on_calculation_state(state: InvestigationState, event: RecordedEvent, p: Ca
             raise RuleViolation("the examination rejected these inputs")
         if exam.verdict is ExaminationVerdict.NEEDS_REVIEW:
             _require_authorization(state, p.authorization_id, PermissionAction.APPROVE_INPUTS, calc.calculation_id)
+        elif exam.agent_review and not _by_review(calc, p.authorization_id, ReviewDecision.APPROVED):
+            _require_authorization(state, p.authorization_id, PermissionAction.APPROVE_INPUTS, calc.calculation_id)
     if p.state is _C.SUBMITTED:
         if any(c.scheduler_job_id == p.scheduler_job_id for c in state.calculations.values()):
             raise RuleViolation(f"scheduler job {p.scheduler_job_id} is already attached to a calculation")
@@ -1175,10 +1257,18 @@ def _on_calculation_state(state: InvestigationState, event: RecordedEvent, p: Ca
             _require_authorization(state, p.authorization_id, PermissionAction.SUBMIT, calc.calculation_id)
     if p.state in (_C.REJECTED, _C.CANCELLED) and not (p.reason and p.reason.strip()):
         raise RuleViolation(f"{p.state} needs a reason")
+    rejected_by = None
     if (p.state is _C.REJECTED and calc.examination is not None
             and calc.examination.verdict is not ExaminationVerdict.REJECTED):
-        # Inputs the examiner did not reject wait for the researcher, who alone may refuse them.
-        _require_authorization(state, p.authorization_id, PermissionAction.REJECT_INPUTS, calc.calculation_id)
+        # Inputs the examiner did not reject wait for the researcher, or the input reviewer, to refuse them.
+        if _by_review(calc, p.authorization_id, ReviewDecision.REJECTED):
+            if escalated(state, calc):
+                raise RuleViolation(f"{MAX_REVIEW_REJECTIONS} revisions of this request were rejected already; the "
+                                    "researcher decides on this one")
+            rejected_by = "input_reviewer"
+        else:
+            _require_authorization(state, p.authorization_id, PermissionAction.REJECT_INPUTS, calc.calculation_id)
+            rejected_by = "researcher"
     if p.state is _C.CANCELLED and calc.state in _LIVE_AT_SCHEDULER:
         _require_authorization(state, p.authorization_id, PermissionAction.CANCEL, calc.calculation_id)
     if p.state is _C.QUALITY_ASSESSED and calc.run_check is None:
@@ -1186,7 +1276,7 @@ def _on_calculation_state(state: InvestigationState, event: RecordedEvent, p: Ca
 
     calc.state = new_state
     if p.state in (_C.REJECTED, _C.CANCELLED):
-        calc.end_reason, calc.ended_by = p.reason, p.authorization_id
+        calc.end_reason, calc.ended_by, calc.rejected_by = p.reason, p.authorization_id, rejected_by
     if scheduler_state is not None:
         calc.scheduler_state = scheduler_state
     if p.scheduler_job_id is not None:
@@ -1348,13 +1438,19 @@ def _on_agent_task(state: InvestigationState, event: RecordedEvent, p: AgentTask
     _require_open(state)
     if p.task_id in state.tasks:
         raise RuleViolation(f"task {p.task_id} already exists")
-    if p.role in ("chief_scientist", "approver"):
+    if p.role in ("chief_scientist", "approver", "input_reviewer"):
         if event.actor.kind is not ActorKind.SYSTEM:
-            raise RuleViolation("only the dispatcher queues " + ("the Chief Scientist's reviews" if p.role ==
-                                                                 "chief_scientist" else "the approver's work"))
+            raise RuleViolation("only the dispatcher queues " + {"chief_scientist": "the Chief Scientist's reviews",
+                                                                 "approver": "the approver's work",
+                                                                 "input_reviewer": "reviews of inputs"}[p.role])
         if p.role == "approver" and state.automation is None:
             raise RuleViolation("the approver works only while the investigation is in full automation")
-    else:
+    if p.role == "input_reviewer":
+        for calculation_id in p.calculation_ids:
+            calc = _calculation(state, calculation_id)
+            if not awaits_reviewer(state, calc) and p.continues is None:
+                raise RuleViolation(f"the inputs of {calculation_id} do not wait for the input reviewer")
+    if p.hypothesis_id is not None:
         _hypothesis(state, p.hypothesis_id)
     if p.agent_id is not None:
         agent = state.agents.get(p.agent_id)
@@ -1371,7 +1467,8 @@ def _on_agent_task(state: InvestigationState, event: RecordedEvent, p: AgentTask
             raise RuleViolation(f"a continuation of {p.continues} is for the same agent and hypothesis")
     state.tasks[p.task_id] = AgentTaskRecord(p.task_id, p.role, p.hypothesis_id, p.agent_id, p.instruction,
                                              event.actor.id, event.stream_version,
-                                             recommendation_id=p.recommendation_id, continues=p.continues)
+                                             recommendation_id=p.recommendation_id, continues=p.continues,
+                                             calculation_ids=p.calculation_ids)
 
 
 def _on_agent_run(state: InvestigationState, event: RecordedEvent, p: AgentRunRecorded) -> None:
@@ -1505,6 +1602,7 @@ _HANDLERS = {
     AssessmentRecorded: _on_assessment,
     AgentTaskQueued: _on_agent_task,
     AgentRunRecorded: _on_agent_run,
+    InputReviewRecorded: _on_input_review,
     AgentsProposed: _on_agents_proposed,
     AgentsStarted: _on_agents_started,
     AgentRetired: _on_agent_retired,

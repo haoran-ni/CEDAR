@@ -81,6 +81,8 @@ class ActorKind(StrEnum):
     calculations are submitted."""
     WORKBENCH = "workbench"
     """Runs agents' commands in their workspaces, in a sandbox, and records them."""
+    INPUT_REVIEWER = "input_reviewer"
+    """Reviews the scientific content of calculation inputs before they can run."""
     SYSTEM = "system"
 
 

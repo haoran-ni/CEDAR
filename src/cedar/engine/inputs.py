@@ -37,7 +37,8 @@ class ProtocolEngine:
         """Generate any missing inputs, examine the full set, and record the verdict.
 
         Approved inputs move to VALIDATED_INPUT; rejected ones to REJECTED. Inputs that
-        need review stay SPECIFIED until the user approves them (see ``approve``).
+        need review stay SPECIFIED until the user approves them (see ``approve``), and so do
+        inputs whose scientific content waits for the input reviewer.
         """
         state = self._ledger.load(investigation_id)
         calc = state.calculations.get(calculation_id)
@@ -84,14 +85,16 @@ class ProtocolEngine:
         verdict = verdict_for(findings)
         examination = InputExamination(protocol=protocol.ref, code_version=protocol.code_version, files=refs,
                                        execution_files=execution, input_hash=input_hash, findings=tuple(findings),
-                                       verdict=verdict, **_requested(protocol.requested_resources(files)))
+                                       verdict=verdict, agent_review=protocol.reviewed_by_agent,
+                                       settings=protocol.input_settings(files),
+                                       **_requested(protocol.requested_resources(files)))
         workdir = f"{investigation_id}/{calculation_id}"
         if verdict is not ExaminationVerdict.REJECTED:
             self._write_run_directory(self._runs_root / workdir, files)
 
         drafts = [EventDraft(actor=self._actor, payload=CalculationInputsExamined(
             calculation_id=calculation_id, examination=examination, workdir=workdir))]
-        if verdict is ExaminationVerdict.APPROVED:
+        if verdict is ExaminationVerdict.APPROVED and not protocol.reviewed_by_agent:
             drafts.append(self._move(calculation_id, CalculationState.VALIDATED_INPUT))
         elif verdict is ExaminationVerdict.REJECTED:
             errors = [f.message for f in findings if f.severity is FindingSeverity.ERROR]

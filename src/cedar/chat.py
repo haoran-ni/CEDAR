@@ -191,8 +191,8 @@ def _not_rejectable(calc: CalculationRecord) -> str | None:
         return f"{cid} is a registered run, computed outside CEDAR; it has no inputs to reject."
     if calc.state is CalculationState.VALIDATED_INPUT or (
             calc.state is CalculationState.SPECIFIED and calc.examination is not None
-            and calc.examination.verdict is ExaminationVerdict.NEEDS_REVIEW):
-        return None
+            and calc.examination.verdict is not ExaminationVerdict.REJECTED):
+        return None  # waiting for review (the researcher's or the input reviewer's) or for submission
     if calc.state is CalculationState.SPECIFIED:
         return f"The inputs of {cid} have not been examined yet."
     if calc.state is CalculationState.REJECTED:

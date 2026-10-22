@@ -149,12 +149,12 @@ def test_a_structure_written_in_the_workspace_can_be_requested(world, tree):
     assert not agent["write_file"].invoke({"path": "atop/geometry.in",
                                            "text": geometry_text(slab, fixed=bottom)}).is_error
     outcome = agent["request_calculation"].invoke({
-        "protocol_name": "fhiaims.run", "protocol_version": "0.1", "observable_name": "total energy",
+        "protocol_name": "fhiaims.run", "protocol_version": "0.3", "observable_name": "total energy",
         "observable_definition": "final total energy", "observable_unit": "eV", "estimand": "E(atop)",
         "system_label": "CO/Cu(111) atop", "structure_path": str(tree["workspace"] / "atop/geometry.in"),
         "rationale": "baseline", **declared()})
     assert not outcome.is_error, outcome.content
     (calc,) = world.state().calculations.values()
-    assert calc.state is CalculationState.VALIDATED_INPUT
+    assert calc.state is CalculationState.SPECIFIED and calc.examination.agent_review  # for the reviewer
     assert world.artifacts.read(calc.task.structure).decode() == geometry_text(slab, fixed=bottom)
     assert not read(access_for(world, tree), tree["workspace"] / "atop/geometry.in").is_error  # any agent reads it

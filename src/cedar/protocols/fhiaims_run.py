@@ -166,6 +166,7 @@ class FhiAimsRun(Protocol):
     execution_files = ("job.sh", "local.sh")
     output_files = ("aims.out",)
     runs_locally = True
+    superseded_by = "0.3"
 
     def __init__(self, profile: ComputeProfile, host: Callable[[], ExecutionHost] | None = None) -> None:
         """``host`` says where CEDAR runs, which bounds a local run."""
@@ -182,6 +183,15 @@ class FhiAimsRun(Protocol):
     @property
     def code_version(self) -> str:
         return self._code.version
+
+    def input_settings(self, files: Mapping[str, bytes]) -> dict[str, str]:
+        """Every keyword control.in sets, with its arguments as written; repeats are joined by '; '."""
+        if "control.in" not in files:
+            return {}
+        settings: dict[str, list[str]] = {}
+        for keyword in parse_control(files["control.in"].decode(errors="replace")).keywords:
+            settings.setdefault(keyword.name, []).append(" ".join(keyword.args))
+        return {name: "; ".join(values) for name, values in settings.items()}
 
     @property
     def _species_root(self) -> Path | None:
@@ -301,7 +311,11 @@ class FhiAimsRun(Protocol):
         findings: list[Finding] = []
         if "control.in" not in present and "geometry.in" in present:
             values, problems = self.resolve(task)
-            if not any(f.severity is _E for f in problems):
+            if SPECIES_DEFAULTS not in values and not any(f.severity is _E for f in problems):
+                findings.append(Finding(severity=_E, code="missing_variable", file="control.in",
+                                        message=f"declare {SPECIES_DEFAULTS} (a level directory of the species "
+                                                "defaults) so control.in can be generated, or write control.in"))
+            elif not any(f.severity is _E for f in problems):
                 geometry = parse_geometry(present["geometry.in"].decode(errors="replace"))
                 generated["control.in"] = self._render_control(values, geometry).encode()
         script = self._script(task)
@@ -638,6 +652,162 @@ class FhiAimsRunSlurmOnly(FhiAimsRun):
     input_files = ("control.in", "geometry.in", "job.sh")
     execution_files = ("job.sh",)
     runs_locally = False
+
+
+REVIEWED_LIMITATION = (
+    "Its inputs were checked deterministically only for what runs on the machine (the job script against the approved "
+    "template, its resources and the task's budget) and for consistency with the task's own declarations; their "
+    "scientific content was judged by the input reviewer, an agent, or by the researcher, not verified by rules.")
+
+
+class FhiAimsRunReviewed(FhiAimsRun):
+    """``fhiaims.run`` 0.3: the input reviewer, an agent, judges the scientific content of the inputs.
+
+    The examination keeps only what needs no knowledge of FHI-aims keywords: the job script against the approved
+    template, its resources, the budget and, for a local run, the allocation; that control.in sets every declared
+    keyword as declared; that the files can be read and every element has a species block; and that nothing hides
+    an unconverged SCF cycle from the run check. Everything else it observes (keywords the task does not declare,
+    species blocks that differ from the declared level, distances, vacuum) is recorded as a fact for the reviewer,
+    which reads the files, the installed code's manual and source, and the documentation on the web.
+    """
+
+    ref = ProtocolRef(name="fhiaims.run", version="0.3")
+    reviewed_by_agent = True
+    superseded_by = None
+
+    def describe(self) -> str:
+        root = self._species_root
+        levels = sorted(d.name for d in root.iterdir() if d.is_dir()) if root and root.is_dir() else []
+        return "\n".join([
+            Protocol.describe(self),
+            f"Code: FHI-aims {self.code_version}",
+            "Declare every setting your test depends on, as control.in keywords named as in control.in, with their "
+            "arguments as the value (a string such as \"atomic_zora scalar\", a number, a list such as [4, 4, 1], true "
+            "for a flag, false for absent): what you vary as interventions, physical conditions you hold fixed as "
+            "controls, accuracy settings as numerical_settings, and species_defaults, the level directory of the "
+            "species blocks. control.in must set each declared keyword exactly as declared.",
+            f"{SPECIES_DEFAULTS} levels available on this system: {', '.join(levels) or 'none found'}",
+            "No keyword list limits what you may set. The input reviewer, an agent, reads your files with the "
+            "installed FHI-aims manual and source and judges whether they make sense for your test: it approves them "
+            "(the researcher then authorizes submission), warns (the researcher looks at them first) or rejects them "
+            "(you are woken with its reasons). Declare what matters: undeclared settings are shown to it as such.",
+            f"Forbidden: {', '.join(f'{k} ({v})' for k, v in FORBIDDEN_KEYWORDS.items())}",
+            "The job script is checked against the researcher's approved template, its limits and your budget.",
+            *self._where(),
+        ])
+
+    def resolve(self, task: ScientificTaskSpec) -> tuple[dict[str, object], list[Finding]]:
+        """Every declared variable, whatever its name; only what cannot be written into control.in is refused."""
+        findings: list[Finding] = []
+        values: dict[str, object] = {}
+        for declared in (task.interventions, task.controls, task.numerical_settings):
+            values.update(declared)
+        for name, value in values.items():
+            if name in FORBIDDEN_KEYWORDS:
+                findings.append(Finding(severity=_E, code="forbidden_keyword",
+                                        message=f"{name} {FORBIDDEN_KEYWORDS[name]}"))
+            elif name == SPECIES_DEFAULTS:
+                findings += self._check_species_level(value)
+            elif not _KEYWORD_NAME.fullmatch(name):
+                findings.append(Finding(severity=_E, code="invalid_variable",
+                                        message=f"{name!r} cannot be a control.in keyword"))
+            else:
+                try:
+                    keyword_args(value)
+                except ValueError as exc:
+                    findings.append(Finding(severity=_E, code="invalid_value", message=f"{name}: {exc}"))
+        return values, findings
+
+    def _examine_geometry(self, geometry: Geometry, values: Mapping[str, object]) -> list[Finding]:
+        f = "geometry.in"
+        findings = [Finding(severity=_E, code="malformed_geometry", file=f, line=line or None,
+                            message=f"cannot read: {text}") for line, text in geometry.malformed_lines]
+        if geometry.malformed_lines:
+            return findings
+        if not geometry.atoms:
+            return findings + [Finding(severity=_E, code="no_atoms", file=f, message="the structure has no atoms")]
+        findings += [Finding(severity=_I, code="geometry_keyword", file=f, line=line,
+                             message=f"not interpreted by the examiner: {text}")
+                     for line, text in geometry.unknown_lines]
+        atoms = geometry.to_atoms()
+        fixed = sum(a.constrained for a in geometry.atoms)
+        moments = sum(1 for a in geometry.atoms if a.initial_moment)
+        facts = [f"{len(geometry.atoms)} atoms ({', '.join(geometry.elements)})",
+                 f"{fixed} constrained" if fixed else "none constrained",
+                 f"{moments} with an initial moment" if moments else "no initial moments"]
+        if len(geometry.atoms) > 1:
+            facts.append(f"shortest interatomic distance {minimum_distance(atoms):.3f} Å")
+        if geometry.periodic:
+            facts.append(f"periodic; {vacuum_along_c(atoms):.2f} Å of empty space along the third lattice vector")
+        else:
+            facts.append("not periodic")
+        findings.append(Finding(severity=_I, code="structure", file=f, message="; ".join(facts)))
+        return findings
+
+    def _examine_control(self, text: str, values: Mapping[str, object], geometry: Geometry) -> list[Finding]:
+        f = "control.in"
+        control = parse_control(text)
+        expected = self.expected_keywords(values)
+        findings: list[Finding] = []
+        seen: dict[str, int] = {}
+        for keyword in control.keywords:
+            name, where = keyword.name, {"file": f, "line": keyword.line}
+            if name in FORBIDDEN_KEYWORDS:
+                findings.append(Finding(severity=_E, code="forbidden_keyword",
+                                        message=f"{name} {FORBIDDEN_KEYWORDS[name]}", **where))
+            elif name in expected:
+                if name in seen:
+                    findings.append(Finding(severity=_E, code="repeated_keyword", message=f"the declared {name} is "
+                                            f"set again (first at line {seen[name]})", **where))
+                elif not _same_args(expected[name], keyword.args):
+                    findings.append(Finding(
+                        severity=_E, code="contradicts_task",
+                        message=f"{_setting(name, keyword.args)} does not match the declared "
+                                f"{_setting(name, expected[name])}", **where))
+            else:
+                findings.append(Finding(severity=_I, code="undeclared_setting",
+                                        message=f"{_setting(name, keyword.args)} is set but not declared by the task",
+                                        **where))
+            seen.setdefault(name, keyword.line)
+        for name, args in expected.items():
+            if name not in seen:
+                findings.append(Finding(severity=_E, code="missing_keyword", file=f,
+                                        message=f"the task declares {_setting(name, args)}, but control.in "
+                                                "does not set it"))
+        level = values.get(SPECIES_DEFAULTS)
+        for element in geometry.elements:
+            block = control.species_block(element)
+            if block is None:
+                findings.append(Finding(severity=_E, code="missing_species", file=f,
+                                        message=f"no species block for {element}"))
+                continue
+            default = species_default_path(self._species_root, str(level), element) if level else None
+            if level and default is None:
+                findings.append(Finding(severity=_I, code="species_level", file=f, line=block.line,
+                                        message=f"no {level} species default for {element} to compare with"))
+            elif default is not None and block.normalized() != normalize_lines(default.read_text().splitlines()):
+                findings.append(Finding(severity=_I, code="species_differs", file=f, line=block.line,
+                                        message=f"species block for {element} differs from {default}"))
+        findings += [Finding(severity=_I, code="unused_species", file=f, line=block.line,
+                             message=f"species {block.species} does not occur in the structure")
+                     for block in control.species if block.species not in geometry.elements]
+        return findings
+
+    def check_run(self, task: ScientificTaskSpec, outputs: Mapping[str, bytes],
+                  scheduler_state: SchedulerState | None) -> RunReport:
+        """As 0.2, except that a relaxation is recognized from the output too: control.in may relax the geometry
+        without the task declaring it."""
+        values, _ = self.resolve(task)
+        raw = outputs.get("aims.out")
+        shown = parse_output(raw.decode(errors="replace")) if raw is not None else None
+        relax = self._relaxes(values) or (shown is not None and (
+            shown.relaxation_steps > 0 or shown.geometry_converged is not None
+            or shown.optimization_aborted is not None))
+        method: dict = {"code": "FHI-aims", "protocol": f"{self.ref.name} {self.ref.version}", **values}
+        scheduler = QualityCheck(name="scheduler_completed", passed=scheduler_state is SchedulerState.COMPLETED,
+                                 detail=f"scheduler state {scheduler_state}")
+        return output_report(raw, relax=relax, method=method, checks=(scheduler,),
+                             expected_version=self.code_version, limitations=(RUN_LIMITATION, REVIEWED_LIMITATION))
 
 
 # -- runs computed outside CEDAR ----------------------------------------------------------

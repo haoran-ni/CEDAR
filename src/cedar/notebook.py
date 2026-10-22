@@ -25,6 +25,7 @@ from typing import TYPE_CHECKING
 
 from cedar.contracts.base import Actor, ActorKind, ArtifactRef, ExternalSource, Observable, Quantity
 from cedar.contracts.analysis import AnalysisRun
+from cedar.contracts.review import InputReviewRecorded, ReviewSeverity
 from cedar.contracts.events import (
     AgentRetired,
     AgentRunRecorded,
@@ -285,6 +286,14 @@ def _inputs(calc: CalculationRecord, indent: str) -> list[str]:
     lines = [f"{indent}- Inputs {written}; examination {exam.verdict.value}" + (f" ({tally})" if tally else "")]
     lines += [f"{indent}  - {f.severity.value} {f.code}: {_flat(f.message)}" for f in exam.findings
               if f.severity in (FindingSeverity.ERROR, FindingSeverity.REVIEW)]
+    review = calc.input_review
+    if review is not None:
+        lines.append(f"{indent}  - input reviewer ({review.review_id}), an agent's judgement: {review.decision.value}: "
+                     f"{_flat(review.summary)}")
+        lines += [f"{indent}    - {f.severity.value}: {_flat(f.text)}" for f in review.findings
+                  if f.severity is not ReviewSeverity.NOTE]
+    elif exam.agent_review and calc.state is CalculationState.SPECIFIED:
+        lines.append(f"{indent}  - waiting for the input reviewer")
     return lines
 
 
@@ -611,8 +620,17 @@ def _tested(rnd: _Round, state: InvestigationState) -> list[str]:
         elif isinstance(p, CalculationStateChanged) and p.state is CalculationState.CANCELLED:
             by = f", authorized by {p.authorization_id}" if p.authorization_id else ""
             lines.append(f"- **{p.calculation_id}** cancelled{by}: {_said(p.reason or '')}")
+        elif isinstance(p, InputReviewRecorded):
+            lines.append(f"- **{p.calculation_id}** reviewed by the input reviewer ({p.review_id}), an agent's "
+                         f"judgement: {p.decision.value}: {_said(p.summary)}")
+            lines += [f"  - {f.severity.value}: {_said(f.text)}" + (f" ({f.file}" + (f":{f.line}" if f.line else "")
+                                                                    + ")" if f.file else "")
+                      for f in p.findings if f.severity is not ReviewSeverity.NOTE]
         elif isinstance(p, CalculationStateChanged) and p.state is CalculationState.REJECTED:
-            by = f"the researcher ({p.authorization_id})" if p.authorization_id else "the input examination"
+            calc = state.calculations[p.calculation_id]
+            by = ("the input reviewer" if p.authorization_id and calc.input_review is not None
+                  and calc.input_review.review_id == p.authorization_id else
+                  f"the researcher ({p.authorization_id})" if p.authorization_id else "the input examination")
             lines.append(f"- **{p.calculation_id}** rejected by {by}: {_said(p.reason or '')}")
     return lines or ["No calculations were requested or submitted this round."]
 
@@ -1080,6 +1098,8 @@ def _describe(event: RecordedEvent) -> str:
             web = f"; {_web_use(p)}" if p.web_searches or p.web_fetches else ""
             return (f"{p.role.replace('_', ' ')} run ended {p.outcome} after {p.turns} turns ({_tokens(p):,} "
                     f"tokens{web})")
+        case InputReviewRecorded():
+            return f"{p.review_id}: the input reviewer judged {p.calculation_id} {p.decision.value}: {_said(p.summary)}"
     return p.type
 
 

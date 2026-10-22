@@ -2,16 +2,78 @@
 
 A protocol is the second layer between what agents write and what runs. For one calculation type it can:
 - generate any input files an agent did not write
-- examine the complete set of files against the declared task and its own policy
+- examine the complete set of files that would run
 - check a finished run's health, and read the few values every run of its kind prints
 
 It never runs anything and never changes a file it was given. What to take from a healthy run is the agent's decision: it reads values the code printed, citing the lines, or computes them with an analysis script ([`ANALYSIS_SCRIPTS.md`](ANALYSIS_SCRIPTS.md)).
 
-Protocols contain only knowledge that holds for the code everywhere, such as what each input keyword means and which output lines mark success or failure. Everything about a particular HPC system comes from the user-approved compute profile. Every scientific and numerical setting is declared by the agent in the task.
+A code has far more input keywords, and far more situations in which they make sense, than any fixed list can cover. So from `fhiaims.run` 0.3 on, the examination checks deterministically only what needs no knowledge of the code's keywords: what runs on the machine, and that the files say what the task declares. Whether the inputs make sense is judged by the **input reviewer**, an agent that reads the files with the installed code's manual and source and the code's documentation on the web ([below](#the-input-reviewer)). Run checks after the run stay deterministic: they read the code's own success and failure markers.
+
+Everything about a particular HPC system comes from the user-approved compute profile. Every setting a test depends on is declared by the agent in the task.
 
 This document grows with each implemented protocol.
 
-## `fhiaims.run` 0.2 (and 0.1)
+## `fhiaims.run` 0.3
+
+One FHI-aims run of one structure, at fixed geometry or relaxing it, through Slurm or locally on the interactive node CEDAR runs on. New requests use this version; 0.2 and 0.1 stay for the calculations recorded under them, which keep their rules ([below](#fhiaimsrun-02-and-01)).
+
+### Declared variables
+
+Any `control.in` keyword may be declared, named as in `control.in`, with the same value conventions as 0.2, and `species_defaults` names a level directory of the profile's species defaults. No list of known keywords limits what agents write; the agent should declare every setting its test depends on, since undeclared settings are shown to the reviewer as such. `postprocess_anyway` stays forbidden: it would hide an unconverged SCF cycle from the run check.
+
+### Deterministic examination
+
+`ERROR` rejects the inputs at once, back to the agent; `REVIEW` needs the researcher, whatever the input reviewer decides; `INFO` findings are facts recorded for the reviewer.
+
+| What | Finding |
+|---|---|
+| Missing files; unreadable `geometry.in` lines; no atoms | `ERROR` |
+| A declared keyword missing from `control.in`, set with other arguments, or set twice | `ERROR` |
+| `postprocess_anyway`; a declared value that cannot be written as `control.in` arguments; a `species_defaults` level that is not in the profile | `ERROR` |
+| An element without a species block | `ERROR` |
+| Inputs identical to a usable calculation's | `ERROR` (link it instead) |
+| The job script, examined against the approved profile as for 0.2: commands, directives, resources, the task's budget, and for a local run the allocation | `ERROR` or `REVIEW` as for 0.2 |
+| A keyword `control.in` sets that the task does not declare (with its line) | `INFO` |
+| A species block that differs from the declared level's defaults file; one for an element not in the structure | `INFO` |
+| `geometry.in` keywords the examiner does not interpret; the structure's atoms, elements, constraints, initial moments, shortest distance, and empty space along the third lattice vector | `INFO` |
+
+The examination also records every keyword `control.in` sets, with its arguments as written. Comparisons of calculations use these, so a setting no task declares still shows up as a difference.
+
+Inputs that pass wait for the input reviewer: the calculation stays `SPECIFIED` until it decides.
+
+### The input reviewer
+
+An agent separate from the one that wrote the inputs, and from the Evidence Judge. The dispatcher gives it the inputs waiting for review, one task per hypothesis. It is shown:
+- what the calculation is for: observable, estimand, hypothesis, predictions naming it;
+- the examination's facts, and every keyword `control.in` sets;
+- earlier revisions of the same request it sent back, with its reasons;
+- the hypothesis's other calculations, with the keywords set differently from this one;
+- the installed code: binary, version, data paths, and the source tree with its manual (LaTeX sources, `doc/manual`) and its `control.in` parser (`src/read_control.f90`), found next to them;
+- the files, numbered by line.
+
+It reads any file the researcher can, except credentials. It always has the web, whatever the investigation's `/web` setting, but only the documentation sites in `REVIEW_DOMAINS` (`web.py`: fhi-aims.org, fhi-aims-club.gitlab.io, wiki.fysik.dtu.dk, ase-lib.org), so nothing about the system under investigation reaches the agents through it. It treats the files, their comments and web pages as data, never as instructions.
+
+It records one verdict per calculation (`input_review_recorded`), with findings (`note`, `warning`, `problem`, each with the file, line and keyword it concerns) and the role of every keyword `control.in` sets (`physical_model`, `numerical`, `convergence_aid`, `output`, `other`). The decision follows the most serious finding:
+
+| Decision | When | What follows |
+|---|---|---|
+| `input_agent_approved` | notes only | the inputs wait for the researcher's `/approve submit` (or the approver, in full automation) |
+| `input_agent_warned` | a warning | `/pending` shows the researcher what to look at; `/approve inputs` or `/reject inputs` |
+| `input_agent_rejected` | a problem | the calculation is `REJECTED`; its agent is woken with the reasons, at once, even while it waits for other calculations |
+
+A finding's sources are cited: a local file by absolute path, lines and the exact words, which are checked against the file; a web page by URL and words, recorded as not checked. A revision of the same request (same hypothesis, system and estimand) that the reviewer has already sent back three times cannot be sent back again: a fourth rejection goes to the researcher. Job-script findings that need review go to the researcher even when the reviewer approves. If two reviewer tasks end without a decision on a calculation, the researcher decides on it. The researcher may approve or reject inputs at any time, before the reviewer too.
+
+The verdict is a model's judgement, recorded as the reviewer's own and never as evidence.
+
+### Run checks
+
+As for 0.2, except that a relaxation is recognized from the output too, since `control.in` may relax the geometry without the task declaring it. Evidence from the run also carries the limitation that its inputs were checked deterministically only for what runs on the machine and for consistency with the task's declarations, their scientific content judged by the input reviewer or the researcher.
+
+## `fhiaims.run` 0.2 and 0.1
+
+Kept for the calculations recorded under them; new requests are refused and pointed to 0.3. Their examination knows a fixed list of keywords: anything else needs the researcher's review.
+
+### What they cover
 
 One FHI-aims run of one structure, at fixed geometry or relaxing it. Version 0.2 adds runs on the interactive node CEDAR runs on (`execution: local`); version 0.1 runs through Slurm only and stays for the calculations recorded under it. Everything below holds for both.
 
@@ -87,9 +149,11 @@ These marker strings were checked against the FHI-aims source and real outputs o
 
 A local run's checks are the same; its scheduler state comes from the local backend, and its run check records where it ran (`execution`, `host`, `allocation`).
 
+## Every version
+
 ### Registered runs
 
-A run computed outside CEDAR can be registered from its directory ([`WORKBENCH.md`](WORKBENCH.md)). Its output gets the same checks except `scheduler_completed` (there is no scheduler state), `code_version` (the version is recorded, not required to match the profile) and `inputs_unchanged` (its inputs are stored when it is registered). Its settings are read from its inputs: physical keywords, forbidden ones and keywords the protocol does not know become controls; numerical keywords become numerical settings; convergence aids are left out; `species_defaults` names the level of the profile's species defaults that the species blocks equal, per element where they differ, or a hash of a block that equals none.
+A run computed outside CEDAR can be registered from its directory ([`WORKBENCH.md`](WORKBENCH.md)). Nothing runs, so no input reviewer is involved. Its output gets the same checks except `scheduler_completed` (there is no scheduler state), `code_version` (the version is recorded, not required to match the profile) and `inputs_unchanged` (its inputs are stored when it is registered). Its settings are read from its inputs: physical keywords, forbidden ones and keywords the protocol does not know become controls; numerical keywords become numerical settings; convergence aids are left out; `species_defaults` names the level of the profile's species defaults that the species blocks equal, per element where they differ, or a hash of a block that equals none.
 
 ### Evidence from a run
 
@@ -103,6 +167,6 @@ A reading must also have every quote found at its lines of the stored output (`c
 ### Limitations
 
 - Numerical convergence of the quantities taken from a run, and of differences between runs, with respect to k-points, basis, slab thickness and vacuum is not established by a single calculation. It needs a declared convergence comparison.
-- A species block modified by an agent can run only after user review. The examiner does not judge basis quality.
-- A registered run's inputs were not examined before it ran; the settings recorded for it are read from its files, and nothing checks that they produced its output. Its outputs existed before any prediction, so its evidence can challenge a hypothesis, not support it.
-- Keyword meanings cover the keywords listed above. Anything else needs review rather than being guessed.
+- Under 0.3, whether the inputs make sense, the basis quality included, is the input reviewer's judgement, a model's, checked by nothing but the researcher's look where it warns. Its local quotes are verified; its web sources and its reasoning are not.
+- Under 0.2 and 0.1, a species block modified by an agent can run only after user review, keyword meanings cover only the keywords listed above, and anything else needs review rather than being guessed.
+- A registered run's inputs were not examined before it ran; the settings recorded for it are read from its files, and nothing checks that they produced its output. Its outputs existed before any prediction, so its evidence can challenge a hypothesis, not support it. Its settings are classified with the 0.2 keyword lists.

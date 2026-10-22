@@ -401,8 +401,21 @@ def _next_step(calc: CalculationRecord) -> str:
     if calc.rejected_by_researcher:
         return ("The researcher rejected these inputs, for the reason above. Address it and make a new request, or say "
                 "in your report why you cannot.")
+    if calc.rejected_by_reviewer:
+        return ("The input reviewer rejected these inputs, for the reasons above. Address them and make a new request, "
+                "or say in your report why you cannot.")
     if calc.state is CalculationState.REJECTED:
         return "The inputs were rejected. Fix the errors above and make a new request."
+    exam = calc.examination
+    reviewing = calc.state is CalculationState.SPECIFIED and exam is not None and exam.agent_review
+    if reviewing and calc.input_review is None:
+        return ("The examination's checks passed. The input reviewer, an agent, now reviews the inputs: approved, they "
+                "wait for the researcher to authorize submission; warned, the researcher looks at them first; "
+                "rejected, you are woken with its reasons. Register predictions for the calculation now if you have "
+                "not, then end with submit_report, waiting for it.")
+    if reviewing:
+        return ("The input reviewer's verdict is above; the researcher decides on these inputs now, and may reject "
+                "them with a reason, which you are then told.")
     if calc.state is CalculationState.SPECIFIED and calc.examination is not None:
         return ("The examiner could not verify part of the inputs. The researcher must approve them before they "
                 "can run, or may reject them with a reason, which you are then told; tell the Chief Scientist why "
@@ -454,8 +467,11 @@ def research_tools(ctx: ResearchContext) -> list[AgentTool]:
     def describe_protocol(args: DescribeArgs) -> str:
         protocol = ctx.registry.get(ProtocolRef(name=args.name, version=args.version))
         if protocol is None:
-            available = ", ".join(f"{r.name} {r.version}" for r in ctx.registry.refs())
+            available = ", ".join(f"{r.name} {r.version}" for r in ctx.registry.current_refs())
             raise ToolFailure(f"no protocol {args.name} {args.version}; available: {available}")
+        if protocol.superseded_by is not None:
+            return (f"{args.name} {args.version} is kept only for the calculations recorded under it; new requests use "
+                    f"{args.name} {protocol.superseded_by}.")
         return protocol.describe()
 
     def set_hypothesis_status(args: StatusArgs) -> str:
@@ -477,6 +493,9 @@ def research_tools(ctx: ResearchContext) -> list[AgentTool]:
         protocol = ctx.registry.get(ProtocolRef(name=args.protocol_name, version=args.protocol_version))
         if protocol is None:
             raise ToolFailure(f"no protocol {args.protocol_name} {args.protocol_version}")
+        if protocol.superseded_by is not None:
+            raise ToolFailure(f"{args.protocol_name} {args.protocol_version} is kept only for the calculations "
+                              f"recorded under it; request {args.protocol_name} {protocol.superseded_by}")
         observable = Observable(name=args.observable_name, definition=args.observable_definition,
                                 unit=args.observable_unit)
         if args.structure_path is not None:

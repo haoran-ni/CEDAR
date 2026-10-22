@@ -544,8 +544,11 @@ def chief_tools(ctx: ChiefContext) -> list[AgentTool]:
             raise ToolFailure("the investigation has no compute profile")
         protocol = ctx.registry_for(profile).get(ProtocolRef(name=args.name, version=args.version))
         if protocol is None:
-            available = ", ".join(f"{r.name} {r.version}" for r in ctx.registry_for(profile).refs())
+            available = ", ".join(f"{r.name} {r.version}" for r in ctx.registry_for(profile).current_refs())
             raise ToolFailure(f"no protocol {args.name} {args.version}; available: {available or 'none'}")
+        if protocol.superseded_by is not None:
+            return (f"{args.name} {args.version} is kept only for the calculations recorded under it; new requests use "
+                    f"{args.name} {protocol.superseded_by}.")
         return protocol.describe()
 
     def register_existing_run(args: RegisterArgs) -> str:

@@ -84,6 +84,13 @@ from cedar.contracts.investigation import (
 )
 from cedar.contracts.next_actions import ActionKind, ActionPriority, CandidateAction, ExpectedOutcome
 from cedar.contracts.plan import Authorization, PermissionAction, Priority, ResearchPlan
+from cedar.contracts.review import (
+    InputReviewRecorded,
+    ReviewDecision,
+    ReviewFinding,
+    ReviewSeverity,
+    ReviewSource,
+)
 from cedar.contracts.status import (
     Assessment,
     CalculationState,
@@ -106,6 +113,11 @@ from cedar.contracts.task import (
 from cedar.contracts.workbench import WorkbenchOutcome, WorkbenchRun
 
 __all__ = [
+    "InputReviewRecorded",
+    "ReviewDecision",
+    "ReviewFinding",
+    "ReviewSeverity",
+    "ReviewSource",
     "ActionKind",
     "ActionPriority",
     "AgentRetired",

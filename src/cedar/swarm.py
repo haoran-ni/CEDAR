@@ -47,7 +47,7 @@ FIRST_TASK = "Your first task, from the Chief Scientist: "
 """How an agent's first task, its brief, begins."""
 WAKE_TASK = "Your calculations have ended:"
 """How the task begins that the dispatcher queues for an agent whose calculations have ended: their runs were
-checked, or they were cancelled, or the researcher rejected their inputs."""
+checked, or they were cancelled, or the researcher or the input reviewer rejected their inputs."""
 REVIEW_ROLES = ("hypothesis_agent", "evidence_judge")
 """Roles whose reports the Chief Scientist reviews."""
 
@@ -177,10 +177,10 @@ def _reviews(state: InvestigationState) -> list[AgentTaskRecord]:
 
 
 def blocking_tasks(state: InvestigationState) -> list[AgentTaskRecord]:
-    """Queued or running agent work the dispatcher will carry out now; a review waits for all of it. A hypothesis
-    agent works only while the investigation is INVESTIGATING, so its work waits, without holding a review back,
-    while the investigation is REVIEWING."""
-    return [t for t in state.pending_tasks if t.role in REVIEW_ROLES
+    """Queued or running agent work the dispatcher will carry out now; a review waits for all of it, reviews of
+    inputs included, whose verdicts it should see. A hypothesis agent works only while the investigation is
+    INVESTIGATING, so its work waits, without holding a review back, while the investigation is REVIEWING."""
+    return [t for t in state.pending_tasks if (t.role in REVIEW_ROLES or t.role == "input_reviewer")
             and not (t.hypothesis_id and state.plan.priority(t.hypothesis_id) is Priority.ON_HOLD)
             and not (t.role == "hypothesis_agent" and state.status is not InvestigationStatus.INVESTIGATING)]
 
@@ -326,15 +326,15 @@ def continuation_text(state: InvestigationState, task: AgentTaskRecord, why: str
 
 def ended_unseen(state: InvestigationState, hypothesis_id: str, since: int) -> list[str]:
     """The hypothesis's calculations that ended after ``since``: their runs were checked, they were cancelled, or
-    the researcher rejected their inputs. Registered runs never ran here, and an examiner's rejection is answered
-    at once."""
+    the researcher or the input reviewer rejected their inputs. Registered runs never ran here, and an examiner's
+    rejection is answered at once."""
     found = []
     for cid in state.hypotheses[hypothesis_id].calculation_ids:
         calc = state.calculations[cid]
         if calc.registered:
             continue
         ended = next((v for v, s in calc.history if s in (CalculationState.QUALITY_ASSESSED, CalculationState.CANCELLED)
-                      or (s is CalculationState.REJECTED and calc.rejected_by_researcher)), None)
+                      or (s is CalculationState.REJECTED and calc.refused)), None)
         if ended is not None and ended > since:
             found.append(cid)
     return found

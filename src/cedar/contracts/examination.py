@@ -91,6 +91,12 @@ class InputExamination(Contract):
     """The walltime the script asks for."""
     partition: str | None = None
     """The Slurm partition it asks for; "local" for a run on the interactive node."""
+    agent_review: bool = False
+    """The scientific content waits for the input reviewer: the deterministic checks covered only what runs on the
+    machine (the job script, its resources and the budget)."""
+    settings: dict[NonEmptyStr, str] = {}
+    """Every keyword set in the main input file, with its arguments as written (repeats joined by '; '): what the
+    inputs actually set, declared or not."""
 
     @model_validator(mode="after")
     def _consistent(self) -> "InputExamination":

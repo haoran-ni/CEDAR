@@ -19,7 +19,7 @@ from cedar.hpc.local import LocalBackend
 from cedar.hpc.profile import ComputeProfile, LocalExecution, ProfileNotApproved, ProfileStore
 from cedar.hpc.slurm import SchedulerBackend, SlurmBackend
 from cedar.models import CredentialStore, ModelClient, ModelConfig, ModelSettings, create_client
-from cedar.protocols import FhiAimsRun, FhiAimsRunSlurmOnly, ProtocolRegistry
+from cedar.protocols import FhiAimsRun, FhiAimsRunReviewed, FhiAimsRunSlurmOnly, ProtocolRegistry
 from cedar.protocols.fhiaims_run import current_host
 from cedar.state.ledger import ResearchLedger
 from cedar.state.projection import AgentRecord, CalculationRecord, InvestigationState
@@ -82,7 +82,8 @@ class Services:
 
 
 def registry_for(profile: ComputeProfile) -> ProtocolRegistry:
-    protocols = [FhiAimsRun(profile), FhiAimsRunSlurmOnly(profile)] if "fhi-aims" in profile.codes else []
+    protocols = ([FhiAimsRunReviewed(profile), FhiAimsRun(profile), FhiAimsRunSlurmOnly(profile)]
+                 if "fhi-aims" in profile.codes else [])
     return ProtocolRegistry(protocols)
 
 

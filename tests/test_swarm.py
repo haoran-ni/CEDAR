@@ -378,13 +378,14 @@ def test_agents_run_at_the_same_time_but_never_twice_at_once(system):
 
 
 def test_job_polling_goes_on_while_agents_work(system):
-    from test_orchestration import HYP, INV as ORCHESTRATION, agent_requests, latest_calc, open_and_start
+    from test_orchestration import HYP, INV as ORCHESTRATION, agent_requests, latest_calc, open_and_start, review_inputs
 
     workspace, chat, clients, dispatcher, scheduler = (system[k] for k in (
         "workspace", "chat", "clients", "dispatcher", "scheduler"))
     open_and_start(system)
     clients.add("hypothesis_agent", *agent_requests(system))
     dispatcher.tick()
+    review_inputs(system)
     calc = latest_calc(workspace)
     chat.handle(f"/approve submit {calc}")
     scheduler.on_submit = lambda job, workdir: (workdir / "aims.out").write_text(aims_output(energy=ENERGY))
@@ -631,13 +632,14 @@ def test_proposed_agents_hold_the_review_back_only_while_they_can_start(system):
 
 def test_a_review_shows_the_evidence_and_assessments_recorded_since_the_last_one(system):
     from test_orchestration import ENERGY as RUN_ENERGY, HYP, INV as OPEN, agent_reads, agent_requests, latest_calc
-    from test_orchestration import open_and_start
+    from test_orchestration import open_and_start, review_inputs
 
     ledger, clients, dispatcher, scheduler = (system["workspace"].ledger, system["clients"], system["dispatcher"],
                                               system["scheduler"])
     open_and_start(system)
     clients.add("hypothesis_agent", *agent_requests(system))
     dispatcher.tick()
+    review_inputs(system)
     calc = latest_calc(system["workspace"])
     system["chat"].handle(f"/approve submit {calc}")
     output = aims_output(energy=RUN_ENERGY)
@@ -1008,11 +1010,12 @@ def test_a_background_dispatcher_runs_detached_and_stops_on_request(tmp_path):
 
 def halted_system(system):
     """The orchestration story up to a submitted job, plus a second hypothesis whose agent is proposed."""
-    from test_orchestration import agent_requests, latest_calc, open_and_start
+    from test_orchestration import agent_requests, latest_calc, open_and_start, review_inputs
 
     open_and_start(system)
     system["clients"].add("hypothesis_agent", *agent_requests(system))
     system["dispatcher"].tick()
+    review_inputs(system)
     calc = latest_calc(system["workspace"])
     system["chat"].handle(f"/approve submit {calc}")
     system["dispatcher"].tick()

@@ -36,6 +36,7 @@ from cedar.contracts.investigation import (
 )
 from cedar.contracts.next_actions import CandidateAction
 from cedar.contracts.plan import Authorization, PermissionAction, ResearchPlan
+from cedar.contracts.review import InputReviewRecorded
 from cedar.contracts.status import (
     Assessment,
     CalculationState,
@@ -516,7 +517,7 @@ class AgentRetired(Contract):
     reason: NonEmptyStr
 
 
-AGENT_TASK_ROLES = ("hypothesis_agent", "evidence_judge", "chief_scientist", "approver")
+AGENT_TASK_ROLES = ("hypothesis_agent", "evidence_judge", "chief_scientist", "approver", "input_reviewer")
 
 
 class AgentTaskQueued(Contract):
@@ -524,12 +525,13 @@ class AgentTaskQueued(Contract):
 
     A hypothesis agent's task names the agent and its hypothesis; the Evidence Judge's names
     the hypothesis to assess; the Chief Scientist's (a review of the agents' reports) and the
-    approver's (decisions waiting in full automation) name neither.
+    approver's (decisions waiting in full automation) name neither. The input reviewer's names the
+    hypothesis whose calculations it reviews, and the calculations.
     """
 
     type: Literal["agent_task_queued"] = "agent_task_queued"
     task_id: Identifier
-    role: Literal["hypothesis_agent", "evidence_judge", "chief_scientist", "approver"]
+    role: Literal["hypothesis_agent", "evidence_judge", "chief_scientist", "approver", "input_reviewer"]
     hypothesis_id: Identifier | None = None
     agent_id: Identifier | None = None
     instruction: NonEmptyStr
@@ -537,11 +539,16 @@ class AgentTaskQueued(Contract):
     """The Chief Scientist's recommendation this carries out, if any."""
     continues: Identifier | None = None
     """The task this one carries on with, after the run carrying it out was cut off."""
+    calculation_ids: tuple[Identifier, ...] = ()
+    """The calculations whose inputs an input reviewer's task reviews."""
 
     @model_validator(mode="after")
     def _names_what_its_role_needs(self) -> "AgentTaskQueued":
+        if (self.role == "input_reviewer") != bool(self.calculation_ids):
+            raise ValueError("an input_reviewer task, and only one, names the calculations it reviews")
         needs = {"hypothesis_agent": (True, True), "evidence_judge": (True, False),
-                 "chief_scientist": (False, False), "approver": (False, False)}[self.role]
+                 "chief_scientist": (False, False), "approver": (False, False),
+                 "input_reviewer": (True, False)}[self.role]
         if (self.hypothesis_id is not None, self.agent_id is not None) != needs:
             raise ValueError(f"a {self.role} task names "
                              + {(True, True): "its agent and hypothesis", (True, False): "a hypothesis and no agent",
@@ -634,7 +641,8 @@ EventPayload = Annotated[
     | ProposalWithdrawn
     | AgentRetired
     | AgentTaskQueued
-    | AgentRunRecorded,
+    | AgentRunRecorded
+    | InputReviewRecorded,
     Field(discriminator="type"),
 ]
 

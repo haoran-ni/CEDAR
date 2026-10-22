@@ -222,7 +222,7 @@ def review_briefing(state: InvestigationState, *, transcripts: Path, notebook: P
 
 
 def role_briefing(state: InvestigationState, *, transcripts: Path, notebook: Path, actor_id: str, role: str) -> str:
-    """What the Evidence Judge or the approver is told at the start of each task."""
+    """What the Evidence Judge, the approver or the input reviewer is told at the start of each task."""
     lines = [f"Briefing from the research record (event {state.version}). Each task starts a new conversation; your "
              f"tools show the rest of the record.", ""]
     lines += investigation_facts(state)

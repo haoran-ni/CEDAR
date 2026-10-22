@@ -14,8 +14,8 @@ runs they bring into the record.
 
 ## What agents read and write
 
-Every agent (the Chief Scientist, the hypothesis agents, the Evidence Judge, the approver
-and the setup agent) reads the whole filesystem with the researcher's Unix permissions,
+Every agent (the Chief Scientist, the hypothesis agents, the Evidence Judge, the approver,
+the input reviewer and the setup agent) reads the whole filesystem with the researcher's Unix permissions,
 except credentials (`agent_access` in `agents/toolkits/files.py`):
 
 - CEDAR's configuration directory (API keys, profiles) and well-known credential stores

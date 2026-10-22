@@ -55,7 +55,7 @@ def calc_id(call) -> str:
 def request_args(world, control_text=None, **overrides):
     slab, bottom = co_on_cu111()
     decl = declared(**overrides)
-    args = {"protocol_name": "fhiaims.run", "protocol_version": "0.1", "observable_name": "total energy",
+    args = {"protocol_name": "fhiaims.run", "protocol_version": "0.3", "observable_name": "total energy",
             "observable_definition": "final total energy printed by FHI-aims", "observable_unit": "eV",
             "estimand": "total energy of CO/Cu(111) atop", "system_label": "CO/Cu(111) atop (synthetic)",
             "structure_text": geometry_text(slab, fixed=bottom), "rationale": "baseline total energy", **decl}
@@ -77,7 +77,7 @@ def test_full_cycle(world, agent, tmp_path):
     # Invocation 1: plan and request.
     first_script = [
         reply(ToolCall(id="t1", name="investigation_overview", arguments={}),
-              ToolCall(id="t2", name="describe_protocol", arguments={"name": "fhiaims.run", "version": "0.1"})),
+              ToolCall(id="t2", name="describe_protocol", arguments={"name": "fhiaims.run", "version": "0.3"})),
         reply(ToolCall(id="t3", name="request_calculation", arguments=request_args(world))),
         lambda call: reply(ToolCall(id="t4", name="register_prediction", arguments={
             "prediction_id": "pred-1", "statement": "The run converges.", "observable_name": "total energy",
@@ -91,12 +91,15 @@ def test_full_cycle(world, agent, tmp_path):
     ]
     result, model = run_agent(world, agent, tmp_path, first_script, "Plan a first test.")
     assert result.outcome == "waiting"
-    assert "Physical (declare as intervention or control)" in latest_tool_text(model.calls[1])
+    assert "No keyword list limits what you may set" in latest_tool_text(model.calls[1])
+    assert "The input reviewer, an agent, now reviews the inputs" in latest_tool_text(model.calls[2])
     state = world.state()
     (cid,) = state.hypotheses[world.hyp].calculation_ids
-    assert state.calculations[cid].state is CalculationState.VALIDATED_INPUT
+    assert state.calculations[cid].state is CalculationState.SPECIFIED  # waiting for the input reviewer
     assert state.hypotheses[world.hyp].status is HypothesisStatus.WAITING_FOR_JOB
     assert "pred-1" in state.predictions
+    assert world.review(cid).content.startswith("Recorded review_")
+    assert world.calc(cid).state is CalculationState.VALIDATED_INPUT
 
     # The researcher authorizes; the job runs (fake scheduler, synthetic output).
     authorize(world.ledger, world.inv, PermissionAction.SUBMIT, cid, intervention_id="ok-submit")
@@ -149,11 +152,11 @@ def test_full_cycle(world, agent, tmp_path):
     assert computed.kind is EvidenceKind.ANALYSIS and computed.quality is EvidenceQuality.VALIDATED
     assert computed.value.unit == "Ha" and computed.value.value == pytest.approx(ENERGY / 27.211386245988)
     assert "script:one_final_energy_line" in {c.name for c in computed.quality_checks}
-    runs = state.agent_runs
+    runs = [r for r in state.agent_runs if r.role == "hypothesis_agent"]  # the input reviewer's run is there too
     assert [r.run.outcome for r in runs] == ["waiting", "finished"]
     assert runs[1].run.report == "The baseline total energy is validated."
     assert state.model_tokens_used == sum(r.run.input_tokens + r.run.output_tokens + r.run.cache_read_tokens
-                                          + r.run.cache_write_tokens for r in runs) > 0
+                                          + r.run.cache_write_tokens for r in state.agent_runs) > 0
 
 
 def test_examiner_findings_reach_the_agent(world, agent, tmp_path):
@@ -201,3 +204,14 @@ def test_overview_shows_the_budget_left_when_there_is_one(ledger, store, artifac
     overview = {t.name: t for t in research_tools(ctx)}["investigation_overview"].invoke({}).content
     assert "Your hypothesis" in overview
     assert (shown in overview) if shown else ("Budget left" not in overview)
+
+
+def test_new_requests_use_the_reviewed_protocol(world, agent):
+    request = {t.name: t for t in agent}["request_calculation"]
+    outcome = request.invoke({**request_args(world), "protocol_version": "0.2"})
+    assert outcome.is_error and "fhiaims.run 0.2 is kept only for the calculations recorded under it; request " \
+                                 "fhiaims.run 0.3" in outcome.content
+    described = {t.name: t for t in agent}["describe_protocol"].invoke({"name": "fhiaims.run", "version": "0.1"})
+    assert described.content == ("fhiaims.run 0.1 is kept only for the calculations recorded under it; new requests "
+                                 "use fhiaims.run 0.3.")
+    assert world.state().calculations == {}

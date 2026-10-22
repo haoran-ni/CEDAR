@@ -127,7 +127,7 @@ def test_a_rejection_reaches_the_agent_with_the_researchers_reason(system, world
     (task,) = world.state().pending_tasks
     assert task.instruction.startswith("Your calculations have ended:")
     assert "rejected by the researcher (msg-1): don't add keywords the examiner can't check" in task.instruction
-    assert f"The researcher rejected the inputs of {calc}; their reason is shown above." in task.instruction
+    assert f"The inputs of {calc} were rejected; who rejected them and why is shown above." in task.instruction
     assert "Look at the outputs" not in task.instruction
     assert system["dispatcher"]._wake(world.inv) == []  # once is enough: the task is queued
 

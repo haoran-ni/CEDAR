@@ -53,12 +53,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from cedar.agents import AgentRunner, RunLimits, record_agent_run
-from cedar.agents.prompts import APPROVER, CHIEF_SCIENTIST, EVIDENCE_JUDGE, HYPOTHESIS_AGENT
+from cedar.agents.prompts import APPROVER, CHIEF_SCIENTIST, EVIDENCE_JUDGE, HYPOTHESIS_AGENT, INPUT_REVIEWER
 from cedar.agents.toolkits import file_tools, research_tools
 from cedar.agents.toolkits.files import agent_access
 from cedar.agents.toolkits.approver import ApproverContext, approver_tools, decisions_text
 from cedar.agents.toolkits.chief import ChiefContext, chief_tools
 from cedar.agents.toolkits.judge import JudgeContext, judge_tools
+from cedar.agents.toolkits.reviewer import ReviewerContext, reviewer_tools
 from cedar.agents.toolkits.materials import material_tools, recorded_materials
 from cedar.contracts.base import Actor, ActorKind, new_id
 from cedar.automation import approver_due, judgements_due
@@ -88,7 +89,7 @@ from cedar.hpc.slurm import SchedulerBackend, SchedulerError
 from cedar.models.prices import dollars, prices_for
 from cedar.notebook import update_notebook
 from cedar.state.projection import (AgentTaskRecord, CalculationRecord, InvestigationState, authorization_for,
-                                    review_deadline)
+                                    awaits_reviewer, review_deadline)
 from cedar.summaries import calculation_summary, task_owner
 from cedar.swarm import (
     CHIEF,
@@ -111,6 +112,7 @@ from cedar.workspace import (ModelClients, Services, Workspace, investigation_re
 SYSTEM = Actor(kind=ActorKind.SYSTEM, id="dispatcher")
 JUDGE = Actor(kind=ActorKind.EVIDENCE_JUDGE, id="evidence-judge")
 APPROVER_ACTOR = Actor(kind=ActorKind.APPROVER, id="approver")
+REVIEWER_ACTOR = Actor(kind=ActorKind.INPUT_REVIEWER, id="input-reviewer")
 _ENDED = frozenset({CalculationState.SCHEDULER_TERMINAL, CalculationState.PARSING, CalculationState.QUALITY_ASSESSED,
                     CalculationState.REJECTED, CalculationState.CANCELLED})
 _ORDER = {Priority.HIGH: 0, Priority.NORMAL: 1, Priority.LOW: 2, Priority.ON_HOLD: 3}
@@ -134,14 +136,14 @@ _LOOK_AT_OUTPUTS = (
     "Look at the outputs (run_outputs, file tools). Record the values that matter: a value printed in an output with "
     "submit_reading, citing its lines; anything that must be computed with run_analysis and then record_result.")
 _ANSWER_REJECTION = (
-    "The researcher rejected the inputs of {calcs}; their reason is shown above. Address it: change what it concerns "
-    "and request the calculation again, or, if you cannot or disagree, say why in your report and ask the researcher. "
-    "Never request the same inputs again unchanged.")
+    "The inputs of {calcs} were rejected; who rejected them and why is shown above. Address the reasons: change what "
+    "they concern and request the calculation again, or, if you cannot or disagree, say why in your report and ask "
+    "the researcher. Never request the same inputs again unchanged.")
 
 
 def wake_instruction(state: InvestigationState, ended: list[CalculationRecord]) -> str:
     """The task that wakes an agent for calculations of its that have ended: what each came to, and what to do."""
-    rejected = [c.calculation_id for c in ended if c.rejected_by_researcher]
+    rejected = [c.calculation_id for c in ended if c.refused]
     lines = [WAKE_TASK, *(calculation_summary(state, c, findings=False) for c in ended)]
     if len(rejected) < len(ended):
         lines.append(_LOOK_AT_OUTPUTS)
@@ -155,7 +157,8 @@ def wake_instruction(state: InvestigationState, ended: list[CalculationRecord]) 
 def needs_dispatcher(state: InvestigationState) -> bool:
     """Whether the investigation has work only a dispatcher carries out: a proposal waiting out its review
     window, agent work that can run, a review that is due, in full automation a decision or an assessment to
-    queue (or its allowance to end), or a calculation authorized, at the scheduler or waiting for its run check."""
+    queue (or its allowance to end), inputs waiting for the input reviewer, or a calculation authorized, at the
+    scheduler or waiting for its run check."""
     if state.status in INVESTIGATION_MACHINE.terminal:
         return False
     proposal = state.pending_proposal
@@ -167,7 +170,7 @@ def needs_dispatcher(state: InvestigationState) -> bool:
                                          or state.automation_cost_left <= 0):
         return True
     for calc in state.calculations.values():
-        if calc.state in _LIVE:
+        if calc.state in _LIVE or (state.status in _WORKING and awaits_reviewer(state, calc)):
             return True
         if (calc.state is CalculationState.VALIDATED_INPUT and state.status in _WORKING
                 and not all(state.plan.priority(h) is Priority.ON_HOLD for h in calc.hypothesis_ids)
@@ -365,6 +368,7 @@ class Dispatcher:
         notes += self._end_spent_automation(investigation_id)
         notes += self._start_proposed(investigation_id)
         notes += self._wake(investigation_id)
+        notes += self._queue_input_reviews(investigation_id)
         notes += self._queue_judgements(investigation_id)
         notes += self._queue_approver(investigation_id)
         notes += self._queue_review(investigation_id)
@@ -473,15 +477,16 @@ class Dispatcher:
                 else last.recorded_at
             if hyp.status is HypothesisStatus.WAITING_FOR_JOB:
                 awaited = [state.calculations[c] for c in hyp.awaiting_calculation_ids]
-                # The researcher's rejection is answered at once, without waiting for the other calculations.
+                # A rejection by the researcher or the input reviewer is answered at once, without waiting for the
+                # other calculations.
                 rejected = [state.calculations[c] for c in ended_unseen(state, hyp.hypothesis_id, since)
-                            if state.calculations[c].rejected_by_researcher]
+                            if state.calculations[c].refused]
                 if all(c.state in _ENDED for c in awaited):
                     ended = awaited + [c for c in rejected if c not in awaited]
                     why = "the calculations it was waiting for have ended"
                 elif rejected and state.plan.priority(hyp.hypothesis_id) is not Priority.ON_HOLD:
                     ended = rejected
-                    why = f"the researcher rejected the inputs of {', '.join(c.calculation_id for c in rejected)}"
+                    why = f"the inputs of {', '.join(c.calculation_id for c in rejected)} were rejected"
                 else:
                     continue
                 drafts.append(EventDraft(actor=SYSTEM, payload=HypothesisStatusChanged(
@@ -520,6 +525,26 @@ class Dispatcher:
 
         result = self.workspace.ledger.record_with(investigation_id, build)
         return [] if result.deduplicated or not result.events else [f"{reason}: back to human-in-the-loop, paused"]
+
+    def _queue_input_reviews(self, investigation_id: str) -> list[str]:
+        """The input reviewer reviews inputs that wait for it, one task per hypothesis for the calculations its
+        agent requested, so it sees them together."""
+
+        def build(state: InvestigationState) -> list[EventDraft]:
+            if state.status not in _WORKING:
+                return []
+            taken = {c for t in state.pending_tasks if t.role == "input_reviewer" for c in t.calculation_ids}
+            waiting: dict[str, list[str]] = {}
+            for calc in state.calculations.values():
+                if calc.calculation_id not in taken and awaits_reviewer(state, calc):
+                    waiting.setdefault(calc.hypothesis_ids[0], []).append(calc.calculation_id)
+            return [EventDraft(actor=SYSTEM, payload=AgentTaskQueued(
+                task_id=new_id("task"), role="input_reviewer", hypothesis_id=hypothesis_id, calculation_ids=tuple(ids),
+                instruction=f"Review the inputs of {', '.join(ids)}, requested for {hypothesis_id}, before they can "
+                            "run.")) for hypothesis_id, ids in waiting.items()]
+
+        result = self.workspace.ledger.record_with(investigation_id, build)
+        return [f"queued the input reviewer for {', '.join(e.payload.calculation_ids)}" for e in result.events]
 
     def _queue_judgements(self, investigation_id: str) -> list[str]:
         """In full automation, the Evidence Judge assesses every hypothesis that has new evidence, before the Chief
@@ -562,7 +587,10 @@ class Dispatcher:
 
     @staticmethod
     def _key(investigation_id: str, task: AgentTaskRecord) -> str:
-        """Runs with the same key never overlap: one per agent, one Judge and one review per investigation."""
+        """Runs with the same key never overlap: one per agent, one Judge and one review per investigation, and one
+        review of inputs per hypothesis."""
+        if task.role == "input_reviewer":
+            return f"{investigation_id}/{task.role}/{task.hypothesis_id}"
         return f"{investigation_id}/{task.agent_id or task.role}"
 
     def _interruption(self, investigation_id: str, task: AgentTaskRecord) -> str | None:
@@ -691,9 +719,24 @@ class Dispatcher:
                                       transcripts=transcripts, notebook=notebook)
         elif role == "evidence_judge":
             actor = JUDGE
+            try:
+                runs_root = profile_for(state, self.profiles).runs_root
+            except (LookupError, ProfileNotApproved, FileNotFoundError):
+                runs_root = None
             tools = judge_tools(JudgeContext(ledger=self.workspace.ledger, investigation_id=investigation_id,
-                                             actor=actor, artifacts=self.workspace.artifacts))
+                                             actor=actor, artifacts=self.workspace.artifacts, runs_root=runs_root))
             system, session = EVIDENCE_JUDGE, session_name(investigation_id, "judge", task.task_id)
+            briefing = role_briefing(state, transcripts=transcripts, notebook=notebook, actor_id=actor.id, role=role)
+        elif role == "input_reviewer":
+            actor = REVIEWER_ACTOR
+            try:
+                profile = profile_for(state, self.profiles)
+            except (LookupError, ProfileNotApproved, FileNotFoundError):
+                profile = None
+            tools = reviewer_tools(ReviewerContext(ledger=self.workspace.ledger, investigation_id=investigation_id,
+                                                   actor=actor, artifacts=self.workspace.artifacts, task=task,
+                                                   files=agent_access(self.deny), profile=profile))
+            system, session = INPUT_REVIEWER, session_name(investigation_id, "input-reviewer", task.task_id)
             briefing = role_briefing(state, transcripts=transcripts, notebook=notebook, actor_id=actor.id, role=role)
         elif role == "approver":
             actor = APPROVER_ACTOR
@@ -770,6 +813,9 @@ class Dispatcher:
         state = self.workspace.ledger.load(investigation_id)
         if state.status in INVESTIGATION_MACHINE.terminal:
             return None
+        if task.role == "input_reviewer" and not any(awaits_reviewer(state, state.calculations[c])
+                                                     for c in task.calculation_ids):
+            return None
         if task.agent_id is not None and not state.agents[task.agent_id].active:
             return None
         if result.outcome == "model_error" and result.retryable:
@@ -789,7 +835,7 @@ class Dispatcher:
         self.workspace.ledger.record(investigation_id, [EventDraft(actor=SYSTEM, payload=AgentTaskQueued(
             task_id=task_id, role=task.role, hypothesis_id=task.hypothesis_id, agent_id=task.agent_id,
             instruction=continuation_text(state, record, why), recommendation_id=task.recommendation_id,
-            continues=task.task_id))])
+            continues=task.task_id, calculation_ids=task.calculation_ids))])
         return f"to be continued as {task_id}"
 
     def _clear_activity(self) -> None:

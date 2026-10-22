@@ -11,6 +11,7 @@ from cedar.automation import mode_summary, pending_decisions
 from cedar.contracts.base import canonical_json
 from cedar.contracts.examination import ExaminationVerdict, FindingSeverity
 from cedar.contracts.plan import PermissionAction
+from cedar.contracts.review import InputReviewRecorded, ReviewSeverity
 from cedar.contracts.status import CalculationState
 from cedar.models.prices import dollars
 from cedar.state.projection import (
@@ -19,7 +20,11 @@ from cedar.state.projection import (
     RecommendationRecord,
     SynthesisRecord,
     authorization_for,
+    awaits_reviewer,
+    escalated,
     evidence_owner,
+    review_attempts,
+    reviewer_rejections,
 )
 from cedar.swarm import agent_label, proposal_note
 from cedar.web import web_summary
@@ -47,11 +52,17 @@ def calculation_summary(state: InvestigationState, calc: CalculationRecord, *, f
                        f"estimand: {calc.task.estimand}; for {', '.join(calc.hypothesis_ids)}"]
         if calc.rejected_by_researcher:
             lines.append(f"  rejected by the researcher ({calc.ended_by}): {calc.end_reason}")
+        elif calc.rejected_by_reviewer:
+            lines.append(f"  rejected by the input reviewer ({calc.ended_by}): {calc.end_reason}")
         elif calc.state is CalculationState.CANCELLED and calc.end_reason:
             lines.append("  cancelled" + (f" ({calc.ended_by})" if calc.ended_by else "") + f": {calc.end_reason}")
+        elif awaits_reviewer(state, calc):
+            lines.append("  its inputs wait for the input reviewer")
+        if calc.input_review is not None and not calc.rejected_by_reviewer:
+            lines += ["  " + line for line in review_lines(calc.input_review)]
     if findings and calc.examination is not None:
         for f in calc.examination.findings:
-            if f.severity is not FindingSeverity.INFO or f.code == "generated":
+            if f.severity is not FindingSeverity.INFO or f.code in ("generated", "undeclared_setting"):
                 lines.append(f"  [{f.severity.value}] {f.code}: {f.message}{_place(f)}")
     if calc.run_check is not None:
         failed = [c for c in calc.run_check.checks if not c.passed]
@@ -78,6 +89,26 @@ def calculation_summary(state: InvestigationState, calc: CalculationRecord, *, f
 def _place(finding) -> str:
     """Where in the inputs a finding is, e.g. " (control.in:42)"; nothing if it names no file."""
     return f" ({finding.file}{':' + str(finding.line) if finding.line else ''})" if finding.file else ""
+
+
+def rejection_reason(review: InputReviewRecorded) -> str:
+    """Why the reviewer sent the inputs back, as the agent is told."""
+    problems = [f.text + (f" ({f.file}" + (f":{f.line}" if f.line else "") + ")" if f.file else "")
+                for f in review.findings if f.severity is ReviewSeverity.PROBLEM]
+    return f"{review.summary} Problems: {'; '.join(problems)}" if problems else review.summary
+
+
+def review_lines(review: InputReviewRecorded, *, notes: bool = False) -> list[str]:
+    """A review as the researcher and the agents see it: the decision, the summary and the findings worth acting on."""
+    lines = [f"input reviewer ({review.review_id}): {review.decision.value}: {review.summary}"]
+    for f in review.findings:
+        if f.severity is ReviewSeverity.NOTE and not notes:
+            continue
+        place = f" ({f.file}" + (f":{f.line}" if f.line else "") + ")" if f.file else ""
+        cited = "; ".join(s.source + (f":{s.lines}" if s.lines else "") + ("" if s.verified else " (not checked)")
+                          for s in f.sources)
+        lines.append(f"  {f.severity.value}: {f.text}{place}" + (f" [sources: {cited}]" if cited else ""))
+    return lines
 
 
 def short_id(calculation_id: str, among: Iterable[str] = ()) -> str:
@@ -155,11 +186,17 @@ def requested_by(state: InvestigationState, calc: CalculationRecord) -> str:
 
 
 def awaiting_review(state: InvestigationState) -> list[str]:
-    """Calculations whose inputs wait for the researcher's review: the examiner could not verify part of them."""
-    return [c.calculation_id for c in state.calculations.values()
-            if c.state is CalculationState.SPECIFIED and c.examination is not None
-            and c.examination.verdict is ExaminationVerdict.NEEDS_REVIEW
-            and authorization_for(state, PermissionAction.APPROVE_INPUTS, c.calculation_id) is None]
+    """Calculations whose inputs wait for the researcher's review: the examiner could not verify part of them, or
+    the input reviewer warned, could not send them back again, or reached no decision."""
+    found = []
+    for c in state.calculations.values():
+        exam = c.examination
+        if (c.state is not CalculationState.SPECIFIED or exam is None or exam.verdict is ExaminationVerdict.REJECTED
+                or authorization_for(state, PermissionAction.APPROVE_INPUTS, c.calculation_id) is not None):
+            continue
+        if not awaits_reviewer(state, c) if exam.agent_review else exam.verdict is ExaminationVerdict.NEEDS_REVIEW:
+            found.append(c.calculation_id)
+    return found
 
 
 def run_directory(calc: CalculationRecord, runs_root: str | Path | None = None) -> str | None:
@@ -170,13 +207,26 @@ def run_directory(calc: CalculationRecord, runs_root: str | Path | None = None) 
 
 
 def review_note(state: InvestigationState, calc: CalculationRecord, runs_root: str | Path | None = None) -> str:
-    """What the researcher needs to review inputs: who asks, what the examiner could not verify and where, and
-    where the files are."""
-    reasons = "; ".join(f"{f.message}{_place(f)}" for f in calc.examination.findings
-                        if f.severity is FindingSeverity.REVIEW)
+    """What the researcher needs to review inputs: who asks, what the input reviewer found, what the examiner could
+    not verify and where, and where the files are."""
+    exam = calc.examination
+    parts = [requested_by(state, calc)]
+    review = calc.input_review
+    if exam.agent_review and review is None:
+        parts.append(f"the input reviewer reached no decision in {review_attempts(state, calc.calculation_id)} "
+                     "attempts")
+    elif review is not None:
+        why = (f" (it sent back {len(reviewer_rejections(state, calc))} revisions of this request already, so you "
+               "decide)" if review.decision.value == "input_agent_rejected" and escalated(state, calc) else "")
+        found = [f"{f.severity.value}: {f.text}{_place(f)}" for f in review.findings
+                 if f.severity is not ReviewSeverity.NOTE]
+        parts.append(f"input reviewer: {review.decision.value}{why}: {review.summary}"
+                     + (f" {' '.join(found)}" if found else ""))
+    reasons = "; ".join(f"{f.message}{_place(f)}" for f in exam.findings if f.severity is FindingSeverity.REVIEW)
+    if reasons:
+        parts.append(f"needs review: {reasons}")
     directory = run_directory(calc, runs_root)
-    return (f"{requested_by(state, calc)}; needs review: {reasons}"
-            + (f"; files in {directory}" if directory else ""))
+    return "; ".join(parts) + (f"; files in {directory}" if directory else "")
 
 
 def submission_note(state: InvestigationState, calc: CalculationRecord, runs_root: str | Path | None = None) -> str:

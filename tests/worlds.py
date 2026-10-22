@@ -12,7 +12,7 @@ from cedar.contracts import PermissionAction, ProtocolRef, SchedulerState, Scien
 from cedar.engine import JobManager, JobMonitor, ProtocolEngine, ResultValidator
 from cedar.engine.analysis import AnalysisRunner
 from cedar.hpc.fake import FakeScheduler
-from cedar.protocols import TOTAL_ENERGY, FhiAimsRun, FhiAimsRunSlurmOnly, ProtocolRegistry
+from cedar.protocols import TOTAL_ENERGY, FhiAimsRun, FhiAimsRunReviewed, FhiAimsRunSlurmOnly, ProtocolRegistry
 
 
 class World:
@@ -21,7 +21,7 @@ class World:
     def __init__(self, ledger, store, artifacts, site, **constraints):
         self.ledger, self.store, self.artifacts, self.site = ledger, store, artifacts, site
         self.scheduler = FakeScheduler()
-        self.registry = ProtocolRegistry([FhiAimsRun(site), FhiAimsRunSlurmOnly(site)])
+        self.registry = ProtocolRegistry([FhiAimsRunReviewed(site), FhiAimsRun(site), FhiAimsRunSlurmOnly(site)])
         self.runs = Path(site.runs_root)
         self.engine = ProtocolEngine(ledger, self.registry, artifacts, self.runs)
         self.manager = JobManager(ledger, self.scheduler, self.runs)
@@ -34,6 +34,8 @@ class World:
         self.structure = artifacts.put_bytes(geometry_text(slab, fixed=bottom).encode(), label="geometry.in")
 
     def task(self, authored=None, version="0.1", **overrides) -> ScientificTaskSpec:
+        """A task under ``version``; 0.1 by default, so the examination alone decides, as it did under 0.1 and 0.2,
+        and 0.3 for inputs the input reviewer judges."""
         return ScientificTaskSpec(
             protocol=ProtocolRef(name="fhiaims.run", version=version), observable=TOTAL_ENERGY,
             estimand="total energy of CO/Cu(111) atop", system_label="CO/Cu(111) atop (synthetic)",
@@ -50,6 +52,50 @@ class World:
 
     def state(self):
         return self.ledger.load(self.inv)
+
+    def review(self, cid, decision="input_agent_approved", findings=(), summary="The inputs fit the test.",
+               settings=None, deny=()):
+        """The input reviewer's verdict on ``cid``, recorded through its own tool in a task the dispatcher would
+        queue; returns the tool's outcome."""
+        from cedar.agents.toolkits.files import agent_access
+        from cedar.agents.toolkits.reviewer import ReviewerContext, reviewer_tools
+        from cedar.contracts import Actor, ActorKind, AgentRunRecorded, AgentTaskQueued, EventDraft
+        from cedar.contracts.base import new_id
+
+        task_id = new_id("task")
+        self.ledger.record(self.inv, [EventDraft(actor=Actor(kind=ActorKind.SYSTEM, id="dispatcher"),
+                                                 payload=AgentTaskQueued(
+            task_id=task_id, role="input_reviewer", hypothesis_id=self.calc(cid).hypothesis_ids[0],
+            calculation_ids=(cid,), instruction="Review."))])
+        ctx = ReviewerContext(ledger=self.ledger, investigation_id=self.inv,
+                              actor=Actor(kind=ActorKind.INPUT_REVIEWER, id="input-reviewer"),
+                              artifacts=self.artifacts, task=self.state().tasks[task_id], files=agent_access(deny),
+                              profile=self.site)
+        tools = {t.name: t for t in reviewer_tools(ctx)}
+        if settings is None:
+            settings = {name: "physical_model" for name in self.calc(cid).examination.settings}
+        outcome = tools["record_input_review"].invoke({"calculation_id": cid, "decision": decision,
+                                                        "summary": summary, "findings": list(findings),
+                                                        "settings": settings})
+        if outcome.is_error:
+            return outcome  # a reviewer corrects itself within the same task
+        self.ledger.record(self.inv, [EventDraft(actor=ctx.actor, payload=AgentRunRecorded(
+            session_id="review", role="input_reviewer", task_id=task_id, provider="p", requested_model="m", turns=1,
+            input_tokens=1, output_tokens=1, cache_read_tokens=0, cache_write_tokens=0, outcome="finished",
+            report=outcome.content))])
+        return outcome
+
+    def reviewer_material(self, cid) -> str:
+        """What the input reviewer is shown for ``cid``."""
+        from cedar.agents.toolkits.files import agent_access
+        from cedar.agents.toolkits.reviewer import ReviewerContext, review_material
+        from cedar.contracts import Actor, ActorKind
+
+        task = type("Task", (), {"calculation_ids": (cid,), "task_id": "t"})()
+        ctx = ReviewerContext(ledger=self.ledger, investigation_id=self.inv,
+                              actor=Actor(kind=ActorKind.INPUT_REVIEWER, id="input-reviewer"),
+                              artifacts=self.artifacts, task=task, files=agent_access(), profile=self.site)
+        return review_material(ctx, self.state(), self.calc(cid))
 
     def calc(self, cid):
         return self.state().calculations[cid]

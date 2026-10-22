@@ -29,6 +29,8 @@ from cedar.models import ModelPrices, ModelSettings, TextPart, ToolCall
 from cedar.models.scripted import ScriptedModel, reply
 from cedar.notebook import render_notebook
 from cedar.state import replay
+from cedar.state.projection import awaits_reviewer
+from cedar.web import REVIEW_DOMAINS
 from cedar.summaries import short_id
 from cedar.workspace import Workspace
 
@@ -151,7 +153,7 @@ def agent_requests(system):
     workspace = system["workspace"]
     return [
         reply(call("set_hypothesis_status", status="PLANNING_TEST", reason="baseline first"),
-              call("request_calculation", protocol_name="fhiaims.run", protocol_version="0.1",
+              call("request_calculation", protocol_name="fhiaims.run", protocol_version="0.3",
                    observable_name="total energy", observable_definition="final total energy printed by FHI-aims",
                    observable_unit="eV", estimand="total energy of CO/Cu(111) atop",
                    system_label="CO/Cu(111) atop (synthetic)", structure_text=geometry_text(slab, fixed=bottom),
@@ -163,6 +165,28 @@ def agent_requests(system):
         lambda c: reply(call("submit_report", outcome="waiting_for_calculations",
                              summary="Requested the PBE baseline; waiting for it.", wait_for=[latest_calc(workspace)])),
     ]
+
+
+def reviewer_decides(system, decision="input_agent_approved", findings=(), summary="The inputs fit the test."):
+    """The input reviewer reads the inputs waiting for it and records ``decision`` on the first of them, classifying
+    every keyword control.in sets as part of the physical model (TEST DOUBLE replies)."""
+    workspace = system["workspace"]
+
+    def record(_call):
+        state = workspace.ledger.load(INV)
+        calc = next(c for c in state.calculations.values() if awaits_reviewer(state, c))
+        return reply(call("record_input_review", calculation_id=calc.calculation_id, decision=decision,
+                          summary=summary, findings=list(findings),
+                          settings={name: "physical_model" for name in calc.examination.settings}))
+
+    return [reply(call("inputs_to_review")), record, reply(TextPart(text=f"Recorded: {decision}."))]
+
+
+def review_inputs(system, *steps):
+    """The dispatcher's next pass, in which the input reviewer reviews the inputs waiting for it: it approves them,
+    unless ``steps`` script another verdict."""
+    system["clients"].add("input_reviewer", *(steps or reviewer_decides(system)))
+    return system["dispatcher"].tick()
 
 
 HARTREE_SCRIPT = (
@@ -219,9 +243,18 @@ def test_full_loop(system):
     clients.add("hypothesis_agent", *agent_requests(system))
     notes = dispatcher.tick()
     assert any("hypothesis_agent ran" in n and "waiting" in n for n in notes)
-    assert not any("submit" in n for n in dispatcher.tick())  # not even attempted without authorization
     calc = latest_calc(workspace)
-    assert workspace.ledger.load(INV).calculations[calc].state is CalculationState.VALIDATED_INPUT
+    assert workspace.ledger.load(INV).calculations[calc].state is CalculationState.SPECIFIED  # for the reviewer
+
+    # The input reviewer approves the inputs; nothing is submitted without authorization.
+    clients.add("input_reviewer", *reviewer_decides(system))
+    notes = dispatcher.tick()
+    assert any(f"queued the input reviewer for {calc}" in n for n in notes)
+    assert any("input_reviewer ran" in n for n in notes) and not any("submit" in n for n in notes)
+    reviewed = workspace.ledger.load(INV).calculations[calc]
+    assert reviewed.state is CalculationState.VALIDATED_INPUT
+    assert reviewed.input_review.decision.value == "input_agent_approved"
+    assert clients.models["input_reviewer"].calls[0].web.allowed_domains == REVIEW_DOMAINS
     assert scheduler.submissions == [] and heartbeat_age(workspace, NOW) == 0
     notices = [n.text for n in chat.notices()]
     assert any(f"agent-{HYP} ({ROLE})" in n and "Requested the PBE baseline" in n for n in notices)
@@ -259,7 +292,8 @@ def test_full_loop(system):
     state = workspace.ledger.load(INV)
     assert state.hypotheses[HYP].assessment is Assessment.INCONCLUSIVE
     assert state.pending_tasks == []
-    assert {r.role for r in state.agent_runs} == {"chief_scientist", "hypothesis_agent", "evidence_judge"}
+    assert {r.role for r in state.agent_runs} == {"chief_scientist", "hypothesis_agent", "input_reviewer",
+                                              "evidence_judge"}
     assert state.interventions["msg-3"].authorizations[0].target_ids == (calc,)
     dossier_view = clients.models["evidence_judge"].calls[1].messages[-1].parts[0].content
     assert "Prediction pred-1" in dossier_view and "check citations_verified: passed" in dossier_view
@@ -289,6 +323,7 @@ def test_on_hold_hypotheses_are_not_submitted(system):
     open_and_start(system)
     clients.add("hypothesis_agent", *agent_requests(system))
     dispatcher.tick()
+    review_inputs(system)
     calc = latest_calc(workspace)
     chat.handle(f"/approve submit {calc}")
     clients.add("chief_scientist", reply(call("revise_plan", reason="researcher paused XC work",
@@ -363,6 +398,7 @@ def test_the_dispatcher_checks_every_finished_run(system):
     open_and_start(system)
     clients.add("hypothesis_agent", *agent_requests(system))
     dispatcher.tick()
+    review_inputs(system)
     calc = latest_calc(workspace)
     chat.handle(f"/approve submit {calc}")
     output = aims_output(energy=ENERGY)
@@ -448,6 +484,9 @@ def test_cli_start_and_dispatch(system, monkeypatch, capsys, tmp_path):
     monkeypatch.setattr(cli, "_make_dispatcher", lambda agents=4: system["dispatcher"])
     assert cli.main(["dispatch", "--once"]) == 0
     assert "hypothesis_agent ran" in capsys.readouterr().out
+    clients.add("input_reviewer", *reviewer_decides(system))
+    assert cli.main(["dispatch", "--once"]) == 0
+    assert "input_reviewer ran" in capsys.readouterr().out
 
     lines = iter(["/pending", "/quit"])
     monkeypatch.setattr("builtins.input", lambda prompt: next(lines))
@@ -494,9 +533,11 @@ def test_reports_that_arrive_during_a_chief_turn_are_still_shown(system):
     chat, dispatcher, clients = system["chat"], system["dispatcher"], system["clients"]
     open_and_start(system)
     clients.add("hypothesis_agent", *agent_requests(system))
+    clients.add("input_reviewer", *reviewer_decides(system))
 
     def answer_while_the_dispatcher_works(_request):
         dispatcher.tick()  # records the agent's report while the Chief is answering
+        dispatcher.tick()  # and the input reviewer's approval
         return reply(TextPart(text="Noted."))
 
     clients.add("chief_scientist", answer_while_the_dispatcher_works)

@@ -3,6 +3,7 @@ from sites import build_site
 
 import cedar.chat
 
+from cedar.secrets import PROVIDER_ENVIRONMENT_VARIABLES
 from cedar.state import ResearchLedger
 from cedar.store import ArtifactStore, SQLiteEventStore
 
@@ -16,7 +17,8 @@ def isolated(tmp_path, monkeypatch):
     """
     monkeypatch.setenv("CEDAR_CONFIG_DIR", str(tmp_path / "isolated-config"))
     monkeypatch.setenv("CEDAR_DATA_DIR", str(tmp_path / "isolated-data"))
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    for variable in PROVIDER_ENVIRONMENT_VARIABLES.values():
+        monkeypatch.delenv(variable, raising=False)
 
     def refuse(workspace):
         raise AssertionError(f"a test tried to start a background dispatcher on {workspace.root}")

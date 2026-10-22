@@ -268,11 +268,12 @@ def _start(args) -> int:
     from cedar.chat import ChatSession
     from cedar.dispatch import heartbeat_age
 
+    clients = _model_clients()  # before the data directory, so a missing models.toml creates nothing
     workspace = _workspace()
     if args.investigation and args.investigation not in workspace.store.investigation_ids():
         print(f"No investigation {args.investigation}. See `cedar investigations`.", file=sys.stderr)
         return 1
-    session = ChatSession(workspace, _profiles(), _model_clients(), investigation_id=args.investigation,
+    session = ChatSession(workspace, _profiles(), clients, investigation_id=args.investigation,
                           auto_dispatch=not args.no_dispatch)
     started = session.ensure_dispatcher()
     if _full_screen(args):
@@ -434,4 +435,11 @@ def main(argv: list[str] | None = None) -> int:
     if not hasattr(args, "handler"):
         parser.print_help()
         return 0
-    return args.handler(args)
+    from cedar.models import MissingCredential, MissingModelConfig
+
+    try:
+        return args.handler(args)
+    except (MissingModelConfig, MissingCredential) as exc:
+        # A setup step not done yet: say which command does it, without a traceback.
+        print(f"cedar: {exc}", file=sys.stderr)
+        return 1

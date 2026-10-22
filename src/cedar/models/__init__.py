@@ -1,6 +1,6 @@
 """Provider-neutral access to language models, with one adapter per provider."""
 
-from cedar.models.config import ModelConfig, load_model_config, write_starter
+from cedar.models.config import MissingModelConfig, ModelConfig, load_model_config, write_starter
 from cedar.models.credentials import (
     CredentialStore,
     InsecureCredentials,
@@ -37,7 +37,7 @@ def create_client(settings: ModelSettings, credentials: CredentialStore) -> Mode
 
 
 __all__ = [
-    "ADAPTERS", "CredentialStore", "InsecureCredentials", "MediaPart", "Message", "MissingCredential", "ModelClient",
-    "ModelConfig", "ModelError", "ModelPrices", "ModelReply", "ModelSettings", "TextPart", "ToolCall", "ToolResult", "ToolSpec",
+    "ADAPTERS", "CredentialStore", "InsecureCredentials", "MediaPart", "Message", "MissingCredential",
+    "MissingModelConfig", "ModelClient", "ModelConfig", "ModelError", "ModelPrices", "ModelReply", "ModelSettings", "TextPart", "ToolCall", "ToolResult", "ToolSpec",
     "Usage", "WebAccess", "create_client", "load_model_config", "redact", "scrubbed_environment", "write_starter",
 ]

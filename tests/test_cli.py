@@ -53,6 +53,18 @@ def test_models_check_reports_the_serving_model(monkeypatch, capsys):
     assert model.calls[0].settings.max_output_tokens == 1024
 
 
+def test_setup_before_models_init_names_the_missing_step(capsys, isolated_config):
+    assert cli.main(["setup", "--name", "mycluster"]) == 1
+    err = capsys.readouterr().err
+    assert "cedar models init" in err and str(isolated_config / "models.toml") in err
+
+
+def test_models_check_before_auth_add_names_the_missing_step(capsys):
+    cli.main(["models", "init"])
+    assert cli.main(["models", "check"]) == 1
+    assert "cedar auth add anthropic" in capsys.readouterr().err
+
+
 def test_no_command_prints_help(capsys):
     assert cli.main([]) == 0
     assert "auth" in capsys.readouterr().out

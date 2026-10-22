@@ -28,6 +28,10 @@ effort = "high"
 """
 
 
+class MissingModelConfig(FileNotFoundError):
+    """No ``models.toml`` yet: ``cedar models init`` writes one."""
+
+
 class ModelConfig(Contract):
     roles: dict[str, ModelSettings]
 
@@ -39,6 +43,9 @@ class ModelConfig(Contract):
 
 
 def load_model_config(path: str | Path) -> ModelConfig:
+    if not Path(path).exists():
+        raise MissingModelConfig(f"no model configuration at {path}; run `cedar models init`, then edit it to "
+                                 "choose models")
     with open(path, "rb") as stream:
         return ModelConfig.model_validate(tomllib.load(stream))
 

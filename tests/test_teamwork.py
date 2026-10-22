@@ -476,8 +476,8 @@ def test_pending_shows_what_a_submission_costs_and_approvals_go_by_agent_or_all(
 
 def test_an_agent_whose_model_has_no_known_prices_waits_while_a_budget_applies(system, monkeypatch):
     from cedar.models import ModelSettings
-    chat = investigation(system, "hyp-a")  # opened with the default budget of $15
-    assert system["workspace"].ledger.load(INV).budget_usd == 15
+    chat = investigation(system, "hyp-a")  # opened with the default budget of $25
+    assert system["workspace"].ledger.load(INV).budget_usd == 25
     propose(system["workspace"].ledger, "p-1", "hyp-a")
     agents_answer(system, **{"hyp-a": [says("A.")]})
     chat.handle("/approve agents")

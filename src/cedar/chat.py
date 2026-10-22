@@ -148,7 +148,8 @@ COMMANDS = (
     Command("/mode full-automation <core-hours> <dollars>", "while you are away, an approver decides on agents and "
             "submissions and the Evidence Judge assesses new evidence, within these limits"),
     Command("/budget", "show what the investigation's agents have spent on models, and the budget"),
-    Command("/budget <dollars>", "limit what all its agents may spend on models in total, e.g. 40 ($15 by default)"),
+    Command("/budget <dollars>", "limit what all its agents may spend on models in total, e.g. 40 "
+            f"(${DEFAULT_BUDGET_USD:g} by default)"),
     Command("/budget off", "no limit on spending"),
     Command("/web", "show whether the agents may use the web"),
     Command("/web on", "let the Chief Scientist and the hypothesis agents search and read the web"),

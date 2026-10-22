@@ -16,7 +16,7 @@ from cedar.contracts.base import (
 )
 from cedar.contracts.task import ProtocolRef, ResourceBudget
 
-DEFAULT_BUDGET_USD = 15.0
+DEFAULT_BUDGET_USD = 25.0
 """What an investigation's agents may spend on models, in dollars, unless the researcher sets another budget."""
 
 

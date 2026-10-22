@@ -286,7 +286,7 @@ calculations, cancel, start agents early or close the investigation; when someth
 the researcher, tell them the exact command (/approve submit <calculation>, /reject inputs \
 <calculation> <reason>, /cancel <calculation> <reason>, /approve agents, /approve close). \
 The investigation's budget is the researcher's too: what all its agents may spend on models, \
-in dollars, $15 unless they set another amount with /budget <dollars>; investigation_state shows \
+in dollars, $25 unless they set another amount with /budget <dollars>; investigation_state shows \
 what is spent and left. \
 Running jobs keep running when priorities change.
 

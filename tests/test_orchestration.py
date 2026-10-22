@@ -362,25 +362,25 @@ def test_a_spent_budget_leaves_queued_work_waiting(system):
     assert any("hypothesis_agent ran" in n for n in dispatcher.tick())
 
 
-def test_the_budget_is_in_dollars_and_fifteen_unless_the_researcher_sets_another(system):
+def test_the_budget_is_in_dollars_and_twenty_five_unless_the_researcher_sets_another(system):
     workspace, chat, clients = system["workspace"], system["chat"], system["clients"]
     assert chat.limits.max_cost_usd is None and system["dispatcher"].limits.max_cost_usd is None
     # Set before the investigation exists, the budget is recorded when it opens.
-    assert chat.handle("/budget").startswith("Budget: $0.00 of $15.00 spent on models, $15.00 left.")
-    assert chat.handle("/budget 25") == ("Budget $25.00 (it is recorded when the investigation opens): $0.00 spent, "
-                                         "$25.00 left for all agents together, the Chief Scientist's answers "
+    assert chat.handle("/budget").startswith("Budget: $0.00 of $25.00 spent on models, $25.00 left.")
+    assert chat.handle("/budget 40") == ("Budget $40.00 (it is recorded when the investigation opens): $0.00 spent, "
+                                         "$40.00 left for all agents together, the Chief Scientist's answers "
                                          "included, at the price of each kind of token.")
     open_and_start(system)
     state = workspace.ledger.load(INV)
-    assert state.budget_usd == 25 and state.spec.constraints.budget_usd == 15  # opened with the default
-    assert [i.text for i in state.interventions.values()][:2] == ["/budget 25", "Investigate CO on Cu(111)."]
+    assert state.budget_usd == 40 and state.spec.constraints.budget_usd == 25  # opened with the default
+    assert [i.text for i in state.interventions.values()][:2] == ["/budget 40", "Investigate CO on Cu(111)."]
 
-    for typed, expected in (("$40", 40.0), ("7.50", 7.5), ("1,000", 1000.0), ("off", None)):
+    for typed, expected in (("$60", 60.0), ("7.50", 7.5), ("1,000", 1000.0), ("off", None)):
         chat.handle(f"/budget {typed}")
         assert workspace.ledger.load(INV).budget_usd == expected
     for bad in ("lots", "0", "5 dollars", "-3"):
         assert chat.handle(f"/budget {bad}").startswith("Usage: /budget")
-    assert [b.max_usd for b in workspace.ledger.load(INV).budget_changes] == [25, 40, 7.5, 1000, None]
+    assert [b.max_usd for b in workspace.ledger.load(INV).budget_changes] == [40, 60, 7.5, 1000, None]
 
     # The Chief Scientist's answers stop at what the budget has left: $0.07 spent, $0.03 left, a reply costs $0.035.
     chat.handle("/budget 0.10")
@@ -390,7 +390,7 @@ def test_the_budget_is_in_dollars_and_fifteen_unless_the_researcher_sets_another
     assert chat.handle("/budget").startswith("Budget: $0.11 of $0.10 spent on models, $0.00 left.")
     usage = render_notebook(workspace.store.read_stream(INV))["index.md"].split("## Model usage")[1]
     assert "- Total: $0.11 of a $0.10 budget, 45 tokens" in usage
-    assert "- Budget set to $25.00 by the researcher's msg-1 (event #" in usage
+    assert "- Budget set to $40.00 by the researcher's msg-1 (event #" in usage
     assert "- Budget removed by the researcher's msg-7 (event #" in usage
 
 

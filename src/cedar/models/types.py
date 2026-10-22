@@ -147,8 +147,8 @@ class ModelSettings(Contract):
     prices: ModelPrices | None = None
     """What its tokens cost; None takes the prices published for the model, if CEDAR knows them."""
     max_output_tokens: int = Field(default=64000, gt=0)
-    effort: Literal["low", "medium", "high", "xhigh", "max"] | None = None
-    """Reasoning effort, for providers that support it."""
+    effort: Literal["low", "medium", "high", "xhigh", "max"] | None = "medium"
+    """Reasoning effort, for providers that support it; None sends none, for models without it."""
     options: dict[str, JsonValue] = {}
     """Provider-specific extras, passed through by the adapter that understands them."""
 

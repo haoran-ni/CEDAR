@@ -199,7 +199,7 @@ def test_requests_define_their_observable(world, agent, tmp_path):
 
 
 @pytest.mark.parametrize("budget, shown", [("none", None), (None, "Budget left for this investigation's model use: "
-                                                                    "$15.00"),
+                                                                    "$25.00"),
                                            (40, "Budget left for this investigation's model use: $40.00")])
 def test_overview_shows_the_budget_left_when_there_is_one(ledger, store, artifacts, site, budget, shown):
     constraints = {"budget_usd": None} if budget == "none" else {"budget_usd": budget} if budget else {}

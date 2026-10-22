@@ -24,7 +24,7 @@ STARTER = """# Which model each CEDAR agent role uses. Roles without a section u
 [roles.default]
 provider = "anthropic"
 model = "claude-opus-5-5"
-effort = "high"
+effort = "medium"
 """
 
 

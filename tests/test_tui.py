@@ -421,7 +421,8 @@ def test_the_panel_is_always_there_with_the_logo_across_its_top_border(system):
         assert len(border) == top.size.width == app.size.width
         assert str(app.query_one("#tagline", Static).content) == TAGLINE
         assert str(app.query_one("#models", Static).content).startswith("Models: Chief Scientist "
-                                                                        "scripted-chief_scientist (scripted)")
+                                                                        "scripted-chief_scientist, effort medium "
+                                                                        "(scripted)")
         assert not app.query_one("#swarm").display  # no hypotheses yet: the panel stays, without their table
         assert app.query_one("#agents").display and list(agents(app)) == ["Chief Scientist", "Evidence Judge"]
 

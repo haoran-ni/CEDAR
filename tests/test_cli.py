@@ -41,7 +41,7 @@ def test_models_init_show(capsys, isolated_config):
     assert cli.main(["models", "init"]) == 0
     cli.main(["models", "show"])
     out = capsys.readouterr().out
-    assert "already exists" in out and "default: anthropic claude-opus-5-5, effort high" in out
+    assert "already exists" in out and "default: anthropic claude-opus-5-5, effort medium" in out
 
 
 def test_models_check_reports_the_serving_model(monkeypatch, capsys):

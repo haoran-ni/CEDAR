@@ -287,9 +287,9 @@ def test_the_panel_names_the_models_in_use(ledger):
     assert model_line(missing, None) == "Model: none configured (cedar models init)"
     mixed = {"hypothesis_agent": ModelSettings(provider="anthropic", model="claude-sonnet-5-5")}
     assert model_line(lambda role: mixed.get(role, opus), None) == (
-        "Models: Chief Scientist claude-opus-5-5, effort high (anthropic) · hypothesis agents claude-sonnet-5-5 "
-        "(anthropic) · Evidence Judge claude-opus-5-5, effort high (anthropic) · approver claude-opus-5-5, effort "
-        "high (anthropic) · input reviewer claude-opus-5-5, effort high (anthropic)")
+        "Models: Chief Scientist claude-opus-5-5, effort high (anthropic) · hypothesis agents claude-sonnet-5-5, "
+        "effort medium (anthropic) · Evidence Judge claude-opus-5-5, effort high (anthropic) · approver "
+        "claude-opus-5-5, effort high (anthropic) · input reviewer claude-opus-5-5, effort high (anthropic)")
 
     inv = start_investigation(ledger)
     hyp = add_hypothesis(ledger, inv)

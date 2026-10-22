@@ -207,9 +207,9 @@ class ThinScrollBar(ScrollBarRender):
     a faint light line, on the background of the widget that scrolls. A click on the line pages, a drag on the
     thumb scrolls, as with Textual's own."""
 
-    LINES = {True: ("│", "┃", "╿", "╽"), False: ("─", "━", "╾", "╼")}
+    LINES = {True: ("│", "┃", "╹", "╻"), False: ("─", "━", "╸", "╺")}
     """Vertical, then horizontal: the track, the thumb, and a cell the thumb covers only the first or the second
-    half of."""
+    half of, drawn as that half alone (half heavy, half light would leave a thin line of the thumb's colour)."""
 
     @classmethod
     def render_bar(cls, size: int = 25, virtual_size: float = 50, window_size: float = 20, position: float = 0,

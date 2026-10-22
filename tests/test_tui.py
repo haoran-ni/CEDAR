@@ -564,8 +564,8 @@ def test_scrollbars_are_lines_thinner_than_a_row(system):
         return "".join(segment.text for segment in drawn.segments if segment.text != "\n")
 
     # A heavy thumb along a light track, its ends on half cells; a click before or after it pages, on it drags.
-    assert bar(0, vertical=False) == "━━╾───────" and bar(10, vertical=False) == "──╼━━─────"
-    assert bar(30, vertical=True) == "│││││││╽┃┃"
+    assert bar(0, vertical=False) == "━━╸───────" and bar(10, vertical=False) == "──╺━━─────"
+    assert bar(30, vertical=True) == "│││││││╻┃┃"
     drawn = ThinScrollBar.render_bar(size=10, virtual_size=40, window_size=10, position=10, vertical=False)
     assert [s.style.meta["@mouse.down"] for s in drawn.segments if s.style][1:4] == ["scroll_up", "grab", "grab"]
 

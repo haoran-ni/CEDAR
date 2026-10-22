@@ -539,6 +539,53 @@ def test_scrollbars_are_lines_thinner_than_a_row(system):
     drive(app, script, size=(80, 40))
 
 
+def test_new_messages_follow_at_the_bottom_until_the_researcher_scrolls_up(system):
+    answer = "\n\n".join(f"Paragraph {i} of a long answer." for i in range(40))
+    system["clients"].add("chief_scientist", reply(TextPart(text=answer)), reply(TextPart(text="Short answer.")))
+    app = CedarApp(system["chat"], refresh_seconds=3600, clock=lambda: NOW)
+
+    async def script(pilot):
+        chat = app.query_one("#chat")
+        bar = chat.vertical_scrollbar
+
+        def at_bottom() -> bool:
+            return chat.max_scroll_y > 0 and chat.scroll_y == chat.max_scroll_y
+
+        async def drag(start: int, end: int) -> None:
+            await pilot.mouse_down(bar, offset=(0, start))
+            await pilot.hover(bar, offset=(0, end))
+            await pilot.mouse_up(bar, offset=(0, end))
+            await settle(pilot)
+
+        await send(pilot, "Explain")
+        assert at_bottom()  # the whole answer, to its last paragraph
+
+        # Scrolled up, the conversation stays where it is while messages come.
+        await drag(bar.size.height - 1, 0)
+        y, height = chat.scroll_y, chat.virtual_size.height
+        assert y < chat.max_scroll_y
+        for i in range(5):
+            app.say(f"Notice {i}", "notice")
+            await pilot.pause()
+        await settle(pilot)
+        assert chat.virtual_size.height > height and chat.scroll_y == y
+
+        # Back at the bottom, it follows them again.
+        await drag(0, bar.size.height - 1)
+        assert at_bottom()
+        app.say("Another notice", "notice")
+        await settle(pilot)
+        assert at_bottom()
+
+        # The researcher's own message brings the conversation back to the bottom, and the answer follows.
+        await drag(bar.size.height - 1, 0)
+        assert not at_bottom()
+        await send(pilot, "And briefly?")
+        assert at_bottom() and "Short answer." in conversation(app)
+
+    drive(app, script, size=(100, 40))
+
+
 def test_the_panel_shows_the_mode_and_web_access_on_their_own_line(system):
     system["clients"].add("chief_scientist", open_and_delegate(system["site"]), reply(TextPart(text="Opened.")))
     app = CedarApp(system["chat"], refresh_seconds=3600, clock=lambda: NOW)

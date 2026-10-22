@@ -11,10 +11,12 @@ waiting for jobs, proposed, idle, retired or off), for how long and its task; an
 with one row per hypothesis, keeping lifecycle, scheduler state, evidence quality and
 assessment in separate columns. Each table shows at most three rows and scrolls for the
 rest; its updates never scroll it back. Scrollbars are thin lines. Where the tables do not fit,
-one line says which agents are working. Then the scrolling
-conversation and the input box, which wraps long text and grows up to six lines, above which
-a menu of matching commands opens when a line starts with "/". The Chief Scientist answers in a
-background thread, so the panel keeps updating and commands keep working while it thinks.
+one line says which agents are working. Then the scrolling conversation, which follows new
+messages while it is scrolled to the bottom; scrolled up, it stays where it is until the
+researcher scrolls back down or sends something. Then the input box, which wraps long text and
+grows up to six lines, above which a menu of matching commands opens when a line starts with
+"/". The Chief Scientist answers in a background thread, so the panel keeps updating and
+commands keep working while it thinks.
 Messages sent meanwhile wait their turn. The Chief Scientist's background reviews of the
 agents' reports appear in the conversation as its messages.
 
@@ -469,6 +471,7 @@ class CedarApp(App):
         yield Composer(placeholder="Message the Chief Scientist, or a /command (/help)", id="composer")
 
     def on_mount(self) -> None:
+        self.query_one("#chat", VerticalScroll).anchor()  # follows what comes until the researcher scrolls up
         self.query_one("#agents", DataTable).add_columns(*self.AGENT_COLUMNS)
         self.query_one("#swarm", DataTable).add_columns(*self.COLUMNS)
         if self.session.investigation_id:
@@ -498,9 +501,7 @@ class CedarApp(App):
 
     def say(self, text: str, kind: str) -> None:
         """Add a line to the conversation, shown exactly as written."""
-        chat = self.query_one("#chat", VerticalScroll)
-        chat.mount(Static(Text(text), classes=kind))
-        chat.scroll_end(animate=False)
+        self.query_one("#chat", VerticalScroll).mount(Static(Text(text), classes=kind))
 
     # -- input --------------------------------------------------------------------------------
 
@@ -562,6 +563,7 @@ class CedarApp(App):
         event.composer.clear()
         if not line:
             return
+        self.query_one("#chat", VerticalScroll).anchor()  # back to the bottom, to follow what was sent
         if line in ("/quit", "/exit"):
             self.exit()
         elif line == "/help":
@@ -601,9 +603,7 @@ class CedarApp(App):
         self.chief_busy, self._chief_since = True, self.clock()
         steps = Static(Text(""), classes="notice")
         box = Collapsible(steps, title="Chief Scientist is working…", collapsed=False)
-        chat = self.query_one("#chat", VerticalScroll)
-        chat.mount(box)
-        chat.scroll_end(animate=False)
+        self.query_one("#chat", VerticalScroll).mount(box)
         self._working("The Chief Scientist is working…")
         self.run_worker(partial(self._chief, line, box, steps), thread=True, group="chief", exit_on_error=False)
 
@@ -635,7 +635,6 @@ class CedarApp(App):
         else:
             chat.mount(Static("Chief Scientist ›", classes="speaker"))
             chat.mount(Markdown(reply or "(no reply)", open_links=False))
-        chat.scroll_end(animate=False)
         self.chief_busy, self._chief_since = False, None
         self._working("")
         self.refresh_state()
@@ -750,7 +749,6 @@ class CedarApp(App):
                 chat = self.query_one("#chat", VerticalScroll)
                 chat.mount(Static("Chief Scientist (review of the agents' reports) ›", classes="speaker"))
                 chat.mount(Markdown(notice.text, open_links=False))
-                chat.scroll_end(animate=False)
             elif notice.source:
                 self._agent_says(notice)
             elif not notice.command:
@@ -772,9 +770,7 @@ class CedarApp(App):
         message = Static(text, classes="agent attention" if notice.attention else "agent")
         if not notice.attention:
             message.styles.border_left = ("tall", color)
-        chat = self.query_one("#chat", VerticalScroll)
-        chat.mount(message)
-        chat.scroll_end(animate=False)
+        self.query_one("#chat", VerticalScroll).mount(message)
 
     def _ask_approval(self, notices: list[Notice]) -> None:
         """New requests for the researcher's approval, in one highlighted block: each command with what it concerns."""
@@ -786,9 +782,7 @@ class CedarApp(App):
         hints = (["/approve submit all approves them all"] if submits > 1 else []) + (
             ["/pending shows where their inputs are"] if submits else ["/pending shows the details"])
         lines.append(Text("  " + " · ".join(hints), style="italic"))
-        chat = self.query_one("#chat", VerticalScroll)
-        chat.mount(Static(Text("\n").join(lines), classes="approvals"))
-        chat.scroll_end(animate=False)
+        self.query_one("#chat", VerticalScroll).mount(Static(Text("\n").join(lines), classes="approvals"))
         self.notify(" · ".join(n.command for n in notices), title="Waiting for your approval", severity="warning",
                     timeout=10, markup=False)
 

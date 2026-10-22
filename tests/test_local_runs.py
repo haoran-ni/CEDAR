@@ -16,7 +16,18 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
-from factories import AGENT, ENGINE, agent_for, authorize, examine, move, set_hypothesis_status, start_agent, task
+from factories import (
+    AGENT,
+    ENGINE,
+    agent_for,
+    authorize,
+    examine,
+    move,
+    set_hypothesis_status,
+    start_agent,
+    submit,
+    task,
+)
 from sites import aims_output
 from test_orchestration import make_system
 from test_swarm import INV, investigation
@@ -44,10 +55,10 @@ from cedar.errors import RuleViolation
 from cedar.hpc.local import RECORDS, LocalBackend, SlurmSteps
 from cedar.hpc.local_runner import main as run_locally
 from cedar.hpc.node import CorePool, ExecutionHost
-from cedar.hpc.slurm import JobRefused, SchedulerError
+from cedar.hpc.slurm import JobRefused, SchedulerError, SchedulerObservation
 from cedar.protocols import FhiAimsRun, FhiAimsRunSlurmOnly, ProtocolRegistry
 from cedar.summaries import calculation_summary, short_id
-from cedar.workspace import Workspace
+from cedar.workspace import Workspace, services_for
 
 ENERGY = -2345.678901234
 TEMPLATE = """#!/bin/bash
@@ -565,6 +576,33 @@ def test_on_a_login_node_the_dispatcher_starts_no_local_run(tmp_path, site):
     assert any(f"{cid} waits: CEDAR is running on a login node (login1)" in note for note in notes), notes
     assert workspace.ledger.load(INV).calculations[cid].state is CalculationState.VALIDATED_INPUT
     assert system["scheduler"].submissions == []
+
+
+class Says:
+    """TEST DOUBLE for the local backend, as a query sees it: every run waits, and the backend says what for."""
+
+    def __init__(self, note: str) -> None:
+        self.note = note
+
+    def query(self, job_ids):
+        return {job_id: SchedulerObservation(job_id, SchedulerState.PENDING, self.note) for job_id in job_ids}
+
+
+def test_the_dispatcher_logs_what_a_waiting_local_run_now_waits_for(tmp_path, site):
+    system = make_system(tmp_path, site)
+    workspace = system["workspace"]
+    investigation(system, "hyp-a")
+    start_agent(workspace.ledger, INV, "hyp-a")
+    cid = workspace.ledger.request_calculation(INV, agent_for("hyp-a"), "hyp-a", task(execution="local"),
+                                               "test").calculation_id
+    submit(workspace.ledger, INV, cid, job_id="local-1")
+    says = Says("waiting for 4 free cores")
+    services = services_for(workspace, site, system["scheduler"], local_backend=says)
+    dispatcher = system["dispatcher"]
+    assert dispatcher._poll(INV, services) == [f"{cid} is QUEUED"]
+    says.note = "waiting for Slurm to start its step"
+    assert dispatcher._poll(INV, services) == [f"{cid}: waiting for Slurm to start its step"]  # still QUEUED
+    assert workspace.ledger.load(INV).calculations[cid].scheduler_note == "waiting for Slurm to start its step"
 
 
 def test_four_cores_always_stay_for_the_agents_commands(ledger, store, artifacts, site, tmp_path):

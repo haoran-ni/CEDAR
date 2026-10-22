@@ -1,10 +1,12 @@
 """Anthropic adapter: one Messages API request per call, through the official SDK.
 
 Requests stream (and are read with ``get_final_message``) so long outputs do not hit HTTP
-timeouts. Tools use eager input streaming, so the runtime validates every tool input
-before running anything. Refusals are retried server-side on Anthropic's recommended
-fallback model unless ``options.refusal_fallback`` is false; the model that actually
-answered is reported as ``served_model``.
+timeouts. Tool inputs are not streamed eagerly: only the final message is read, and the API
+then checks each input before sending it, so a malformed one arrives as a value the runtime's
+validation rejects and the agent corrects in the same run. Eagerly streamed, it would arrive
+as JSON the SDK cannot parse, which loses the whole reply. Refusals are retried
+server-side on Anthropic's recommended fallback model unless ``options.refusal_fallback``
+is false; the model that actually answered is reported as ``served_model``.
 
 Assistant turns are sent back with their reasoning blocks. The API checks that each block
 still belongs to the conversation it was made in (same system prompt, tools and earlier
@@ -64,8 +66,8 @@ class AnthropicClient:
             "messages": [self._to_wire(m) for m in messages],
             "cache_control": {"type": "ephemeral"},
         }
-        wire_tools = [{"name": t.name, "description": t.description, "input_schema": t.input_schema,
-                       "eager_input_streaming": True} for t in tools]
+        wire_tools = [{"name": t.name, "description": t.description, "input_schema": t.input_schema}
+                      for t in tools]
         if web is not None:
             wire_tools += self._web_tools(web, settings)
         if wire_tools:
@@ -89,7 +91,7 @@ class AnthropicClient:
             with self._client.beta.messages.stream(**params) as stream:
                 response = stream.get_final_message()
         except ValueError as exc:
-            # The SDK could not parse a streamed tool input at all; the turn must be re-issued.
+            # The SDK could not parse a tool input at all, so the reply is lost; the turn must be re-issued.
             raise ModelError(self._clean(f"unparseable tool input from the model: {exc}"), retryable=True) from None
         except (anthropic.AuthenticationError, anthropic.PermissionDeniedError) as exc:
             raise ModelError(self._clean(f"Anthropic rejected the credentials: {exc}"), retryable=False) from None

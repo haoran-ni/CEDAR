@@ -88,8 +88,9 @@ def test_request_parameters():
     assert params["betas"] == ["thinking-binding-controls-2026-08-01", "server-side-fallback-2026-07-01"]
     assert params["fallbacks"] == "default"
     assert params["cache_control"] == {"type": "ephemeral"}
+    # Not eagerly streamed, so the API checks tool inputs and a malformed one is not a reply the SDK cannot parse.
     assert params["tools"] == [{"name": "read_output", "description": TOOL.description,
-                                "input_schema": TOOL.input_schema, "eager_input_streaming": True}]
+                                "input_schema": TOOL.input_schema}]
     assert params["messages"] == [{"role": "user", "content": [{"type": "text", "text": "Check the run."}]}]
 
 

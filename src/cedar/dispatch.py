@@ -71,6 +71,7 @@ from cedar.contracts.events import (
     HypothesisStatusChanged,
     InvestigationStatusChanged,
     ModeChanged,
+    SchedulerNoteRecorded,
 )
 from cedar.contracts.plan import PermissionAction, Priority
 from cedar.contracts.status import (
@@ -215,6 +216,15 @@ def _write_atomically(path: Path, text: str) -> None:
     partial = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.partial")
     partial.write_text(text)
     os.replace(partial, path)
+
+
+def _polled(payload) -> str:
+    """The log line for what a scheduler query recorded: a new state, or what a local run's scheduler now says
+    while its state stays the same."""
+    if isinstance(payload, SchedulerNoteRecorded):
+        return f"{payload.calculation_id}: {payload.note}"
+    return f"{payload.calculation_id} is {payload.state.value}" + (
+        f" ({payload.scheduler_state.value})" if payload.scheduler_state else "")
 
 
 @dataclass
@@ -431,9 +441,7 @@ class Dispatcher:
             except SchedulerError as exc:
                 notes.append(f"{monitor.execution} query failed: {exc}")
                 continue
-            notes += [f"{e.payload.calculation_id} is {e.payload.state.value}"
-                      + (f" ({e.payload.scheduler_state.value})" if e.payload.scheduler_state else "")
-                      for e in result.recorded]
+            notes += [_polled(e.payload) for e in result.recorded]
         return notes
 
     def _check_runs(self, investigation_id: str, services: Services) -> list[str]:

@@ -6,6 +6,7 @@ ScriptedModel and FakeScheduler TEST DOUBLES on a SYNTHETIC site; no model or jo
 import asyncio
 import re
 import threading
+from datetime import timedelta
 
 import pytest
 from factories import add_hypothesis
@@ -44,6 +45,7 @@ from cedar.tui import (
     NotebookScreen,
     PanelTop,
     CedarApp,
+    ThinScrollBar,
 )
 
 
@@ -473,6 +475,68 @@ def test_each_table_shows_at_most_three_rows_and_scrolls_for_the_rest(system):
         assert app.query_one("#chat").size.height >= 10
 
     drive(app, script, size=(120, 40))
+
+
+def test_refreshing_the_tables_keeps_where_they_are_scrolled(system):
+    validated_run(system)
+    now = [NOW]
+    app = CedarApp(system["chat"], refresh_seconds=3600, clock=lambda: now[0])
+
+    async def script(pilot):
+        await settle(pilot)
+        await send(pilot, "/panel")
+        table, agents_table = app.query_one("#swarm", DataTable), app.query_one("#agents", DataTable)
+        assert table.max_scroll_x > 0 and agents_table.max_scroll_y > 0
+        table.scroll_to(x=table.max_scroll_x, animate=False)
+        agents_table.scroll_to(y=agents_table.max_scroll_y, animate=False)
+        await pilot.pause()
+        x, y = table.scroll_x, agents_table.scroll_y
+        assert x > 0 and y > 0
+
+        # A cell changes: the table stays where it was scrolled to (DataTable.clear scrolls to the start).
+        ledger = system["workspace"].ledger
+        ledger.record(INV, [EventDraft(actor=JUDGE, payload=AssessmentRecorded(
+            hypothesis_id=HYP, assessment=Assessment.INCONCLUSIVE, completeness=Completeness.PARTIAL,
+            evidence_ids=tuple(ledger.load(INV).evidence)[:1], rationale="One energy cannot settle a site ordering."))])
+        now[0] += timedelta(minutes=5)  # and every agent's "For"
+        await refresh(pilot)
+        assert panel(app)[0][4] == "INCONCLUSIVE (partial)" and table.scroll_x == x
+        assert agents(app)[f"A1 agent-{HYP}"][2] == "5 min" and agents_table.scroll_y == y
+
+        # A row comes: the table is refilled, still scrolled sideways, its cursor on the same row.
+        table.move_cursor(row=0)
+        add_hypothesis(ledger, INV, "hyp-more")
+        await refresh(pilot)
+        assert [row[0] for row in panel(app)] == [HYP, "hyp-more"] and table.scroll_x == x and table.cursor_row == 0
+
+    drive(app, script, size=(80, 40))
+
+
+def test_scrollbars_are_lines_thinner_than_a_row(system):
+    def bar(position, vertical):
+        drawn = ThinScrollBar.render_bar(size=10, virtual_size=40, window_size=10, position=position,
+                                         vertical=vertical)
+        return "".join(segment.text for segment in drawn.segments if segment.text != "\n")
+
+    # A heavy thumb along a light track, its ends on half cells; a click before or after it pages, on it drags.
+    assert bar(0, vertical=False) == "━━╾───────" and bar(10, vertical=False) == "──╼━━─────"
+    assert bar(30, vertical=True) == "│││││││╽┃┃"
+    drawn = ThinScrollBar.render_bar(size=10, virtual_size=40, window_size=10, position=10, vertical=False)
+    assert [s.style.meta["@mouse.down"] for s in drawn.segments if s.style][1:4] == ["scroll_up", "grab", "grab"]
+
+    validated_run(system)
+    app = CedarApp(system["chat"], refresh_seconds=3600, clock=lambda: NOW)
+
+    async def script(pilot):
+        await settle(pilot)
+        await send(pilot, "/panel")
+        table = app.query_one("#swarm", DataTable)
+        assert table.show_horizontal_scrollbar and isinstance(table.horizontal_scrollbar.render(), ThinScrollBar)
+        assert table.horizontal_scrollbar.size.height == 1
+        for name in ("#agents", "#swarm", "#chat", "#composer"):
+            assert app.query_one(name).styles.scrollbar_size_vertical == 1
+
+    drive(app, script, size=(80, 40))
 
 
 def test_the_panel_shows_the_mode_and_web_access_on_their_own_line(system):

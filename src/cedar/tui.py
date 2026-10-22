@@ -10,7 +10,8 @@ automation; the status lines; a table of the agents, each with its status (worki
 waiting for jobs, proposed, idle, retired or off), for how long and its task; and a table
 with one row per hypothesis, keeping lifecycle, scheduler state, evidence quality and
 assessment in separate columns. Each table shows at most three rows and scrolls for the
-rest. Where the tables do not fit, one line says which agents are working. Then the scrolling
+rest; its updates never scroll it back. Scrollbars are thin lines. Where the tables do not fit,
+one line says which agents are working. Then the scrolling
 conversation and the input box, which wraps long text and grows up to six lines, above which
 a menu of matching commands opens when a line starts with "/". The Chief Scientist answers in a
 background thread, so the panel keeps updating and commands keep working while it thinks.
@@ -33,12 +34,16 @@ from datetime import datetime, timezone
 from functools import partial
 from pathlib import Path
 
+from rich.color import Color
+from rich.segment import Segment, Segments
+from rich.style import Style
 from rich.text import Text
 from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import Screen
+from textual.scrollbar import ScrollBar, ScrollBarRender
 from textual.widget import Widget
 from textual.message import Message
 from textual.widgets import Collapsible, DataTable, Footer, Markdown, OptionList, Static, TextArea
@@ -191,6 +196,61 @@ def color_agents(text: str, style: str = "") -> Text:
     return shown
 
 
+class ThinScrollBar(ScrollBarRender):
+    """Scrollbars drawn as lines, thinner than a row of a table: the thumb a heavy line, its ends on half cells, along
+    a faint light line, on the background of the widget that scrolls. A click on the line pages, a drag on the
+    thumb scrolls, as with Textual's own."""
+
+    LINES = {True: ("│", "┃", "╿", "╽"), False: ("─", "━", "╾", "╼")}
+    """Vertical, then horizontal: the track, the thumb, and a cell the thumb covers only the first or the second
+    half of."""
+
+    @classmethod
+    def render_bar(cls, size: int = 25, virtual_size: float = 50, window_size: float = 20, position: float = 0,
+                   thickness: int = 1, vertical: bool = True, back_color: Color = Color.parse("#555555"),
+                   bar_color: Color = Color.parse("bright_magenta")) -> Segments:
+        track, thumb, first, second = cls.LINES[vertical]
+        faint = Color.from_rgb(*(b + (f - b) * 0.35 for b, f in zip(back_color.get_truecolor(),
+                                                                     bar_color.get_truecolor())))
+        width = thickness if vertical else 1
+        if window_size and size and virtual_size and size != virtual_size:
+            length = max(1, window_size * size / virtual_size)
+            offset = (size - length) * position / (virtual_size - window_size)
+            start, end = round(offset * 2), round((offset + length) * 2)  # in half cells
+            segments = []
+            for half in range(0, 2 * size, 2):
+                covers = (start <= half < end, start <= half + 1 < end)
+                glyph = {(True, True): thumb, (True, False): first, (False, True): second}.get(covers, track)
+                action = "grab" if any(covers) else "scroll_up" if half < start else "scroll_down"
+                segments.append(Segment(glyph.center(width), Style(color=bar_color if any(covers) else faint,
+                                                                   meta={"@mouse.down": action})))
+        else:
+            segments = [Segment(" " * width)] * size
+        if vertical:
+            return Segments(segments, new_lines=True)
+        return Segments((segments + [Segment.line()]) * thickness, new_lines=False)
+
+
+def fill_table(table: DataTable, rows: list[tuple[str, tuple]]) -> None:
+    """Show ``rows``, each its key and cells, in ``table`` without scrolling it back: with the same rows in the same
+    order only the cells that changed change; otherwise the table is refilled at the same sideways position, with
+    the cursor on the same row (``DataTable.clear`` scrolls to the start)."""
+    if [row.key.value for row in table.ordered_rows] == [key for key, _ in rows]:
+        for key, cells in rows:
+            for column, cell in zip(table.ordered_columns, cells):
+                old = table.get_cell(key, column.key)
+                if old != cell or getattr(old, "style", None) != getattr(cell, "style", None):  # Text compares text
+                    table.update_cell(key, column.key, cell, update_width=True)
+        return
+    x, cursor = table.scroll_x, table.cursor_row
+    table.clear()
+    for key, cells in rows:
+        table.add_row(*cells, key=key)
+    if rows:
+        table.move_cursor(row=min(cursor, len(rows) - 1))
+    table.scroll_to(x=x, animate=False, immediate=True, force=True)
+
+
 class PanelTop(Widget):
     """The logo's upper two rows, with the panel's top border running through the second, a space either side."""
 
@@ -324,6 +384,11 @@ class CedarApp(App):
     #awaiting { height: auto; color: $warning; text-style: bold; display: none; }
     #awaiting.shown { display: block; }
     .section { height: auto; margin-top: 1; color: $accent; text-style: bold; }
+    DataTable, VerticalScroll, TextArea, OptionList {
+        scrollbar-size-vertical: 1;
+        scrollbar-color: $foreground 45%; scrollbar-color-hover: $primary; scrollbar-color-active: $accent;
+    }
+    DataTable, TextArea { scrollbar-corner-color: $surface; }
     #agents, #swarm { height: auto; max-height: 4; }
     #chat { height: 1fr; padding: 0 1; }
     #working { height: auto; padding: 0 1; color: $text-muted; display: none; }
@@ -352,6 +417,7 @@ class CedarApp(App):
     def __init__(self, session: ChatSession, *, refresh_seconds: float = 2.0,
                  clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc), started: str | None = None) -> None:
         super().__init__()
+        ScrollBar.renderer = ThinScrollBar  # Textual's way to draw every scrollbar differently
         self.session = session
         self._started = started
         self.workspace = session.workspace
@@ -671,17 +737,13 @@ class CedarApp(App):
             self._fit_panel()
         if snapshot.rows != self._rows:
             self._rows = snapshot.rows
-            table = self.query_one("#swarm", DataTable)
-            cursor = table.cursor_row
-            table.clear()
+            cells = []
             for row in snapshot.rows:
                 lifecycle = row.lifecycle + (f", {row.priority.replace('_', ' ')}" if row.priority != "normal" else "")
                 jobs = Text(row.jobs)
                 jobs.highlight_regex(r"needs /approve submit( \(the input reviewer warned\))?", "bold yellow")
-                table.add_row(row.hypothesis_id, lifecycle, jobs, row.evidence, row.assessment,
-                              key=row.hypothesis_id)
-            if snapshot.rows:
-                table.move_cursor(row=min(cursor, len(snapshot.rows) - 1))
+                cells.append((row.hypothesis_id, (row.hypothesis_id, lifecycle, jobs, row.evidence, row.assessment)))
+            fill_table(self.query_one("#swarm", DataTable), cells)
             self._fit_panel()
         for notice in snapshot.notices:
             if notice.review:
@@ -732,19 +794,16 @@ class CedarApp(App):
 
     def _show_agents(self) -> None:
         """Fill the agents table, its tasks shortened to fit the panel so that it never scrolls sideways."""
-        table = self.query_one("#agents", DataTable)
-        cursor = table.cursor_row
-        table.clear()
         rows = self._agents or []
         # less the panel's border and padding, and room for the table's own scrollbar
-        tasks = fit_tasks(rows, self.size.width - 8, self.AGENT_COLUMNS[:-1])
+        tasks = fit_tasks(rows, self.size.width - 7, self.AGENT_COLUMNS[:-1])
+        cells = []
         for row, task in zip(rows, tasks):
             style = self.STATUS_STYLES.get(row.status.split(" · ")[0], "")
             color = agent_color(row.name)
-            table.add_row(Text(row.name, style=f"bold {color}" if color else ""), row.role,
-                          Text(row.status, style=style), row.since or "—", task, key=row.key)
-        if rows:
-            table.move_cursor(row=min(cursor, len(rows) - 1))
+            cells.append((row.key, (Text(row.name, style=f"bold {color}" if color else ""), row.role,
+                                    Text(row.status, style=style), row.since or "—", task)))
+        fill_table(self.query_one("#agents", DataTable), cells)
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
         """Enter on a hypothesis, or on an agent working on one, opens that hypothesis's notebook page."""

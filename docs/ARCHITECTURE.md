@@ -195,6 +195,15 @@ All rows and statuses above are illustrative. Actual state must come from the ev
 
 The UI can subscribe to a local event stream or poll at a restrained interval for MVP. Preserve a usable keyboard experience, small-terminal behavior, Markdown formatting and an unobtrusive alert when major results arrive. Chat input must work while status redraw occurs.
 
+The conversation keeps the other agents' messages apart from the researcher's exchange with the Chief Scientist. Each is set behind a bar in the agent's own colour, under its name in that colour (hypothesis agents by tag and id, e.g. `A3 agent-h-kgrid`; the agents table uses the same colours). Then comes how its task ended, then the gist of what it said in grey: the first sentence of its report's summary (two if the first is short), cut at a word, with calculation ids in the short form the commands accept. The full reports are in the notebook, so agents are told to put what they found first. The Chief Scientist's choice of next steps shows only the steps it takes. What needs the researcher is highlighted:
+- questions for them, agents that could not go on and runs that failed (a model error, a budget reached) appear in the warning colour, not grey;
+- new requests for approval arrive in one highlighted block, each command with what it concerns, and raise a toast;
+- one panel line says what waits, the calculations grouped by the agent that asked for them;
+- in the agents table, an agent whose calculations wait for the researcher shows `waiting for you`, with the command;
+- in the hypotheses table, a job that needs `/approve submit` is highlighted.
+
+The plain terminal shows the same notices as one line each.
+
 ## 8. Trust, permission, and isolation boundaries
 
 - LLM-written inputs and Slurm scripts are allowed, but only after input examination (and user approval where the verdict is `NEEDS_REVIEW`). The job script, what actually runs on the machine, is always checked deterministically against the approved template; the input reviewer, itself a model, checks only that the code will run the inputs as described and that nothing in them is harmful, so a prompt injection in the inputs can at worst mislead a review the researcher still approves, never run a command. Nothing LLM- or user-supplied is passed unchecked to subprocess or SSH, and agents never execute commands on the cluster themselves.

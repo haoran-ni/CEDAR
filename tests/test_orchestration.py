@@ -258,7 +258,7 @@ def test_full_loop(system):
     assert clients.models["input_reviewer"].calls[0].web.allowed_domains == REVIEW_DOMAINS
     assert scheduler.submissions == [] and heartbeat_age(workspace, NOW) == 0
     notices = [n.text for n in chat.notices()]
-    assert any(f"agent-{HYP} ({ROLE})" in n and "Requested the PBE baseline" in n for n in notices)
+    assert f"[A1 agent-{HYP}: waiting for calculations] Requested the PBE baseline; waiting for it." in notices
     assert any(f"/approve submit {short_id(calc)}  (" in n for n in notices)
 
     # The researcher approves the run, the last step; the dispatcher submits; the job finishes.

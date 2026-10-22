@@ -277,7 +277,8 @@ def test_an_agent_ends_its_task_with_a_structured_report(system):
     assert run.run.report.startswith("[needs researcher data] The registered run is not enough.")
     assert "- The PBE run prefers fcc. (no recorded evidence)" in run.run.report
     texts = [n.text for n in chat.notices()]
-    assert "[A1 agent-hyp-a (hyp-a specialist) asks you] Please give the measured coverage." in texts
+    assert texts[:2] == ["[A1 agent-hyp-a: needs researcher data] The registered run is not enough.",
+                         "[A1 agent-hyp-a: asks you] Please give the measured coverage."]
     assert "A1 (agent-hyp-a) on hyp-a asks: Please give the measured coverage." in chat.handle("/pending")
 
 

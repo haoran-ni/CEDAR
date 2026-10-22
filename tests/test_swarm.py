@@ -579,7 +579,7 @@ def test_a_review_can_start_another_round_that_builds_on_the_first(tmp_path, sit
     texts = [n.text for n in chat.notices()]
     review, recommended = texts.index("Not resolved: an effect remains. Round 2: A controls for B1, and I propose "
                                       "an agent for C."), texts.index(next(t for t in texts if rec_id in t))
-    assert review < recommended and "Taking: a1, a2." in texts[recommended]
+    assert review < recommended and f"Taking a1, a2 ({rec_id}, " in texts[recommended]
 
     dispatcher.tick()  # A's follow-up runs at once, in a new conversation briefed from the record
     (follow_up,) = router.models["agent-hyp-a"].calls[-1].messages

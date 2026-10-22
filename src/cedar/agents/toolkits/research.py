@@ -178,7 +178,9 @@ class ReportArgs(Contract):
     outcome: Literal["concluded", "waiting_for_calculations", "needs_approval", "needs_researcher_data",
                      "needs_other_agent", "could_not_proceed"]
     summary: NonEmptyStr = Field(description="What you did, what you found and what it means for your hypothesis, "
-                                             "in a few sentences. State hypotheses as hypotheses.")
+                                             "in a few sentences, the most important first: the researcher sees "
+                                             "only the first sentence in the conversation. State hypotheses as "
+                                             "hypotheses.")
     findings: list[FindingArg] = []
     open_questions: list[NonEmptyStr] = []
     requests: list[RequestArg] = Field(default=[], description="What you need from the researcher (data or a "

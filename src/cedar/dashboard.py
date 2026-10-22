@@ -35,7 +35,14 @@ from cedar.state.projection import (
     awaits_reviewer,
     hypothesis_evidence,
 )
-from cedar.summaries import approval_requests, job_text, needs_inputs_approval, short_id
+from cedar.summaries import (
+    approval_requests,
+    job_text,
+    needs_inputs_approval,
+    requesting_agent,
+    researcher_waits,
+    short_id,
+)
 from cedar.swarm import FIRST_TASK, WAKE_TASK, minutes_left
 from cedar.web import web_summary
 
@@ -291,6 +298,11 @@ def _hypothesis_agent_row(state: InvestigationState, agent: AgentRecord, mine: S
         status = ("working", ago(working.started_at), task_label(state.tasks.get(working.task_id)) + step)
     elif queued:
         status = ("queued", ago(at(queued[0].queued_at)), task_label(queued[0]))
+    elif yours := [c for c in researcher_waits(state) if requesting_agent(state, state.calculations[c]) is agent]:
+        since = next((e.stream_version for e in reversed(events)
+                      if getattr(e.payload, "calculation_id", None) in yours), None)
+        status = ("waiting for you", ago(at(since)),
+                  "/approve submit " + ", ".join(short_id(c, state.calculations) for c in yours))
     elif hyp.status is HypothesisStatus.WAITING_FOR_JOB:
         since = next((e.stream_version for e in reversed(events) if isinstance(e.payload, HypothesisStatusChanged)
                       and e.payload.hypothesis_id == agent.hypothesis_id
@@ -316,6 +328,8 @@ def _awaited(state: InvestigationState, calculation_id: str) -> str:
     """A calculation an agent waits for, with what its job is doing: e.g. ``3f2a91c0 (waiting for 60 free cores)``,
     so that a local run that waits for cores is not taken for one that runs."""
     calc = state.calculations.get(calculation_id)
+    if calc is not None and awaits_reviewer(state, calc):
+        return f"{short_id(calculation_id)} (with the input reviewer)"
     if calc is None or calc.state not in _AWAITED:
         return short_id(calculation_id)
     doing = calc.scheduler_note if calc.state in (_C.QUEUED, _C.RUNNING) and calc.scheduler_note else None
@@ -470,7 +484,6 @@ def mode_line(state: InvestigationState | None, web: RetrievalRecord | None = No
 def status_line(state: InvestigationState, now: datetime) -> str:
     budget = state.budget_usd
     spent = dollars(state.model_cost) + (f" of {dollars(budget)}" if budget is not None else "") + " spent"
-    waiting = len(approval_requests(state))
     agents = sum(a.active for a in state.agents.values())
     automation = state.automation
     parts = [state.investigation_id, state.status.value, "setup" if state.round == 0 else f"round {state.round}",
@@ -482,6 +495,27 @@ def status_line(state: InvestigationState, now: datetime) -> str:
         when = ("held for your reply" if proposal.feedback_ids else "for the approver" if automation is not None else
                 f"start in {age(left * 60)} unless you reply" if left > 0 else "starting")
         parts.append(f"{n} agent{'s' if n > 1 else ''} proposed: {when} (/agents)")
-    if waiting:
-        parts.append(f"{waiting} waiting for you (/pending)")
     return " · ".join(parts)
+
+
+def awaiting_line(state: InvestigationState | None) -> str:
+    """What waits for the researcher, for the panel's highlighted line: the calculations to approve, by the agent
+    that asked for them, proposed agents and a proposed closing; empty when nothing does."""
+    needs = [command for command, _ in approval_requests(state)] if state is not None else []
+    if not needs:
+        return ""
+    calcs = researcher_waits(state)
+    parts = []
+    if calcs:
+        by_agent: dict[str, list[str]] = {}
+        for c in calcs:
+            agent = requesting_agent(state, state.calculations[c])
+            by_agent.setdefault(agent.tag if agent else "no agent", []).append(short_id(c, state.calculations))
+        listed = "; ".join(f"{who}: {', '.join(ids)}" for who, ids in by_agent.items())
+        approve = "/approve submit " + ("all" if len(calcs) > 1 else short_id(calcs[0], state.calculations))
+        parts.append(f"{len(calcs)} calculation{'s' if len(calcs) > 1 else ''} to run ({listed}): {approve}")
+    if "/approve agents" in needs:
+        parts.append("proposed agents: /approve agents")
+    if "/approve close" in needs:
+        parts.append("closing the investigation: /approve close")
+    return "⚑ Waiting for you: " + " · ".join(parts) + " · /pending for details"

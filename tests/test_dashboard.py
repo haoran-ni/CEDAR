@@ -44,6 +44,7 @@ from cedar.contracts import (
 from cedar.dashboard import (
     age,
     agent_rows,
+    awaiting_line,
     dispatcher_status,
     job_status,
     model_line,
@@ -243,13 +244,17 @@ def test_dispatcher_status_and_status_line(ledger):
     examine(ledger, inv, calc)
     move(ledger, inv, calc, ENGINE, CalculationState.VALIDATED_INPUT)
     assert status_line(ledger.load(inv), now) == "inv-1 · INVESTIGATING · setup · plan v1 · 1 agent · " \
-                                                 "$0.00 of $20.00 spent · 1 waiting for you (/pending)"
+                                                 "$0.00 of $20.00 spent"
+    # What waits for the researcher has its own, highlighted line.
+    assert awaiting_line(ledger.load(inv)) == (f"⚑ Waiting for you: 1 calculation to run (A1: {short_id(calc)}): "
+                                              f"/approve submit {short_id(calc)} · /pending for details")
     other = add_hypothesis(ledger, inv, "hyp-other", agent=False)
     ledger.record(inv, [draft(CHIEF, AgentsProposed(proposal_id="p-9", rationale="test", agents=(
         AgentSpec(hypothesis_id=other, role="coverage specialist", brief="vary coverage"),)))])
     line = status_line(ledger.load(inv), now)
-    assert "1 agent proposed: start in " in line and line.endswith("unless you reply (/agents) · 2 waiting for you "
-                                                                   "(/pending)")
+    assert "1 agent proposed: start in " in line and line.endswith("unless you reply (/agents)")
+    assert awaiting_line(ledger.load(inv)).endswith(" · proposed agents: /approve agents · /pending for details")
+    assert awaiting_line(None) == ""
 
 
 def test_the_panel_says_which_sub_agents_are_working(ledger):

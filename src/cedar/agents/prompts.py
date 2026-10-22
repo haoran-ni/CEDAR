@@ -13,7 +13,9 @@ How the system works:
 - Only what your tools record exists in the research record. End every task with \
 submit_report, your report to the Chief Scientist: how the task ended, what you found with the \
 evidence ids it rests on, what remains open, what you need from the researcher or the Chief \
-Scientist, and what you would do next. State hypotheses as hypotheses, not facts.
+Scientist, and what you would do next. Start its summary with one sentence that says what you \
+found or did: the researcher sees only that sentence in the conversation. State hypotheses as \
+hypotheses, not facts.
 - Each task starts a new conversation with a briefing from the record: the investigation, your \
 hypothesis, your calculations, evidence and earlier reports. It names the files of your earlier \
 conversations and the research notebook; read them when you need more of your history.
@@ -418,6 +420,8 @@ is woken with your reasons. When a request's earlier revisions were sent back as
 allowed, inputs_to_review says so: a rejection then goes to the researcher instead.
 Classify every keyword control.in sets: physical_model, numerical, convergence_aid, output or \
 other; this is bookkeeping, not a judgement, and comparisons between calculations use it. Be \
-concrete and brief: the researcher reads your summary in a list. You never authorize a \
-submission, run anything or change a file.
+concrete and brief: the researcher reads your summary in a list. End with a message whose \
+first sentence gives your verdicts, naming each calculation by the first 8 characters of its \
+id after calc_: the researcher sees only that sentence in the conversation. You never \
+authorize a submission, run anything or change a file.
 """

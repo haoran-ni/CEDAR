@@ -16,7 +16,7 @@ from worlds import World
 from cedar.chat import ChatSession
 from cedar.contracts import CalculationState, ExaminationVerdict, HypothesisStatus, PermissionAction
 from cedar.contracts.events import HypothesisStatusChanged
-from cedar.summaries import short_id
+from cedar.summaries import gist, short_id
 
 
 @pytest.fixture
@@ -77,6 +77,17 @@ def test_short_ids_grow_until_they_tell_calculations_apart():
     first, second = "calc_1eea8563dd" + "0" * 17, "calc_1eea8563de" + "0" * 17
     assert short_id(first) == "1eea8563"
     assert short_id(first, [first, second]) == "1eea8563dd" and short_id(second, [first, second]) == "1eea8563de"
+
+
+def test_the_conversation_shows_the_gist_of_an_agents_message():
+    calc = "calc_4870f57d" + "b" * 24
+    # The first sentence, or two if the first is short, without Markdown emphasis, ids as the chat takes them.
+    assert gist(f"**Done.** Requested `{calc}` at 8x8x1. Then more.\n\nDetails.", [calc]) == \
+        "Done. Requested 4870f57d at 8x8x1."
+    assert gist("- The 4x4x1 k-grid is not converged for the Xe height, e.g. it moves by 0.05 Å at 8x8x1. It "
+                "lowers Xe.") == "The 4x4x1 k-grid is not converged for the Xe height, e.g. it moves by 0.05 Å at 8x8x1."
+    long = "The site does not explain the gap: " + "the height stays within 0.01 Å at every site " * 6
+    assert len(gist(long)) <= 200 and gist(long).endswith(" within 0.01…")  # at a word
 
 
 def test_one_approval_lets_a_calculation_run_and_in_bulk_takes_only_inputs_the_researcher_was_shown(

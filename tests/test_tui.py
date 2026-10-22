@@ -25,6 +25,7 @@ from test_orchestration import (
     review_inputs,
     reviewer_decides,
 )
+from textual.color import Color
 from textual.widgets import Collapsible, DataTable, Footer, Markdown, OptionList, Static, TextArea
 
 from cedar.contracts import Assessment, AssessmentRecorded, Completeness, EventDraft, SchedulerState
@@ -32,7 +33,9 @@ from cedar.dashboard import short_id
 from cedar.dispatch import JUDGE
 from cedar.models import TextPart
 from cedar.models.scripted import reply
+from cedar.swarm import clock_time, review_deadline
 from cedar.tui import (
+    AGENT_COLORS,
     LOGO,
     MENU_COMMANDS,
     TAGLINE,
@@ -109,6 +112,19 @@ def status(app) -> str:
     return str(app.query_one("#status", Static).content)
 
 
+def awaiting(app) -> str:
+    """The panel's highlighted line of what waits for the researcher."""
+    return str(app.query_one("#awaiting", Static).content)
+
+
+def state(system):
+    return system["workspace"].ledger.load(INV)
+
+
+def proposal_id(system) -> str:
+    return state(system).pending_proposal.proposal_id
+
+
 def validated_run(system) -> str:
     """Open, start the agent, approve and finish one calculation without the interface; returns its id."""
     chat, clients, dispatcher, scheduler = system["chat"], system["clients"], system["dispatcher"], system["scheduler"]
@@ -148,7 +164,14 @@ def test_conversation_live_panel_and_approval(system):
                                                "Compute a PBE baseline total energy for CO atop."]
         assert status(app).startswith(f"{INV} · INVESTIGATING · round 1 · plan v1 · 0 agents")
         assert "1 agent proposed: start in 10 min unless you reply (/agents)" in status(app)
-        assert "[waiting for you] /approve agents" in conversation(app)
+        assert awaiting(app) == "⚑ Waiting for you: proposed agents: /approve agents · /pending for details"
+        (block,) = app.query_one("#chat").query(".approvals")
+        assert str(block.content).splitlines() == [
+            "⚑ Waiting for your approval",
+            f"  /approve agents  1 hypothesis agent proposed ({proposal_id(system)}); they start at "
+            f"{clock_time(review_deadline(state(system), state(system).pending_proposal))} unless you reply",
+            "  /pending shows the details"]
+        assert [n.title for n in app._notifications] == ["Waiting for your approval"]
 
         await send(pilot, "/agents")
         assert f"{HYP}: {ROLE}" in conversation(app) and "first task: Compute a PBE baseline" in conversation(app)
@@ -170,17 +193,26 @@ def test_conversation_live_panel_and_approval(system):
         assert agents(app)["Input reviewer"][3] == f"last: review the inputs of {short_id(calc)}"
         (row,) = panel(app)
         assert row[2] == f"{short_id(calc)} needs /approve submit" and row[3] == "none" and row[4] == "NOT_TESTED"
-        assert agents(app)[f"A1 agent-{HYP}"][1] == "waiting for jobs" and "dispatcher seen 0 s ago" in status(app)
-        assert agents(app)[f"A1 agent-{HYP}"][3] == f"calculations {short_id(calc)}"
-        assert "1 waiting for you (/pending)" in status(app)
-        assert f"[waiting for you] /approve submit {short_id(calc)}  (" in conversation(app)
-        assert "Requested the PBE baseline; waiting for it." in conversation(app)
+        assert agents(app)[f"A1 agent-{HYP}"][1] == "waiting for you" and "dispatcher seen 0 s ago" in status(app)
+        assert agents(app)[f"A1 agent-{HYP}"][3] == f"/approve submit {short_id(calc)}"
+        assert awaiting(app) == (f"⚑ Waiting for you: 1 calculation to run (A1: {short_id(calc)}): /approve submit "
+                                 f"{short_id(calc)} · /pending for details")
+        assert f"  /approve submit {short_id(calc)}  A1 agent-{HYP} on {HYP}; " in conversation(app)
+
+        # The agent's message is set apart: a bar and its name in its colour, how its task ended, what it said.
+        message = next(w for w in app.query_one("#chat").query(".agent") if f"A1 agent-{HYP}" in str(w.content))
+        assert str(message.content) == f"A1 agent-{HYP}  waiting for calculations\nRequested the PBE baseline; " \
+                                       "waiting for it."
+        assert message.styles.border_left[1] == Color.parse(AGENT_COLORS[0])
+        assert any(span.style == f"bold {AGENT_COLORS[0]}" for span in message.content.spans)
+        reviewer = next(w for w in app.query_one("#chat").query(".agent") if "input reviewer" in str(w.content))
+        assert str(reviewer.content).startswith("input reviewer  finished\n")
 
         await send(pilot, f"/approve submit {short_id(calc)}")
         assert "Approved 1 calculation to run" in conversation(app) and calc in conversation(app)
         await refresh(pilot)
         assert panel(app)[0][2] == f"{short_id(calc)} authorized, not yet submitted"
-        assert "waiting for you" not in status(app)
+        assert awaiting(app) == "" and not app.query_one("#awaiting").display
 
     drive(app, script)
     calc = latest_calc(system["workspace"])

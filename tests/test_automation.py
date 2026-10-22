@@ -77,8 +77,8 @@ def test_in_full_automation_the_approver_and_the_judge_carry_the_investigation(t
     assert f"Agents proposed by the Chief Scientist ({proposal.proposal_id}). Why: one cheap baseline first" in shown
     assert f"  - {HYP} (Semilocal XC misplaces CO frontier orbitals" in shown and f"{ROLE}; first task: " in shown
     texts = [n.text for n in chat.notices()]
-    assert (f"[approver, full automation] approved the agents of {proposal.proposal_id}: A cheap baseline "
-            "first.") in texts
+    assert texts == [f"[approver: full automation] approved the agents of {proposal.proposal_id}: A cheap baseline "
+                     "first."]  # its decisions, not its run's message too
 
     # The agent requests a calculation, the input reviewer approves its inputs, and the approver approves its
     # submission within the core-hours.

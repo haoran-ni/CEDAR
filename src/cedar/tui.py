@@ -16,8 +16,16 @@ a menu of matching commands opens when a line starts with "/". The Chief Scienti
 background thread, so the panel keeps updating and commands keep working while it thinks.
 Messages sent meanwhile wait their turn. The Chief Scientist's background reviews of the
 agents' reports appear in the conversation as its messages.
+
+The other agents' messages are set apart from the conversation: each behind a bar in the
+agent's own colour, with its name in that colour (in the agents table too), how its task ended,
+and the first sentence of what it said, in grey; the full reports are in the notebook.
+Whatever waits for the researcher is highlighted: one line of the panel says what, the agents
+whose calculations wait show "waiting for you", and new requests appear in the conversation in
+one block with their commands, with a toast.
 """
 
+import re
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -41,6 +49,7 @@ from cedar.dashboard import (
     AgentRow,
     SwarmRow,
     agent_rows,
+    awaiting_line,
     dispatcher_status,
     fit_tasks,
     mode_line,
@@ -151,6 +160,35 @@ _LOGO_ANSI = (
 """The logo, three rows of shaded blocks in two cyans, as ANSI text."""
 LOGO = tuple(Text.from_ansi(row) for row in _LOGO_ANSI)
 LOGO_WIDTH = max(row.cell_len for row in LOGO)
+
+AGENT_COLORS = ("#61afef", "#c678dd", "#f0a8d0", "#a9a1e1", "#73daca", "#ffb3a7", "#d4bfff", "#9ece6a")
+"""The hypothesis agents' colours, A1 the first; they repeat after eight. None is red or yellow, which mark what
+failed and what waits for the researcher."""
+ROLE_COLORS = {"input reviewer": "#2ac3de", "Evidence Judge": "#b0a050", "approver": "#ff9e64",
+               "Chief Scientist": "#7fbf7f"}
+_AGENT_TAG = re.compile(r"\bA(\d+)\b(?: agent-[\w.-]*\w)?")
+LABEL_STYLES = {"concluded": "bold green", "finished": "green", "reported": "green", "started": "cyan",
+                "waiting for calculations": "cyan", "waiting": "cyan", "needs approval": "yellow",
+                "needs other agent": "magenta", "needs researcher data": "bold yellow", "asks you": "bold yellow",
+                "could not proceed": "bold red", "full automation": "italic", "next steps": "italic"}
+"""How an agent's task ended, as its message shows it; any other ending that needs the researcher (a model error,
+a budget reached) is red."""
+
+
+def agent_color(name: str) -> str | None:
+    """The colour of an agent named by its tag ("A3 agent-h-kgrid", "A3") or its role ("input reviewer")."""
+    tag = _AGENT_TAG.match(name)
+    if tag:
+        return AGENT_COLORS[(int(tag.group(1)) - 1) % len(AGENT_COLORS)]
+    return ROLE_COLORS.get(name)
+
+
+def color_agents(text: str, style: str = "") -> Text:
+    """``text`` with every hypothesis agent it names, as "A3" or "A3 agent-h-kgrid", in that agent's colour."""
+    shown = Text(text, style=style)
+    for match in _AGENT_TAG.finditer(text):
+        shown.stylize(f"bold {agent_color(match.group(0))}", match.start(), match.end())
+    return shown
 
 
 class PanelTop(Widget):
@@ -264,6 +302,7 @@ class _Snapshot:
     notices: list[Notice] = field(default_factory=list)
     alerts: list[str] = field(default_factory=list)
     round: int = 0
+    awaiting: str = ""
 
 
 class CedarApp(App):
@@ -282,6 +321,8 @@ class CedarApp(App):
     #status { height: auto; }
     #status.alarm { color: $warning; text-style: bold; }
     #subagents { height: auto; color: $success; }
+    #awaiting { height: auto; color: $warning; text-style: bold; display: none; }
+    #awaiting.shown { display: block; }
     .section { height: auto; margin-top: 1; color: $accent; text-style: bold; }
     #agents, #swarm { height: auto; max-height: 4; }
     #chat { height: 1fr; padding: 0 1; }
@@ -292,6 +333,10 @@ class CedarApp(App):
     .user { margin-top: 1; color: $accent; text-style: bold; }
     .speaker { margin-top: 1; color: $success; text-style: bold; }
     .notice { color: $text-muted; }
+    .notice.attention { color: $warning; text-style: bold; }
+    .agent { margin-top: 1; padding-left: 1; border-left: tall $secondary; color: $text-muted; }
+    .agent.attention { border-left: tall $warning; color: $text; }
+    .approvals { margin-top: 1; padding-left: 1; border-left: thick $warning; background: $warning 10%; }
     .command { padding-left: 2; }
     .error { color: $error; }
     .title { height: auto; padding: 0 1; background: $boost; }
@@ -302,7 +347,7 @@ class CedarApp(App):
     COLUMNS = ("Hypothesis", "Lifecycle", "Jobs (scheduler)", "Evidence (validator)", "Assessment (judge)")
     AGENT_COLUMNS = ("Agent", "Role", "Status", "For", "Task")
     STATUS_STYLES = {"working": "bold green", "queued": "yellow", "waiting for jobs": "cyan", "proposed": "magenta",
-                     "idle": "", "retired": "dim", "off": "dim"}
+                     "waiting for you": "bold reverse yellow", "idle": "", "retired": "dim", "off": "dim"}
 
     def __init__(self, session: ChatSession, *, refresh_seconds: float = 2.0,
                  clock: Callable[[], datetime] = lambda: datetime.now(timezone.utc), started: str | None = None) -> None:
@@ -344,6 +389,7 @@ class CedarApp(App):
                         yield Static(id="models")
                 yield Static(id="mode")
                 yield Static(id="status")
+                yield Static(id="awaiting")
                 yield Static("No working sub-agents", id="subagents")
                 yield Static("Agents", id="agents-title", classes="section")
                 yield DataTable(id="agents", cursor_type="row", zebra_stripes=True)
@@ -582,7 +628,7 @@ class CedarApp(App):
                          mode, automated, agent_rows(state, self._events, activities, now, self._chief_since),
                          swarm_rows(state),
                          self.session.notices() if changed else [], self._new_results(state) if changed else [],
-                         state.round)
+                         state.round, awaiting_line(state))
 
     def _new_results(self, state: InvestigationState) -> list[str]:
         """New evidence and assessments since the last look; nothing on the first look."""
@@ -614,6 +660,9 @@ class CedarApp(App):
         mode.update(Text(snapshot.mode))
         mode.set_class(snapshot.automated, "automated")
         self.query_one("#subagents", Static).update(Text(snapshot.subagents))
+        awaiting = self.query_one("#awaiting", Static)
+        awaiting.update(color_agents(snapshot.awaiting))
+        awaiting.set_class(bool(snapshot.awaiting), "shown")
         self.query_one("#models", Static).update(Text(snapshot.models))
         self._round = snapshot.round
         if snapshot.agents != self._agents:
@@ -627,7 +676,9 @@ class CedarApp(App):
             table.clear()
             for row in snapshot.rows:
                 lifecycle = row.lifecycle + (f", {row.priority.replace('_', ' ')}" if row.priority != "normal" else "")
-                table.add_row(row.hypothesis_id, lifecycle, row.jobs, row.evidence, row.assessment,
+                jobs = Text(row.jobs)
+                jobs.highlight_regex(r"needs /approve submit( \(the input reviewer warned\))?", "bold yellow")
+                table.add_row(row.hypothesis_id, lifecycle, jobs, row.evidence, row.assessment,
                               key=row.hypothesis_id)
             if snapshot.rows:
                 table.move_cursor(row=min(cursor, len(snapshot.rows) - 1))
@@ -638,10 +689,46 @@ class CedarApp(App):
                 chat.mount(Static("Chief Scientist (review of the agents' reports) ›", classes="speaker"))
                 chat.mount(Markdown(notice.text, open_links=False))
                 chat.scroll_end(animate=False)
-            else:
-                self.say(notice.text, "notice")
+            elif notice.source:
+                self._agent_says(notice)
+            elif not notice.command:
+                self.say(notice.text, "notice attention" if notice.attention else "notice")
+        waiting = [n for n in snapshot.notices if n.command]
+        if waiting:
+            self._ask_approval(waiting)
         for alert in snapshot.alerts:
             self.notify(alert, title="New result", timeout=10, markup=False)
+
+    def _agent_says(self, notice: Notice) -> None:
+        """An agent's message, set apart from the conversation: a bar and its name in its colour, how its task ended,
+        and the gist of what it said, in grey; with a bar in the warning colour, and not grey, when it needs the
+        researcher."""
+        color = agent_color(notice.source) or "#808080"
+        style = LABEL_STYLES.get(notice.label, "bold red" if notice.attention else "italic")
+        text = Text.assemble((notice.source, f"bold {color}"), "  ", (notice.label, style), "\n",
+                             color_agents(notice.body))
+        message = Static(text, classes="agent attention" if notice.attention else "agent")
+        if not notice.attention:
+            message.styles.border_left = ("tall", color)
+        chat = self.query_one("#chat", VerticalScroll)
+        chat.mount(message)
+        chat.scroll_end(animate=False)
+
+    def _ask_approval(self, notices: list[Notice]) -> None:
+        """New requests for the researcher's approval, in one highlighted block: each command with what it concerns."""
+        warning = self.get_css_variables().get("warning", "yellow")
+        lines = [Text("⚑ Waiting for your approval" + (f" ({len(notices)})" if len(notices) > 1 else ""),
+                      style=f"bold {warning}")]
+        lines += [Text.assemble("  ", (n.command, f"bold {warning}"), "  ", color_agents(n.body)) for n in notices]
+        submits = sum(n.command.startswith("/approve submit ") for n in notices)
+        hints = (["/approve submit all approves them all"] if submits > 1 else []) + (
+            ["/pending shows where their inputs are"] if submits else ["/pending shows the details"])
+        lines.append(Text("  " + " · ".join(hints), style="italic"))
+        chat = self.query_one("#chat", VerticalScroll)
+        chat.mount(Static(Text("\n").join(lines), classes="approvals"))
+        chat.scroll_end(animate=False)
+        self.notify(" · ".join(n.command for n in notices), title="Waiting for your approval", severity="warning",
+                    timeout=10, markup=False)
 
     def _show_agents(self) -> None:
         """Fill the agents table, its tasks shortened to fit the panel so that it never scrolls sideways."""
@@ -653,7 +740,9 @@ class CedarApp(App):
         tasks = fit_tasks(rows, self.size.width - 8, self.AGENT_COLUMNS[:-1])
         for row, task in zip(rows, tasks):
             style = self.STATUS_STYLES.get(row.status.split(" · ")[0], "")
-            table.add_row(row.name, row.role, Text(row.status, style=style), row.since or "—", task, key=row.key)
+            color = agent_color(row.name)
+            table.add_row(Text(row.name, style=f"bold {color}" if color else ""), row.role,
+                          Text(row.status, style=style), row.since or "—", task, key=row.key)
         if rows:
             table.move_cursor(row=min(cursor, len(rows) - 1))
 

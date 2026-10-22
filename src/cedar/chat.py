@@ -94,6 +94,7 @@ from cedar.state.projection import (
     AgentRunRecord,
     CalculationRecord,
     InvestigationState,
+    RecommendationRecord,
     RetrievalRecord,
     awaits_reviewer,
     find_agent,
@@ -103,13 +104,13 @@ from cedar.summaries import (
     approval_requests,
     awaiting_researcher,
     awaiting_review,
+    gist,
     needs_inputs_approval,
     short_id,
     submission_note,
     calculation_summary,
     investigation_summary,
     pending_approvals,
-    recommendation_text,
 )
 from cedar.swarm import CHIEF, agent_label, agents_summary, close_drafts, halt_drafts, start_drafts
 from cedar.web import web_access, web_summary
@@ -231,11 +232,64 @@ def _not_rejectable(calc: CalculationRecord) -> str | None:
 
 @dataclass(frozen=True)
 class Notice:
-    """Something that happened while the researcher was not looking."""
+    """Something that happened while the researcher was not looking, in a few words: the full reports are in the
+    notebook and the transcripts."""
 
-    text: str
+    body: str
+    source: str = ""
+    """Who it comes from: an agent by its tag and id (e.g. "A3 agent-h-kgrid"), "input reviewer", "Evidence Judge",
+    "approver" or "Chief Scientist"; empty for CEDAR's own notices."""
+    label: str = ""
+    """What it is: how the agent's task ended, "asks you", "waiting for you"."""
+    attention: bool = False
+    """It needs the researcher: a question for them, something waiting for their approval, or an agent that could
+    not go on."""
+    command: str = ""
+    """The command that grants what waits for the researcher; the body then says what it concerns."""
     review: bool = False
     """The Chief Scientist's background review, shown as its message."""
+
+    @property
+    def text(self) -> str:
+        """The notice as one plain line."""
+        head = ": ".join(part for part in (self.source, self.label) if part)
+        body = f"{self.command}  ({self.body})" if self.command else self.body
+        return f"[{head}] {body}" if head else body
+
+
+_ROLE_NAMES = {"input_reviewer": "input reviewer", "evidence_judge": "Evidence Judge", "approver": "approver",
+               "chief_scientist": "Chief Scientist"}
+_FAILED_RUNS = {"turn_limit", "budget_limit", "truncated", "refused", "model_error", "stopped"}
+"""Run outcomes that stopped an agent before it finished its task."""
+_NEEDS_RESEARCHER = {"needs_researcher_data", "could_not_proceed"}
+
+
+def _report_notice(state: InvestigationState, run: AgentRunRecord) -> Notice:
+    """An agent's finished task in one line: who, how it ended, and the first sentence of what it said."""
+    agent = state.agents.get(run.actor_id)
+    who = f"{agent.tag} {agent.agent_id}" if agent else _ROLE_NAMES.get(run.role, f"{run.role} {run.actor_id}")
+    report = run.run.structured
+    ended = report.outcome.value if report is not None else run.run.outcome
+    said = report.summary if report is not None else run.run.report or "(no report)"
+    return Notice(gist(said, state.calculations), who, ended.replace("_", " "),
+                  attention=ended in _NEEDS_RESEARCHER or ended in _FAILED_RUNS)
+
+
+def _next_steps_notice(state: InvestigationState, record: RecommendationRecord) -> Notice:
+    """The Chief Scientist's choice of next steps: what it takes and the gist of why, and each chosen step in a line;
+    the other candidates and the reasons are on the round's notebook page."""
+    rec = record.recommendation
+    among = state.calculations
+    lines = [f"Taking {', '.join(rec.chosen) or 'none for now'} ({rec.recommendation_id}, round {record.round}): "
+             f"{gist(rec.reason, among)}"]
+    chosen = [c for c in rec.candidates if c.candidate_id in rec.chosen]
+    lines += [f"  {c.candidate_id} ({c.kind.value}, {c.priority.value} priority"
+              + (f", on {', '.join(c.hypothesis_ids)}" if c.hypothesis_ids else "") + f"): {gist(c.action, among, 160)}"
+              for c in chosen]
+    others = len(rec.candidates) - len(chosen)
+    lines.append("  In full" + (f", with the {others} other candidate{'s' if others > 1 else ''}," if others else "")
+                 + " on the round's notebook page (/round).")
+    return Notice("\n".join(lines), "Chief Scientist", "next steps")
 
 
 def _is_review(run: AgentRunRecord) -> bool:
@@ -1070,31 +1124,32 @@ class ChatSession:
         notices = []
         for agent in state.agents.values():  # the researcher's own /approve agents already said who started
             if agent.agent_id not in self._shown_starts and agent.authorization_id is None:
-                notices.append(Notice(f"[agent started after the review window, with no reply] {agent_label(agent)} "
-                                      f"on {agent.hypothesis_id}"))
+                notices.append(Notice(f"on {agent.hypothesis_id}, after the review window passed with no reply",
+                                      f"{agent.tag} {agent.agent_id}", "started"))
             self._shown_starts.add(agent.agent_id)
         for run in fresh:
             if _is_review(run):
                 notices.append(Notice((run.run.report or f"(the review ended {run.run.outcome} without a "
                                                          "message)").strip(), review=True))
                 continue
-            agent = state.agents.get(run.actor_id)
-            who = agent_label(agent) if agent else f"{run.role} {run.actor_id}"
-            report = (run.run.report or "(no report)").strip().splitlines()[0][:300]
-            notices.append(Notice(f"[{who}: {run.run.outcome}] {report}"))
+            if run.role == "approver" and run.run.outcome not in _FAILED_RUNS:
+                continue  # each of its decisions is shown below, with its reason
+            notice = _report_notice(state, run)
+            notices.append(notice)
             asked = run.run.structured.requests if run.run.structured is not None else ()
-            notices += [Notice(f"[{who} asks you] {r.text}") for r in asked if r.to == "researcher"]
-        notices += [Notice(f"[{recommendation_text(r)}]") for r in recommended]
+            notices += [Notice(r.text, notice.source, "asks you", attention=True) for r in asked
+                        if r.to == "researcher"]
+        notices += [_next_steps_notice(state, r) for r in recommended]
         for a in decided:
             what = (f"the agents of {a.target_id}" if a.action is PermissionAction.START_AGENTS else
                     f"submitting {a.target_id}" + (f" ({a.core_hours:g} core-hours)" if a.core_hours else ""))
-            notices.append(Notice(f"[approver, full automation] {'approved' if a.approved else 'declined'} {what}: "
-                                  f"{a.reason}"))
-        notices += [Notice(f"[full automation ended] {m.reason}. It is paused: ask the Chief Scientist to resume it, "
-                           "or switch full automation on again with /mode.") for m in ended]
-        for command, note in approval_requests(state, self._runs_root(state)):
+            notices.append(Notice(f"{'approved' if a.approved else 'declined'} {what}: {a.reason}", "approver",
+                                  "full automation"))
+        notices += [Notice(f"{m.reason}. It is paused: ask the Chief Scientist to resume it, or switch full automation "
+                           "on again with /mode.", label="full automation ended", attention=True) for m in ended]
+        for command, note in approval_requests(state, brief=True):
             if f"{command} {note}" not in self._shown_approvals:
                 self._shown_approvals.add(f"{command} {note}")
-                notices.append(Notice(f"[waiting for you] {command}  ({note})"))
+                notices.append(Notice(note, label="waiting for you", attention=True, command=command))
         self._shown_reviews.update(awaiting_review(state))
         return notices

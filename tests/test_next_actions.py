@@ -67,20 +67,13 @@ def test_the_chief_records_the_next_steps_it_weighed_and_carries_out_its_choice(
     outcome = use("delegate", hypothesis_id="hyp-a", instruction="x", recommendation_id="rec-unknown")
     assert outcome.is_error and "unknown recommendation rec-unknown" in outcome.content
 
-    # The researcher sees it once, in full; the Chief's state view gives one line per candidate.
-    (shown,) = [n.text for n in chat.notices() if "Next steps recommended" in n.text]
-    assert shown.splitlines()[:6] == [
-        f"[Next steps recommended by the Chief Scientist ({rec_id}, round 0). Taking: a1. Why: a1 tells A from B at "
-        "the lowest cost.",
-        "  a1 (chosen; calculation, high priority) on hyp-a, hyp-b: Relax both sites with a hybrid functional.",
-        "    if hyp-a holds: atop lower",
-        "    if hyp-b holds: hollow lower",
-        "    informative because: why a1",
-        "    cost: 2 relaxations, about 400 core-hours; feasibility: possible now"]
-    assert "  a2 (measurement, medium priority) on hyp-b: Suggest low-temperature IRAS." in shown
-    assert shown.endswith("  a3 (close, low priority): do a3\n    informative because: why a3\n    cost: small; "
-                          "feasibility: possible now\n    priority because: because a3]")
-    assert not [n for n in chat.notices() if "Next steps recommended" in n.text]
+    # The researcher sees it once: what the Chief takes and why, and the chosen steps; the rest in the notebook.
+    (shown,) = [n.text for n in chat.notices() if "next steps" in n.text]
+    assert shown.splitlines() == [
+        f"[Chief Scientist: next steps] Taking a1 ({rec_id}, round 0): a1 tells A from B at the lowest cost.",
+        "  a1 (calculation, high priority, on hyp-a, hyp-b): Relax both sites with a hybrid functional.",
+        "  In full, with the 2 other candidates, on the round's notebook page (/round)."]
+    assert not [n for n in chat.notices() if "next steps" in n.text]
     state_view = use("investigation_state").content
     assert "Latest recommendation:\n  Next steps recommended by the Chief Scientist" in state_view
     assert "  a2 (measurement, medium priority) on hyp-b: Suggest low-temperature IRAS." in state_view

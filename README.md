@@ -2,6 +2,8 @@
 
 **Autonomous Scientific Agent Swarm for Computation-Experiment Discrepancies**
 
+*Built for the 2026 Open Scientific Intelligence Hackathon.*
+
 <table>
   <tr>
     <td width="33%"><a href="figures/CEDAR%20Scientist%20Research%20System%20Infographic.png"><img src="figures/CEDAR%20Scientist%20Research%20System%20Infographic.png" alt="CEDAR design overview: terminal interface, system architecture and research workflow"></a></td>
@@ -17,140 +19,218 @@
 
 Computational models and experimental measurements often disagree. The disagreement may arise from an approximation in the electronic-structure method, an idealized atomic structure, finite-temperature or environmental effects, an incorrect comparison of observables, numerical inaccuracies, or several interacting causes. A plausible explanation is not necessarily a verified explanation.
 
-**CEDAR** is a proposed, human-guided autonomous research system that investigates these discrepancies as scientific questions. A conversational **Chief Scientist** coordinates dynamically instantiated hypothesis agents. Each agent develops falsifiable predictions, requests validated computational analyses or evaluates experimental evidence, and reports what its results do—and do not—establish. An evidence-synthesis layer reconciles the findings and recommends the next computation or experiment expected to be most informative.
+**CEDAR** is a human-guided research system that investigates these discrepancies as scientific questions. You describe the discrepancy to a conversational **Chief Scientist**, which proposes one agent per hypothesis. Each agent commits to falsifiable predictions, writes and requests DFT calculations (FHI-aims or VASP, through Slurm or on an interactive node), reads the outputs and reports what its results do—and do not—establish. Every calculation is checked before it runs and needs your approval to start; every number that becomes evidence is traced to the output lines or analysis script it came from. An **Evidence Judge** assesses the hypotheses, and a Markdown research notebook records each round.
 
-## Design principles
+CEDAR is an early prototype. It has not been validated as producing correct scientific conclusions.
 
-- **Hypotheses first:** Investigations create specialized agents for the actual scientific problem, not a fixed collection of agents for every run.
-- **Human in control:** Researchers can converse with the Chief Scientist and change priorities while independent investigations continue.
-- **Examined computation:** Agents may write their own DFT inputs and job scripts and read raw outputs directly. Versioned protocol tools examine every input and job script before it runs, and verify the values agents read from outputs before they count as evidence. Agents check things with sandboxed commands in their own workspaces, and need a calculation only when a hypothesis needs new DFT.
-- **Asynchronous HPC:** Long-running DFT and related calculations are submitted to schedulers such as Slurm. Agents release their runtime while jobs execute and resume when results arrive.
-- **Evidence before conclusions:** Reports distinguish quantified contributions, model-dependent estimates, unresolved mechanisms, and non-identifiable explanations. The system can conclude that the evidence is insufficient.
-- **Research provenance:** Every meaningful hypothesis, planned test, executed action, result, revision, and human intervention is recorded in a concise, auditable research notebook.
-- **Terminal-native:** A planned Claude Code–style terminal interface combines an always-accessible Chief Scientist conversation with a persistent live agent/job status panel.
+## Requirements
 
-## Initial research demonstrations
-
-The first proposed benchmark is the **CO/Cu(111) adsorption-site discrepancy**, where common semilocal DFT treatments can favor a hollow adsorption site while low-coverage experiments favor atop adsorption. The goal is not to rediscover a known literature result through retrieval, but to test whether agents can propose discriminating checks, carry them out with reliable computational protocols, and revise conclusions based on independently revealed evidence. A more challenging example from ongoing research is **TCNE/Au**, involving a possible disagreement between computed planar configurations and experimentally inferred upright/tilted arrangements; its exact experimental conditions and comparison must be established before use.
-
-The project is being designed as a **general-purpose investigation framework**, rather than a hard-coded solution to either example. Its initial scope emphasizes atomistic materials science, surfaces, interfaces, DFT, MLIPs, and spectroscopy, with extensions to other computational sciences envisaged.
-
-## Project status
-
-**Early prototype.** The path from a described discrepancy to recorded evidence is built:
-- The Chief Scientist opens an investigation and proposes hypothesis agents: at most one per hypothesis, each with the role its work needs. The researcher sees the proposal; the agents start after 10 minutes unless the researcher replies.
-- Agents work at the same time, one hypothesis each, numbered A1, A2, ...: each can see the others' work, read their files and use their calculations, but records only for its own hypothesis. When they have reported, the Chief Scientist compares their results across hypotheses, records that comparison (where each stands, how much of the discrepancy it accounts for, what remains unexplained), proposes new hypotheses from it, and reports to the researcher.
-- Every task of an agent starts a new conversation with a briefing CEDAR builds from the record, so long investigations do not outgrow the model's context; agents can read their earlier conversations and the notebook. There is no limit on model calls. Agents end each task with a structured report (findings with evidence ids, open questions, requests to you); an agent is woken whenever one of its calculations ends; a run cut off by a temporary model-service error is continued.
-- Agents write FHI-aims or VASP inputs, and may add any other file a run reads, such as a restart file; for VASP, CEDAR writes POTCAR from the PAW datasets the agent names, and the job script launches the build the inputs need (`ncl` for spin-orbit). Deterministic checks cover only what runs on the machine: the job script against your approved template, its limits and the budget; for VASP also that POTCAR matches POSCAR's species. No rule holds the DFT settings to a list or to what the agent declared. An input-reviewer agent then checks that the code will run the inputs as the calculation the agent describes, and that nothing in them is harmful, the files CEDAR does not read included, using the installed code's manual or source, and documentation sites on the web, where it is unsure. It leaves the scientific choices to the agents and to you. It approves the inputs, warns you to look first, or sends them back to the agent with its reasons. Only then are you asked to approve the run, the last step before it starts. You can also reject inputs, with a reason the agent is woken to address.
-- Every agent reads any file you can, except credentials (CEDAR's configuration directory and the usual key stores); hypothesis agents write only in their own workspaces. There they run shell commands and scripts to check things, in a sandbox: no network, no scheduler, no DFT code, a time limit, every command recorded; what they compute this way is context, not evidence.
-- Experimental knowledge, even a single sentence from you such as "the measured adsorption height is 2.5 Å", becomes evidence when an agent records it with its quoted source; quotes from your messages, files and PDFs are checked, and values read off figures or web pages stay provisional.
-- Your earlier FHI-aims or VASP runs can be registered (`/register`, or by the agents and the Chief Scientist): their files are stored by hash and their health checked, and evidence from them is marked as computed outside CEDAR.
-- When CEDAR runs on an interactive node, inside your Slurm allocation, calculations can also run there (locally) instead of as Slurm jobs, on all but 4 of the allocation's cores, which stay for the agents' commands; on a login node they cannot. Local runs need your `/approve submit` like Slurm jobs. Each runs as its own Slurm step on cores no other run uses, whatever MPI it uses; one that does not fit waits until enough cores are free, and the panel says what each waits for ("waiting for 60 free cores") or where it runs ("running on CPUs 0-59").
-- Agents can look at images and PDFs: files you attach with `/attach`, which every agent of the investigation can view, and images or PDFs in their own run directories.
-- With `/web on` (or `/web only <domains>`), the Chief Scientist and the hypothesis agents can search and read the web. It is off by default, and the Evidence Judge and the approver never use it. The input reviewer always reads code documentation sites, and nothing else.
-- Researcher-authorized jobs run under Slurm. A job the scheduler refuses is tried again on the next passes; if it is still refused, its agent is woken with what the scheduler said, to fix the cause and request it again.
-- Agents read the outputs and compute whatever quantities they need with their own analysis scripts, which run on the login node isolated with bubblewrap, seeing only the files staged for them (run outputs, and materials or files such as measured data). Cited readings and script results are verified or recorded before they become evidence.
-- The Evidence Judge assesses hypotheses: when the Chief Scientist asks, or, in full automation, every round. A hypothesis can be supported only by a calculation it predicted before the calculation was submitted; earlier results, such as your registered runs and measurements, can challenge it but not support it.
-- In full automation, an approver agent takes your routine decisions (starting agents, submitting calculations) within core-hour and dollar limits you set; the panel shows the mode.
-- Budgets are in dollars, at the price of each kind of token (cached input costs far less than fresh input or output): every investigation may spend $25 on models unless you set another amount with `/budget`. The size of the Chief Scientist's conversation with you is a separate, token limit: past 800,000 tokens it continues in a new conversation, briefed from the record.
-- When the Chief Scientist decides what to do next, it records the candidate steps it weighed (what each hypothesis predicts each would show, cost, feasibility, priority) and which it takes, and why. You see this in the chat and the notebook.
-- A research notebook in Markdown, generated from the event log, records each round: what was hypothesized and why, predicted, tested and observed, what changed, what remains unknown and what is next.
-- A full-screen terminal interface keeps a live panel of hypotheses, agents, jobs, evidence and assessments above the conversation, and opens notebook pages and cited output lines in place.
-
-The full path passes automated tests that use stand-ins for the models and the scheduler. The workbench's sandbox (bubblewrap) has been tested on one cluster's login node; registering has been tried on a real FHI-aims run; the VASP protocol has been tried only on the files of one real VASP 5.4.4 run, outside CEDAR's dispatcher (its inputs examined, its POTCAR rebuilt identically from the library, its OUTCAR checked), and no VASP calculation has yet run through CEDAR; local calculations have run through CEDAR only with a stand-in for FHI-aims and a simulated allocation; on an interactive node, real FHI-aims runs (and Intel MPI and Open MPI test programs) started the way CEDAR starts them ran side by side as Slurm steps on separate cores, but not yet from within CEDAR. Web search and fetch, images and PDF pages have also been checked through CEDAR's model adapter and agent loop with a real Claude model, though not yet in a real investigation; with OpenAI's GPT-5.6 Sol, so have tool calls in a resumed conversation, images and PDF pages in a tool's output, web search within one site and a reply cut off at its output limit (`tests/test_openai_live.py`), but no agent has yet run on it in an investigation. On one Slurm cluster, with FHI-aims and Claude models, each step except the Evidence Judge has also run for real, though not yet together in one uninterrupted investigation. The terminal interface has also been used with the real Chief Scientist, and a real hypothesis agent has analysed a real FHI-aims output with its own scripts, both on test investigations. On another test investigation, without calculations, the real Chief Scientist proposed two agents and revised the proposal after a researcher reply; the two agents ran at the same time, and the Chief Scientist then reviewed their reports.
-
-Not yet built:
-- protocols for codes other than FHI-aims and VASP
-- schedulers other than Slurm
-- model providers other than Anthropic and OpenAI
-- retries of agent work that failed for reasons other than a temporary model-service error or an interruption
-- blind evaluation
-
-The input reviewer has run only with stand-in models in tests, not yet with a real model on real inputs.
-
-Nothing here has been validated as producing correct scientific conclusions.
+- Linux, with Python 3.12 or later (conda is the simplest way to get it)
+- an API key from Anthropic or OpenAI, or both
+- for calculations: a cluster with Slurm and FHI-aims or VASP installed
+- recommended: [bubblewrap](https://github.com/containers/bubblewrap) (`bwrap`) on the machine CEDAR runs on, to sandbox the commands and analysis scripts agents run. Without it, agents can run only Python scripts, under a weaker guard.
 
 ## Installation
 
-You need:
-- access to a Linux cluster that runs Slurm and has FHI-aims or VASP installed (for calculations)
-- conda (Miniconda or Anaconda), to create a Python 3.12 environment
-- an Anthropic or OpenAI API key, or both
-
-**1. Get the code** and go into its folder:
+**1. Get the code and create an environment**
 
 ```bash
-git clone <repository-url> cedar
+git clone https://github.com/haoran-ni/CEDAR.git cedar
 cd cedar
-```
-
-**2. Create a conda environment named `cedar`** with Python 3.12, and activate it:
-
-```bash
 conda create -n cedar python=3.12
 conda activate cedar
+pip install -e .
+cedar --version
 ```
 
-If your cluster provides conda as a module, load it first (for example with `module load`). If `conda activate` says your shell is not set up for it, run `conda init bash` once and open a new terminal.
+On a cluster you may first need to load conda as a module (`module load ...`). If `conda activate` complains that your shell is not set up, run `conda init bash` once and open a new terminal. Any other Python 3.12 environment, such as a `venv`, works as well.
 
-**3. Install CEDAR** into the environment, from the repository folder:
+To use `cedar` without activating the environment, link it onto your `PATH` while the environment is active:
 
 ```bash
-pip install -e ".[dev]"
-cedar --version                         # prints: cedar 0.0.1
+ln -s "$(which cedar)" ~/.local/bin/cedar
 ```
 
-`-e` installs it in editable mode: changes to the code take effect without reinstalling, but if you move the repository folder, run `pip install -e ".[dev]"` again. `[dev]` adds pytest, so `pytest` runs the tests.
-
-The `cedar` command lives in the environment's `bin/` folder and works without activating the environment. To use it from any shell, link it into a folder on your `PATH`, for example `ln -s "$(which cedar)" ~/.local/bin/cedar` (run this while the environment is active).
-
-**4. Store your API key:**
+**2. Add your API key**
 
 ```bash
-cedar auth add anthropic                # asks for the key without showing it
-cedar auth add openai                   # the same for OpenAI, if you use its models
+cedar auth add anthropic        # prompts for the key without showing it
+cedar auth add openai           # only if you use OpenAI models
+cedar auth status               # shows which keys CEDAR will use
 ```
 
-The keys are kept in `~/.config/cedar/credentials.toml`, readable only by you. If the `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` environment variable is set, it is used instead.
+Keys are stored in `~/.config/cedar/credentials.toml`, readable only by you. If `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` is set in your environment, it takes precedence.
 
-**5. Choose the models:**
+**3. Choose the models**
 
 ```bash
-cedar models init                       # writes ~/.config/cedar/models.toml
-cedar models check                      # one tiny request to confirm the key and model work
+cedar models init               # writes ~/.config/cedar/models.toml
+cedar models check              # sends one tiny request to confirm the key and model work
+cedar models show               # lists each role's model and its prices
 ```
 
-`models.toml` suggests Claude Opus 5.5 for every agent; edit it to choose a model per agent role, from Anthropic or OpenAI (its comments show GPT-5.6 Sol for one role). With `cedar models check --role <role>`, the request goes to that role's model.
+The starter file uses Claude Opus 5.5 for every agent. Edit it to give a role its own model, for example:
 
-**6. Describe your cluster** in a compute profile. Nothing runs on the cluster until you approve one:
+```toml
+[roles.default]
+provider = "anthropic"
+model = "claude-opus-5-5"
+effort = "medium"
+
+[roles.hypothesis_agent]
+provider = "openai"
+model = "gpt-5.6-sol"
+effort = "medium"
+```
+
+The roles are `chief_scientist`, `hypothesis_agent`, `evidence_judge`, `input_reviewer`, `approver` and `environment_setup`. Any role without its own section uses `default`. CEDAR knows the prices of the current Claude models and of GPT-5.6 Sol; for any other model, add a `[roles.<role>.prices]` section (the starter file shows how), or CEDAR cannot keep a budget. `cedar models check --role <role>` checks one role's model.
+
+**4. Describe your cluster**
+
+Nothing runs on the cluster until you approve a compute profile: how each code is run, the job-script template, the allowed partitions and the resource limits. An environment-setup agent proposes one by reading your existing job scripts and asking you questions in the terminal:
 
 ```bash
-cedar setup --name mycluster            # an agent reads your existing job scripts and asks you questions
-cedar profile show mycluster            # review what it proposes
+cedar setup --name mycluster
+cedar profile show mycluster    # review the proposal and its checks
 cedar profile approve mycluster
 ```
 
-**7. Start CEDAR:**
+The setup agent stops after spending $15 on its model (`--max-cost` changes this); `cedar setup --name mycluster --resume` continues an interrupted session. `cedar profile list` lists your profiles.
+
+**5. Start CEDAR**
 
 ```bash
-cedar start                             # live panel and chat with the Chief Scientist; /help lists commands
+cedar start
 ```
-
-`cedar start --plain` gives a line-by-line chat instead of the full-screen interface, and `cedar report` writes the research notebook (the dispatcher also keeps it current).
-
-Configuration and keys live in `~/.config/cedar`; research data (event log, stored files, notebooks) in `~/.local/share/cedar`. Set `CEDAR_CONFIG_DIR` or `CEDAR_DATA_DIR` to put them elsewhere.
-
-**Starting over:**
-
-```bash
-cedar reset                             # delete every investigation and its history; keep profiles, models and keys
-cedar purge                             # delete everything CEDAR stored, the setup and API keys included
-```
-
-Each lists what it deletes and asks you to type its name (`--yes` skips that). Run directories, with the calculations' inputs and outputs, stay unless you add `--runs`. Neither deletes while a dispatcher is running or a calculation CEDAR started has not ended, as its scheduler reports: wait for it, or add `--cancel-jobs`. Only files CEDAR writes are deleted. An API key set in your environment stays set. `pip uninstall cedar` removes the program itself.
 
 ## Using CEDAR
 
-The chat starts a dispatcher in the background whenever there is work for it: it starts the agents, submits what you authorize and follows the jobs, keeps going after you close the chat, and stops by itself after 30 idle minutes (`cedar dispatch --stop` stops it now; `cedar start --no-dispatch` leaves it to you, e.g. `cedar dispatch --agents N` in tmux). Proposed agents start after a 10-minute review window unless you reply; `/agents` shows them and `/approve agents` starts them at once. Every calculation's inputs go to the input reviewer first. Once it has finished, the chat asks you to approve the calculation, and your approval is the last step before it runs: `/approve submit <calculation>`, `/approve submit A2` for everything agent A2 waits to run, or `/approve submit all`. One approval covers the inputs and the submission. `/pending` shows who asks for each calculation, what it computes, where it runs, its size in tasks, minutes and core-hours, and the directory holding its examined inputs. Where the reviewer warned or could not decide, it also says what to look at, at which line of which file; `/approve submit all` takes those only once you have been shown them. It names each calculation by the first 8 characters of its id, which the commands accept. A calculation still with the reviewer cannot be approved yet. `/reject inputs <calculation> <reason>` refuses inputs before they run: the agent is woken with your reason. When you will be away, `/mode full-automation <core-hours> <dollars>` lets an approver agent decide on agents and submissions, and the Evidence Judge assess new evidence every round, within those limits; `/mode human-in-the-loop` takes the decisions back. Calculations whose inputs need your look, `/reject inputs`, `/approve close`, `/cancel` and `/halt` always stay yours. `/attach <path> <note>` gives the agents a figure, paper or data file to view, `/register <dir> <note>` brings a finished FHI-aims run of yours into the record for every agent, `/web on`, `/web only <domains>` or `/web off` sets whether they may use the web, and `/workbench off` or `/workbench on` whether they may run commands in their workspaces (on by default). To run calculations locally, start CEDAR on an interactive node, inside a Slurm allocation, and run the chat and the dispatcher there. Every investigation's agents may spend $25 on models in total, the Chief Scientist's answers included, unless you set another amount: `/budget 40` sets $40, `/budget` shows what is spent, and `/budget off` removes the limit. Running agents share the budget, checking what all of them have spent before every model call. All three also work before the investigation exists. CEDAR knows the published prices of the current Claude models and of GPT-5.6 Sol (`cedar models show` lists them); for another model, give its prices in `models.toml`. An investigation is closed only by you: the Chief Scientist proposes closing it, and `/approve close` closes it for good. `/halt` stops an investigation at once: it cancels its jobs, retires its agents and pauses it; `/halt all` does so for every investigation and stops the background dispatcher. Each investigation's notebook is in the data directory, by default `~/.local/share/cedar/notebooks/<investigation>/index.md`.
+### An investigation, step by step
 
-For detailed implementation guidance, start with [`AGENTS.md`](AGENTS.md). Design documents are in [`docs/`](docs/).
+1. **Describe the discrepancy.** Tell the Chief Scientist what you computed, what was measured, and where your files are, in plain language. For example: *"My FHI-aims runs under `/scratch/me/xe_cu111` give a Xe adsorption height of 3.473 Å on Cu(111); experiment gives 3.6 ± 0.08 Å. Please investigate."* You can also set limits here, such as which species defaults to use or how many hypotheses to test.
+2. **Review the proposed agents.** The Chief Scientist opens an investigation, reads and registers the runs you point it to, and proposes hypotheses with one agent each. `/agents` shows the proposal. The agents start after a 10-minute review window, or at once with `/approve agents`. Any message you send in the meantime holds them until the Chief Scientist revises the proposal.
+3. **Approve calculations.** Agents write inputs and request calculations. Each request is checked against your compute profile and read by an input-reviewer agent; then it waits for you. `/pending` shows what each calculation computes, where it runs, its size in core-hours, and the directory with its inputs. Approve it with `/approve submit <calc>`, or refuse it with `/reject inputs <calc> <reason>`, which sends your reason back to the agent.
+4. **Let it run.** Agents stop while their jobs run, spending nothing, and are woken when the jobs end. You can close the chat: a background dispatcher keeps submitting approved work and following jobs. `cedar start <investigation>` reopens the investigation where it was.
+5. **Read the results.** When the agents report, the Chief Scientist compares the hypotheses and tells you where each stands. Ask it anything at any time: status, reasoning, evidence, alternative tests, or a change of priorities. Read the full record with `/notebook`.
+6. **Close it.** The Chief Scientist proposes closing the investigation when the evidence is in; only `/approve close` closes it.
+
+To run calculations on an interactive node instead of submitting Slurm jobs, start CEDAR inside a Slurm allocation (for example with `salloc`). Local calculations use all but 4 of the allocation's cores, which stay free for the agents' commands. DFT never runs on a login node.
+
+### The terminal interface
+
+The window has three parts:
+
+- **Panel (top):** the mode, budget and status lines; a table of agents with their status, for how long, and their current task; and a table of hypotheses with their lifecycle, scheduler jobs, evidence and assessment, kept in separate columns. A highlighted line says what is waiting for you.
+- **Conversation (middle):** your chat with the Chief Scientist. Other agents' messages appear behind a bar in their own colour, and requests for your approval appear in a highlighted block with the command to run.
+- **Input box (bottom):** type a message to the Chief Scientist, or a command starting with `/`.
+
+Keys:
+
+- Typing `/` opens a menu of matching commands: `↑`/`↓` choose, `Tab` or `Enter` completes, `Esc` closes the menu. `Enter` on a complete command runs it.
+- `Tab` moves focus to the panel; `Enter` on a hypothesis opens its notebook page.
+- On a notebook page, links open the cited output lines and other pages; `Backspace` goes back and `Esc` closes the page.
+
+`cedar start --plain` gives a line-by-line chat instead, for terminals that cannot show the full-screen interface.
+
+### Chat commands
+
+Anything that does not start with `/` goes to the Chief Scientist. A `<calc>` can be given by the first characters of its id (the interface shows 8), and an `<agent>` by its number, such as `A2`.
+
+**Status and records**
+
+| Command | What it does |
+|---|---|
+| `/status` | Show the investigation's state |
+| `/agents` | Show the hypothesis agents, and any the Chief Scientist proposes |
+| `/pending` | Show what waits for your approval, and requests from agents |
+| `/report` | Update the research notebook and show where it is |
+| `/notebook` | Open the notebook's index *(full-screen interface only)* |
+| `/round` | Open this round's notebook page *(full-screen interface only)* |
+| `/timeline` | Open the timeline of every event *(full-screen interface only)* |
+| `/panel` | Hide or show the panel's tables *(full-screen interface only)* |
+| `/help` | List the commands |
+| `/quit`, `/exit` | Leave; queued work and jobs continue with the dispatcher |
+
+**Approvals**
+
+| Command | What it does |
+|---|---|
+| `/approve agents` | Start the proposed agents now, instead of after the review window |
+| `/approve submit <calc>` | Let a calculation run, once the input reviewer has finished with it |
+| `/approve submit <agent>` | Let every calculation one agent is waiting for run |
+| `/approve submit all` | Let every waiting calculation run; ones the reviewer warned about only after `/pending` has shown them |
+| `/reject inputs <calc> <reason>` | Refuse a calculation's inputs; the reason goes to the agent |
+| `/cancel <calc> <reason>` | Cancel a calculation, stopping its job if it has one |
+| `/approve close` | Close the investigation for good, as the Chief Scientist proposes |
+
+**Settings**
+
+| Command | What it does |
+|---|---|
+| `/mode` | Show the mode: human-in-the-loop, or full automation and what it has left |
+| `/mode full-automation <core-hours> <dollars>` | While you are away, an approver agent decides on agents and submissions within these limits, and the Evidence Judge assesses new evidence every round |
+| `/mode human-in-the-loop` | Take the decisions back |
+| `/budget` | Show what the agents have spent on models, and the budget |
+| `/budget <dollars>` | Limit what all agents of the investigation may spend on models (default $25) |
+| `/budget off` | Remove the limit |
+| `/web` | Show whether agents may use the web |
+| `/web on` | Let the Chief Scientist and the hypothesis agents search and read the web |
+| `/web only <domains>` | The same, limited to these domains, e.g. `arxiv.org doi.org` |
+| `/web off` | No web for any agent (the default) |
+| `/workbench` | Show whether agents may run commands in their workspaces |
+| `/workbench on` | Let them (the default): sandboxed, no network, no DFT, writing only in their own workspace |
+| `/workbench off` | No commands for any agent of this investigation |
+
+**Data**
+
+| Command | What it does |
+|---|---|
+| `/attach <path> <note>` | Give the agents an image, PDF or text file to view, such as a figure, paper or measured data; the note is optional |
+| `/materials` | List the files you attached |
+| `/register <dir> <note>` | Register a finished FHI-aims or VASP run computed outside CEDAR, so evidence can come from it; add `--output <file>` if its output is not `aims.out` or `OUTCAR` |
+
+**Stopping**
+
+| Command | What it does |
+|---|---|
+| `/halt <reason>` | Stop this investigation now: cancel its jobs, retire its agents and pause it |
+| `/halt all <reason>` | The same for every investigation, and stop the background dispatcher |
+
+In full automation, calculations whose inputs need your look, `/reject inputs`, `/cancel`, `/approve close` and `/halt` still stay with you. `/budget`, `/web`, `/attach`, `/materials` and `/halt all` also work before an investigation has been opened.
+
+### Command-line reference
+
+| Command | What it does |
+|---|---|
+| `cedar start [<investigation>]` | Talk with the Chief Scientist, in a new or an existing investigation. `--plain` for a line-by-line chat; `--no-dispatch` to run the dispatcher yourself |
+| `cedar investigations` | List investigations and their state |
+| `cedar report [<investigation>]` | Write the research notebook from the event log |
+| `cedar auth add\|remove <provider>`, `cedar auth status` | Manage API keys (`anthropic`, `openai`) |
+| `cedar models init\|show\|check` | Write, list or test the model configuration |
+| `cedar setup --name <profile>` | Let the environment-setup agent propose a compute profile |
+| `cedar profile list\|show\|approve` | Review and approve compute profiles |
+| `cedar dispatch` | Run the dispatcher in the foreground. `--agents N` (default 4) agents at once, `--interval` seconds between passes (default 60), `--once` for one pass, `--stop` to stop a running one |
+| `cedar reset` | Delete every investigation and its history; keep profiles, models and keys |
+| `cedar purge` | Delete everything CEDAR stored, including the setup and API keys |
+
+`cedar start` launches a dispatcher in the background whenever there is work for one. It keeps going after you close the chat and stops by itself after 30 idle minutes; its log is in the data directory. If you prefer to manage it yourself, run `cedar start --no-dispatch` and `cedar dispatch` in tmux or screen.
+
+### Where things are stored
+
+| What | Where | Override |
+|---|---|---|
+| Keys, models, compute profiles | `~/.config/cedar` | `CEDAR_CONFIG_DIR` |
+| Event log, stored files, transcripts, notebooks | `~/.local/share/cedar` | `CEDAR_DATA_DIR` |
+
+Each investigation's notebook starts at `~/.local/share/cedar/notebooks/<investigation>/index.md`.
+
+### Starting over
+
+`cedar reset` and `cedar purge` list what they will delete and ask you to type the command's name (`--yes` skips this). Run directories, with the calculations' inputs and outputs, are kept unless you add `--runs`. Neither deletes anything while a dispatcher is running or a calculation CEDAR started has not ended: wait for it, or add `--cancel-jobs`. `pip uninstall cedar` removes the program itself.
+
+## Further reading
+
+- [`AGENTS.md`](AGENTS.md): the design and implementation contract
+- [`docs/`](docs/): architecture, scientific protocols, evidence and provenance, analysis scripts, and the workbench
+
+To run the tests: `pip install -e ".[dev]"`, then `pytest`.

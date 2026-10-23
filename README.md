@@ -2,6 +2,19 @@
 
 **Autonomous Scientific Agent Swarm for Computation-Experiment Discrepancies**
 
+<table>
+  <tr>
+    <td width="33%"><a href="figures/CEDAR%20Scientist%20Research%20System%20Infographic.png"><img src="figures/CEDAR%20Scientist%20Research%20System%20Infographic.png" alt="CEDAR design overview: terminal interface, system architecture and research workflow"></a></td>
+    <td width="33%"><a href="figures/gallary_1.png"><img src="figures/gallary_1.png" alt="CEDAR terminal interface as the Chief Scientist opens a Xe/Cu(111) adsorption-height investigation"></a></td>
+    <td width="33%"><a href="figures/gallary_2.png"><img src="figures/gallary_2.png" alt="CEDAR terminal interface during the Xe/Cu(111) investigation, with agent reports and a calculation waiting for approval"></a></td>
+  </tr>
+  <tr>
+    <td align="center"><sub>Design overview</sub></td>
+    <td align="center"><sub>Opening an investigation</sub></td>
+    <td align="center"><sub>Agents report; a calculation waits for approval</sub></td>
+  </tr>
+</table>
+
 Computational models and experimental measurements often disagree. The disagreement may arise from an approximation in the electronic-structure method, an idealized atomic structure, finite-temperature or environmental effects, an incorrect comparison of observables, numerical inaccuracies, or several interacting causes. A plausible explanation is not necessarily a verified explanation.
 
 **CEDAR** is a proposed, human-guided autonomous research system that investigates these discrepancies as scientific questions. A conversational **Chief Scientist** coordinates dynamically instantiated hypothesis agents. Each agent develops falsifiable predictions, requests validated computational analyses or evaluates experimental evidence, and reports what its results do—and do not—establish. An evidence-synthesis layer reconciles the findings and recommends the next computation or experiment expected to be most informative.
